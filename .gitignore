@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.db
+*.db-journal
+.DS_Store
+/data/*.db
