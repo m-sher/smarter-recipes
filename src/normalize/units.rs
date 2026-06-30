@@ -8,7 +8,17 @@ use std::sync::RwLock;
 pub const CANONICAL_MASS: &str = "g";
 pub const CANONICAL_VOLUME: &str = "ml";
 
+/// Case-sensitive aliases that must not collide when lowercased (e.g. t vs T).
+fn case_sensitive_units() -> HashMap<&'static str, Unit> {
+    let mut m = HashMap::new();
+    // Culinary convention: lowercase t = teaspoon, uppercase T = tablespoon.
+    m.insert("t", Unit::new("t", UnitKind::Volume, 4.92892159375));
+    m.insert("T", Unit::new("T", UnitKind::Volume, 14.78676478125));
+    m
+}
+
 /// Built-in units with conversion factors to canonical bases (g / ml / ea).
+/// Keys are lowercased; single-letter t/T are handled separately.
 fn builtin_units() -> HashMap<String, Unit> {
     let mut m = HashMap::new();
     let add = |m: &mut HashMap<String, Unit>, names: &[&str], kind: UnitKind, to_base: f64| {
@@ -43,9 +53,8 @@ fn builtin_units() -> HashMap<String, Unit> {
         UnitKind::Mass,
         453.59237,
     );
-    // US customary volume often used for mass-like ingredients still treated as volume below.
 
-    // Volume → milliliters
+    // Volume → milliliters (do NOT register bare "t" / "T" here — case-sensitive map)
     add(
         &mut m,
         &[
@@ -66,13 +75,13 @@ fn builtin_units() -> HashMap<String, Unit> {
     );
     add(
         &mut m,
-        &["tsp", "teaspoon", "teaspoons", "t"],
+        &["tsp", "teaspoon", "teaspoons"],
         UnitKind::Volume,
         4.92892159375,
     );
     add(
         &mut m,
-        &["tbsp", "tablespoon", "tablespoons", "T", "tbl", "tbs"],
+        &["tbsp", "tablespoon", "tablespoons", "tbl", "tbs"],
         UnitKind::Volume,
         14.78676478125,
     );
@@ -121,25 +130,26 @@ fn builtin_units() -> HashMap<String, Unit> {
 }
 
 static UNITS: Lazy<RwLock<HashMap<String, Unit>>> = Lazy::new(|| RwLock::new(builtin_units()));
+static CASE_SENSITIVE: Lazy<HashMap<&'static str, Unit>> = Lazy::new(case_sensitive_units);
 
-/// Look up a unit by alias (case-insensitive). Returns a clone of the registered unit.
+/// Look up a unit by alias. Single-letter `t` / `T` are case-sensitive;
+/// all other aliases are case-insensitive.
 pub fn lookup_unit(name: &str) -> Option<Unit> {
-    let key = name.trim().to_lowercase();
-    // Prefer exact key; also try without trailing 's' for simple plurals if not found.
+    let trimmed = name.trim();
+    if trimmed == "t" || trimmed == "T" {
+        return CASE_SENSITIVE.get(trimmed).cloned();
+    }
+    let key = trimmed.to_lowercase();
     let map = UNITS.read().ok()?;
     if let Some(u) = map.get(&key) {
         return Some(u.clone());
     }
-    // "fl. oz." style cleanup
     let cleaned = key
         .replace('.', "")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    if let Some(u) = map.get(&cleaned) {
-        return Some(u.clone());
-    }
-    None
+    map.get(&cleaned).cloned()
 }
 
 /// Resolve a unit token to a [`Unit`], or treat unknown tokens as Other with factor 1.
@@ -147,7 +157,7 @@ pub fn resolve_unit(name: &str) -> Unit {
     lookup_unit(name).unwrap_or_else(|| Unit::new(name.to_string(), UnitKind::Other, 1.0))
 }
 
-/// Register an additional alias at runtime (tests / user config).
+/// Register an additional alias at runtime (tests / user config). Case-insensitive.
 pub fn register_alias(alias: &str, unit: Unit) {
     if let Ok(mut map) = UNITS.write() {
         map.insert(alias.trim().to_lowercase(), unit);
@@ -177,5 +187,14 @@ mod tests {
     fn case_insensitive() {
         assert!(lookup_unit("TBSP").is_some());
         assert!(lookup_unit("Cups").is_some());
+    }
+
+    #[test]
+    fn lower_t_teaspoon_upper_t_tablespoon() {
+        let tsp = lookup_unit("t").unwrap();
+        let tbsp = lookup_unit("T").unwrap();
+        assert!((tsp.to_base - 4.92892159375).abs() < 1e-9);
+        assert!((tbsp.to_base - 14.78676478125).abs() < 1e-9);
+        assert!(tsp.to_base < tbsp.to_base);
     }
 }

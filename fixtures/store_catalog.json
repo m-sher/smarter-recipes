@@ -1,0 +1,12 @@
+{
+  "milk": [
+    {"label": "Store brand 1 qt milk", "size_canonical": 946.353, "price_cents": 289, "kind": "volume"},
+    {"label": "Store brand 1/2 gal milk", "size_canonical": 1892.71, "price_cents": 329, "kind": "volume"}
+  ],
+  "flour": [
+    {"label": "Store 5 lb flour", "size_canonical": 2267.96, "price_cents": 399, "kind": "mass"}
+  ],
+  "eggs": [
+    {"label": "Store dozen eggs", "size_canonical": 12, "price_cents": 299, "kind": "count"}
+  ]
+}

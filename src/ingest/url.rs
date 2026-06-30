@@ -92,10 +92,7 @@ fn find_recipe_objects(v: &Value, out: &mut Vec<Value>) {
             if is_recipe_type(v) {
                 out.push(v.clone());
             }
-            // schema.org graph
-            if let Some(graph) = map.get("@graph") {
-                find_recipe_objects(graph, out);
-            }
+            // Recurse into all values once (covers @graph and every other field).
             for val in map.values() {
                 find_recipe_objects(val, out);
             }

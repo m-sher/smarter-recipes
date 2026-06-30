@@ -68,6 +68,13 @@ smarter-recipes plan --days 3 --pool <id1>,<id2>,<id3>
 # Shopping list with package recommendations + leftover flags
 smarter-recipes shop <plan-id-or-prefix>
 
+# Show how plan ordering introduces ingredients (trip analysis)
+smarter-recipes shop <plan-id> --trips
+
+# Enrich catalog from Open Food Facts (network) or a recorded fixture
+smarter-recipes shop <plan-id> --fetch-prices openfoodfacts
+smarter-recipes shop <plan-id> --fetch-prices fixture --store-fixture fixtures/store_catalog.json
+
 # Custom package sizes/prices (JSON object: name → [packages])
 smarter-recipes shop <plan-id> --catalog my_catalog.json
 
@@ -114,6 +121,8 @@ src/
 2. **Ingredient identity** — `(normalized_name, UnitKind)` so “2 cups milk” and “500 ml milk” aggregate when both are volume.
 3. **Core vs I/O** — Normalization, planning, and purchase optimization are pure and unit-tested without network or OCR.
 4. **New ingest source** — Implement `RecipeSourceIngest` in `ingest/`, wire it in `ingest_from`.
+5. **Density table** — Volume-measured dry goods (flour, sugar, salt, …) convert to mass for realistic packages (`src/pricing/density.rs`).
+6. **Store sources** — `ProductSource` trait with Open Food Facts + fixture backends (`--fetch-prices`). Graceful fallback to the offline catalog.
 
 ### Planning algorithm (summary)
 

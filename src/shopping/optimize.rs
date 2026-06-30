@@ -19,12 +19,41 @@ impl Default for OptimizeOptions {
     }
 }
 
+/// Running cost of a package combination.
+/// `Empty` is the identity (no packages yet); `Unknown` means ≥1 package lacked a price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunCost {
+    Empty,
+    Known(u64),
+    Unknown,
+}
+
+impl RunCost {
+    fn add_package(self, unit_price: Option<u64>, count: u32) -> Self {
+        if count == 0 {
+            return self;
+        }
+        match (self, unit_price) {
+            (_, None) => RunCost::Unknown,
+            (RunCost::Unknown, _) => RunCost::Unknown,
+            (RunCost::Empty, Some(p)) => RunCost::Known(p * u64::from(count)),
+            (RunCost::Known(a), Some(p)) => RunCost::Known(a + p * u64::from(count)),
+        }
+    }
+
+    fn as_option(self) -> Option<u64> {
+        match self {
+            RunCost::Known(c) => Some(c),
+            RunCost::Empty | RunCost::Unknown => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Combo {
-    /// index into packages → count
     counts: Vec<u32>,
     total_size: f64,
-    total_cost: Option<u64>,
+    cost: RunCost,
     n_packages: u32,
 }
 
@@ -42,12 +71,10 @@ pub fn optimize_purchase(
     if pkgs.is_empty() {
         return (vec![], 0.0, None);
     }
-    // Prefer considering smaller packages first for leftover minimization
     pkgs.sort_by(|a, b| a.size_canonical.partial_cmp(&b.size_canonical).unwrap());
 
     let mut best: Option<Combo> = None;
 
-    // DFS over package multiset counts
     #[allow(clippy::too_many_arguments)]
     fn search(
         pkgs: &[&Package],
@@ -56,7 +83,7 @@ pub fn optimize_purchase(
         opts: &OptimizeOptions,
         counts: &mut Vec<u32>,
         size: f64,
-        cost: Option<u64>,
+        cost: RunCost,
         n: u32,
         best: &mut Option<Combo>,
     ) {
@@ -67,7 +94,7 @@ pub fn optimize_purchase(
             let combo = Combo {
                 counts: counts.clone(),
                 total_size: size,
-                total_cost: cost,
+                cost,
                 n_packages: n,
             };
             if is_better(&combo, best) {
@@ -89,16 +116,7 @@ pub fn optimize_purchase(
         for c in 0..=max_c {
             counts[idx] = c;
             let add_size = p.size_canonical * f64::from(c);
-            let new_cost = if c == 0 {
-                cost
-            } else {
-                match (cost, p.price_cents.map(|pc| pc * u64::from(c))) {
-                    (Some(a), Some(b)) => Some(a + b),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                }
-            };
+            let new_cost = cost.add_package(p.price_cents, c);
             search(
                 pkgs,
                 idx + 1,
@@ -122,30 +140,27 @@ pub fn optimize_purchase(
         opts,
         &mut counts,
         0.0,
-        None,
+        RunCost::Empty,
         0,
         &mut best,
     );
 
-    // Fallback: single largest packages until covered
     let combo = best.unwrap_or_else(|| {
         let mut counts = vec![0u32; pkgs.len()];
         let mut size = 0.0;
-        let mut cost = None;
+        let mut cost = RunCost::Empty;
         let mut n = 0;
         let largest = pkgs.len() - 1;
         while size < required && n < opts.max_packages {
             counts[largest] += 1;
             size += pkgs[largest].size_canonical;
             n += 1;
-            if let Some(pc) = pkgs[largest].price_cents {
-                cost = Some(cost.unwrap_or(0) + pc);
-            }
+            cost = cost.add_package(pkgs[largest].price_cents, 1);
         }
         Combo {
             counts,
             total_size: size,
-            total_cost: cost,
+            cost,
             n_packages: n,
         }
     });
@@ -162,26 +177,25 @@ pub fn optimize_purchase(
             });
         }
     }
-    (picks, combo.total_size, combo.total_cost)
+    (picks, combo.total_size, combo.cost.as_option())
 }
 
 fn is_better(c: &Combo, best: &Option<Combo>) -> bool {
     let Some(b) = best else {
         return true;
     };
-    // Primary: cost (missing cost ranks after known cost only if both cover —
-    // treat missing as equal for both)
-    match (c.total_cost, b.total_cost) {
-        (Some(ca), Some(cb)) if ca != cb => return ca < cb,
-        (Some(_), None) => return true,
-        (None, Some(_)) => return false,
+    // Primary: known cost beats unknown; lower known cost wins.
+    match (c.cost, b.cost) {
+        (RunCost::Known(ca), RunCost::Known(cb)) if ca != cb => return ca < cb,
+        (RunCost::Known(_), RunCost::Unknown) => return true,
+        (RunCost::Unknown, RunCost::Known(_)) => return false,
+        (RunCost::Known(_), RunCost::Empty) => return true,
+        (RunCost::Empty, RunCost::Known(_)) => return false,
         _ => {}
     }
-    let leftover_c = c.total_size; // compared via leftover below with required implicit in size
-    let leftover_b = b.total_size;
-    // Secondary: smaller total size (less leftover) — both >= required
-    if (leftover_c - leftover_b).abs() > 1e-6 {
-        return leftover_c < leftover_b;
+    // Secondary: smaller total size (less leftover)
+    if (c.total_size - b.total_size).abs() > 1e-6 {
+        return c.total_size < b.total_size;
     }
     // Tertiary: fewer packages
     c.n_packages < b.n_packages
@@ -197,16 +211,18 @@ pub fn optimize_shopping_list(
     let mut total_cost: Option<u64> = Some(0);
 
     for (key, required) in requirements {
-        // Skip pure "to taste" / presence-only lines with no quantity.
         if *required <= 0.0 {
             continue;
         }
-        let packages = catalog.packages_for(key);
-        let (picks, purchased, cost) = optimize_purchase(*required, &packages, opts);
-        let leftover = (purchased - required).max(0.0);
+        let (req_mass_or_vol, packages) = catalog.packages_for_requirement(key, *required);
+        let (picks, purchased, cost) = optimize_purchase(req_mass_or_vol, &packages, opts);
+        // Map purchased back for display in the requirement's kind when converted.
+        let (display_required, display_purchased, display_unit) =
+            catalog.display_amounts(key, *required, purchased);
+        let leftover = (display_purchased - display_required).max(0.0);
         let threshold = opts
             .leftover_abs_eps
-            .max(opts.leftover_rel_eps * required.abs());
+            .max(opts.leftover_rel_eps * display_required.abs());
         let flagged = leftover > threshold;
 
         if let Some(c) = cost {
@@ -214,16 +230,15 @@ pub fn optimize_shopping_list(
                 *t += c;
             }
         } else if !picks.is_empty() {
-            // Purchased something without a known price → total incomplete.
             total_cost = None;
         }
 
         items.push(ShoppingItem {
             ingredient: key.clone(),
-            required_canonical: *required,
-            required_unit_label: ShoppingList::kind_label(key.kind).to_string(),
+            required_canonical: display_required,
+            required_unit_label: display_unit,
             packages: picks,
-            purchased_canonical: purchased,
+            purchased_canonical: display_purchased,
             leftover_canonical: leftover,
             total_cost_cents: cost,
             leftover_flagged: flagged,
@@ -270,9 +285,6 @@ mod tests {
 
     #[test]
     fn prefer_less_leftover_when_costs_differ_secondary() {
-        // 14 oz needed → 16 oz has less leftover than 32 oz
-        // Even if we only look at leftover when comparing... both have costs;
-        // 16oz costs 199, 32oz costs 349 → cost primary picks 16oz anyway.
         let req = oz_mass(14.0);
         let (picks, purchased, cost) =
             optimize_purchase(req, &milk_packages(), &OptimizeOptions::default());
@@ -287,7 +299,6 @@ mod tests {
 
     #[test]
     fn prefer_cheaper_when_zero_leftover() {
-        // 32 oz needed: 2x16 = 398 cents, 1x32 = 349 cents → prefer 32
         let req = oz_mass(32.0);
         let (picks, purchased, cost) =
             optimize_purchase(req, &milk_packages(), &OptimizeOptions::default());
@@ -314,9 +325,10 @@ mod tests {
             },
         ];
         let req = oz_mass(14.0);
-        let (picks, purchased, _) = optimize_purchase(req, &pkgs, &OptimizeOptions::default());
+        let (picks, purchased, cost) = optimize_purchase(req, &pkgs, &OptimizeOptions::default());
         assert!((picks[0].size_canonical - oz_mass(16.0)).abs() < 0.01);
         assert!(purchased - req < oz_mass(3.0));
+        assert_eq!(cost, None);
     }
 
     #[test]
@@ -331,5 +343,67 @@ mod tests {
         assert_eq!(picks[0].count, 3);
         assert!((purchased - 300.0).abs() < 0.01);
         assert_eq!(cost, Some(150));
+    }
+
+    #[test]
+    fn mixed_priced_and_unpriced_reports_unknown_cost() {
+        let pkgs = vec![
+            Package {
+                label: "20u priced".into(),
+                size_canonical: 20.0,
+                price_cents: Some(100),
+                kind: UnitKind::Count,
+            },
+            Package {
+                label: "20u free?".into(),
+                size_canonical: 20.0,
+                price_cents: None,
+                kind: UnitKind::Count,
+            },
+        ];
+        // Need 30: only feasible with both types or 2x priced.
+        // 2x priced = 200 cost, 0 leftover from 40; 1 priced + 1 unpriced = unknown cost, 10 leftover.
+        // Known cost 200 should beat unknown.
+        let (picks, _purchased, cost) = optimize_purchase(30.0, &pkgs, &OptimizeOptions::default());
+        assert_eq!(cost, Some(200));
+        assert!(picks.iter().all(|p| p.unit_price_cents.is_some()));
+
+        // Force only unpriced by using packages where priced can't cover alone efficiently...
+        // Need 20 with only mixed - use 1 unpriced only possible with size 20 unpriced
+        let only_mixed_needed = vec![
+            Package {
+                label: "10 priced".into(),
+                size_canonical: 10.0,
+                price_cents: Some(50),
+                kind: UnitKind::Count,
+            },
+            Package {
+                label: "25 unpriced".into(),
+                size_canonical: 25.0,
+                price_cents: None,
+                kind: UnitKind::Count,
+            },
+        ];
+        // Need 25: 1x unpriced (unknown cost, 0 leftover) vs 3x priced (150, 5 leftover)
+        // Known cost should win even with leftover
+        let (_picks, _, cost) =
+            optimize_purchase(25.0, &only_mixed_needed, &OptimizeOptions::default());
+        assert_eq!(cost, Some(150));
+
+        // Need 26: 3x priced = 30 (cost 150), or 1 unpriced doesn't cover... 1 unpriced + 1 priced = unknown
+        // Known 200 for 4x10=40
+        let (_p, _, cost) =
+            optimize_purchase(26.0, &only_mixed_needed, &OptimizeOptions::default());
+        assert!(cost.is_some());
+
+        // Only unpriced packages available that cover: cost must be None
+        let unpriced_only = vec![Package {
+            label: "30u".into(),
+            size_canonical: 30.0,
+            price_cents: None,
+            kind: UnitKind::Count,
+        }];
+        let (_p, _, cost) = optimize_purchase(30.0, &unpriced_only, &OptimizeOptions::default());
+        assert_eq!(cost, None);
     }
 }
