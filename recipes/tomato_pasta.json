@@ -1,0 +1,18 @@
+{
+  "title": "Simple Tomato Pasta",
+  "servings": 4,
+  "ingredients": [
+    "500g pasta",
+    "2 cups tomato sauce",
+    "3 cloves garlic",
+    "2 tbsp olive oil",
+    "1 tsp salt",
+    "1/2 cup parmesan"
+  ],
+  "steps": [
+    "Boil pasta.",
+    "Saute garlic in oil, add sauce.",
+    "Toss with pasta and cheese."
+  ],
+  "tags": ["dinner", "pasta"]
+}

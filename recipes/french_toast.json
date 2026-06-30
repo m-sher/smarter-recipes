@@ -1,0 +1,17 @@
+{
+  "title": "French Toast",
+  "servings": 2,
+  "ingredients": [
+    "4 slices bread",
+    "2 eggs",
+    "1/2 cup milk",
+    "1 tsp vanilla",
+    "1 tbsp butter",
+    "1 tbsp sugar"
+  ],
+  "steps": [
+    "Beat eggs, milk, vanilla, and sugar.",
+    "Dip bread and fry in butter."
+  ],
+  "tags": ["breakfast"]
+}

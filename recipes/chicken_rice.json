@@ -1,0 +1,19 @@
+{
+  "title": "Chicken and Rice",
+  "servings": 4,
+  "ingredients": [
+    "1.5 lb chicken breast",
+    "2 cups rice",
+    "1 onion, diced",
+    "2 cloves garlic",
+    "3 cups chicken broth",
+    "1 tsp salt",
+    "2 tbsp olive oil"
+  ],
+  "steps": [
+    "Brown chicken in oil.",
+    "Saute onion and garlic.",
+    "Add rice and broth; simmer until done."
+  ],
+  "tags": ["dinner"]
+}

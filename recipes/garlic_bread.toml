@@ -1,0 +1,13 @@
+title = "Garlic Bread"
+servings = 4.0
+ingredients = [
+  "1 loaf bread",
+  "4 tbsp butter",
+  "3 cloves garlic",
+  "1 tbsp parsley",
+]
+steps = [
+  "Mix butter and garlic.",
+  "Spread on bread and bake.",
+]
+tags = ["side"]
