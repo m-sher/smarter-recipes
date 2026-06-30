@@ -115,7 +115,17 @@ pub fn optimize_purchase(
     }
 
     let mut counts = vec![0u32; pkgs.len()];
-    search(&pkgs, 0, required, opts, &mut counts, 0.0, None, 0, &mut best);
+    search(
+        &pkgs,
+        0,
+        required,
+        opts,
+        &mut counts,
+        0.0,
+        None,
+        0,
+        &mut best,
+    );
 
     // Fallback: single largest packages until covered
     let combo = best.unwrap_or_else(|| {
