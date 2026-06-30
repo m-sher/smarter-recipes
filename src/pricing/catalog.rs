@@ -380,6 +380,20 @@ impl PackageCatalog {
         })
     }
 
+    /// When true, recipe volume for this ingredient should be priced as mass (density known
+    /// and mass packages available).
+    fn uses_mass_via_density(&self, key: &IngredientKey) -> bool {
+        key.kind == UnitKind::Volume
+            && volume_ml_to_mass_g(&key.name, 1.0).is_some()
+            && self
+                .packages_for(&IngredientKey {
+                    name: key.name.clone(),
+                    kind: UnitKind::Mass,
+                })
+                .iter()
+                .any(|p| p.kind == UnitKind::Mass)
+    }
+
     /// Packages and required amount in the **package** measurement space.
     ///
     /// For volume-measured dry goods with a known density, converts required ml → g
@@ -389,19 +403,13 @@ impl PackageCatalog {
         key: &IngredientKey,
         required: f64,
     ) -> (f64, Vec<Package>) {
-        // Prefer mass packages for volume requirements when density is known.
-        if key.kind == UnitKind::Volume {
-            if let Some(grams) = volume_ml_to_mass_g(&key.name, required) {
-                let mass_key = IngredientKey {
-                    name: key.name.clone(),
-                    kind: UnitKind::Mass,
-                };
-                let packs = self.packages_for(&mass_key);
-                // Only use conversion if we got real mass packages (not pure fallback with wrong kind)
-                if packs.iter().any(|p| p.kind == UnitKind::Mass) {
-                    return (grams, packs);
-                }
-            }
+        if self.uses_mass_via_density(key) {
+            let grams = volume_ml_to_mass_g(&key.name, required).expect("density checked");
+            let packs = self.packages_for(&IngredientKey {
+                name: key.name.clone(),
+                kind: UnitKind::Mass,
+            });
+            return (grams, packs);
         }
         (required, self.packages_for(key))
     }
@@ -414,16 +422,10 @@ impl PackageCatalog {
         required_recipe: f64,
         purchased_package_space: f64,
     ) -> (f64, f64, String) {
-        if key.kind == UnitKind::Volume {
-            if let Some(grams_req) = volume_ml_to_mass_g(&key.name, required_recipe) {
-                let mass_packs = self.packages_for(&IngredientKey {
-                    name: key.name.clone(),
-                    kind: UnitKind::Mass,
-                });
-                if mass_packs.iter().any(|p| p.kind == UnitKind::Mass) {
-                    return (grams_req, purchased_package_space, "g".into());
-                }
-            }
+        if self.uses_mass_via_density(key) {
+            let grams_req =
+                volume_ml_to_mass_g(&key.name, required_recipe).expect("density checked");
+            return (grams_req, purchased_package_space, "g".into());
         }
         let label = match key.kind {
             UnitKind::Mass => "g",

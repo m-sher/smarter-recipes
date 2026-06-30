@@ -21,9 +21,10 @@
 //!
 //! [`trip_breakdown_for_plan`] walks meals in plan order and reports which
 //! ingredient keys are **newly introduced** at each meal (not seen in earlier
-//! meals). That makes the planner's ordering observable: front-loading shared
-//! ingredients reduces the number of trips that introduce new keys. A "trip" is
-//! modeled as one shopping run per day by default (configurable).
+//! meals). That makes the planner's ordering observable: shared ingredients
+//! appear once as "new" on the earliest meal that needs them, then are covered
+//! for later meals. A "trip" is modeled as one shopping day; `new_keys_per_day`
+//! sums first-seen keys by plan day.
 
 mod optimize;
 
@@ -68,22 +69,24 @@ pub struct TripStep {
 pub struct TripBreakdown {
     pub plan_id: String,
     pub steps: Vec<TripStep>,
-    /// Unique ingredients if meals were in plan order (cumulative at end).
+    /// Unique ingredients across the whole plan.
     pub total_unique_ingredients: usize,
-    /// Sum of new keys per day (one "trip" per day): how many first-seen keys per day.
+    /// First-seen ingredient keys summed by plan day (one shopping trip per day).
     pub new_keys_per_day: Vec<usize>,
-    /// Counterfactual: average new keys per day if meal order were reversed.
-    pub reversed_new_keys_per_day: Vec<usize>,
-    /// How many fewer first-seen keys appear in the first half of days vs reversed order.
-    pub ordering_front_load_advantage: i32,
+    /// Human-readable explanation of what the ordering implies for shopping.
     pub summary: String,
 }
 
 /// Explain how plan ordering affects when ingredients are first needed (proxy for trips).
+///
+/// Walks meals in schedule order and records which ingredient keys appear for the
+/// first time at each meal. Later meals that reuse those keys contribute 0 new keys
+/// — so an overlap-maximizing order shows large `new_count` early and smaller
+/// increments later when ingredients are reused.
 pub fn trip_breakdown_for_plan(store: &Store, plan: &MealPlan) -> Result<TripBreakdown> {
     let mut steps = Vec::new();
     let mut coverage: HashSet<IngredientKey> = HashSet::new();
-    let mut per_day_new: Vec<usize> = vec![0; plan.days as usize];
+    let mut per_day_new: Vec<usize> = vec![0; plan.days.max(1) as usize];
 
     for m in &plan.meals {
         let recipe = store
@@ -97,8 +100,9 @@ pub fn trip_breakdown_for_plan(store: &Store, plan: &MealPlan) -> Result<TripBre
             }
         }
         let n = new_keys.len();
-        if let Some(slot) = per_day_new.get_mut(m.day as usize) {
-            *slot += n;
+        let day_idx = m.day as usize;
+        if day_idx < per_day_new.len() {
+            per_day_new[day_idx] += n;
         }
         steps.push(TripStep {
             day: m.day,
@@ -110,50 +114,83 @@ pub fn trip_breakdown_for_plan(store: &Store, plan: &MealPlan) -> Result<TripBre
         });
     }
 
-    // Reversed meal order counterfactual
-    let mut rev_coverage: HashSet<IngredientKey> = HashSet::new();
-    let mut rev_per_day: Vec<usize> = vec![0; plan.days as usize];
-    for m in plan.meals.iter().rev() {
-        let recipe = store
-            .get_recipe(m.recipe_id.as_str())?
-            .ok_or_else(|| anyhow::anyhow!("recipe {} missing", m.recipe_id))?;
-        let mut n = 0usize;
-        for line in &recipe.ingredients {
-            let key = IngredientKey::from_line(line);
-            if rev_coverage.insert(key) {
-                n += 1;
-            }
-        }
-        // Map reversed position back onto days in reverse schedule order
-        if let Some(slot) = rev_per_day.get_mut(m.day as usize) {
-            *slot += n;
-        }
-    }
-
-    let half = (plan.days as usize).div_ceil(2).max(1);
-    let front: usize = per_day_new.iter().take(half).sum();
-    let rev_front: usize = rev_per_day.iter().take(half).sum();
-    let advantage = rev_front as i32 - front as i32;
-
-    let summary = format!(
-        "Plan order introduces {} unique ingredient key(s). New keys per day (plan order): {:?}. \
-         Reversed meal order would introduce {:?} new keys by day (same day labels). \
-         First-half-of-days new-key count: plan={front}, reversed={rev_front} \
-         (positive advantage {advantage} means plan front-loads shared ingredients better / \
-         spreads fewer brand-new keys early than the reverse order).",
-        coverage.len(),
-        per_day_new,
-        rev_per_day,
-        advantage = advantage
-    );
+    let total = coverage.len();
+    let mid = steps.len() / 2;
+    let early_new: usize = steps.iter().take(mid).map(|s| s.new_count).sum();
+    let late_new: usize = steps.iter().skip(mid).map(|s| s.new_count).sum();
+    let summary = if steps.is_empty() {
+        "No meals in plan; nothing to analyze.".into()
+    } else {
+        format!(
+            "Walked {} meal(s) in plan order; {} distinct ingredient key(s) in total. \
+             New keys introduced per day (trip proxy): {:?}. \
+             First half of meals introduced {} new key(s); second half introduced {} \
+             (a well-ordered overlap plan typically shows more new keys early, then reuse). \
+             Each step lists exactly which keys are first required at that meal — later meals \
+             that only reuse earlier ingredients show new_count = 0.",
+            steps.len(),
+            total,
+            per_day_new,
+            early_new,
+            late_new
+        )
+    };
 
     Ok(TripBreakdown {
         plan_id: plan.id.clone(),
         steps,
-        total_unique_ingredients: coverage.len(),
+        total_unique_ingredients: total,
         new_keys_per_day: per_day_new,
-        reversed_new_keys_per_day: rev_per_day,
-        ordering_front_load_advantage: advantage,
         summary,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::Recipe;
+    use crate::normalize::normalize_line;
+    use tempfile::TempDir;
+
+    fn rec(title: &str, ings: &[&str]) -> Recipe {
+        let mut r = Recipe::new(title);
+        r.ingredients = ings.iter().map(|l| normalize_line(l)).collect();
+        r
+    }
+
+    #[test]
+    fn trip_steps_mark_reuse_as_zero_new() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let a = rec("A", &["1 cup milk", "2 eggs"]);
+        let b = rec("B", &["1 cup milk", "1 cup flour"]);
+        store.save_recipe(&a).unwrap();
+        store.save_recipe(&b).unwrap();
+        let plan = MealPlan {
+            id: "p1".into(),
+            days: 2,
+            meals_per_day: 1,
+            meals: vec![
+                crate::domain::PlannedMeal {
+                    day: 0,
+                    meal: 0,
+                    recipe_id: a.id.clone(),
+                    recipe_title: a.title.clone(),
+                },
+                crate::domain::PlannedMeal {
+                    day: 1,
+                    meal: 0,
+                    recipe_id: b.id.clone(),
+                    recipe_title: b.title.clone(),
+                },
+            ],
+            rationale: "test".into(),
+        };
+        let t = trip_breakdown_for_plan(&store, &plan).unwrap();
+        assert_eq!(t.steps[0].new_count, 2); // milk, eggs
+        assert_eq!(t.steps[1].new_count, 1); // flour only; milk reused
+        assert_eq!(t.total_unique_ingredients, 3);
+        assert!(!t.summary.contains("positive advantage"));
+        assert!(!t.summary.contains("reversed"));
+    }
 }
