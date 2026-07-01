@@ -5,6 +5,7 @@
 
 mod crawl;
 mod file;
+mod manual;
 mod ocr;
 mod url;
 
@@ -13,6 +14,7 @@ pub use crawl::{
     ScrapeEvent, ScrapeOutcome,
 };
 pub use file::FileSource;
+pub use manual::read_manual_recipe;
 pub use ocr::ImageOcrSource;
 pub use url::UrlSource;
 
