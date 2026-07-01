@@ -70,7 +70,8 @@ impl IngredientKey {
     }
 }
 
-/// Lowercase, collapse whitespace, strip trailing punctuation for identity.
+/// Lowercase, collapse whitespace, strip trailing punctuation and leading size
+/// descriptors for identity (so "2 large eggs" aggregates with "eggs").
 pub fn normalize_ingredient_name(name: &str) -> String {
     let s = name.trim().to_lowercase();
     let s = s.trim_end_matches(['.', ',', ';']);
@@ -87,5 +88,83 @@ pub fn normalize_ingredient_name(name: &str) -> String {
             prev_space = false;
         }
     }
-    out
+    strip_leading_descriptors(&out)
+}
+
+/// Remove leading size/quality descriptors used only for identity matching.
+/// Conservative and leading-only: words that change the ingredient itself
+/// (ground, whole, colors, brown/white, sweet, …) are intentionally excluded.
+fn strip_leading_descriptors(name: &str) -> String {
+    const MULTI: &[&str] = &["extra large", "extra-large"];
+    const SINGLE: &[&str] = &[
+        "large", "medium", "small", "jumbo", "fresh", "ripe", "boneless", "skinless",
+    ];
+    let mut s = name;
+    loop {
+        let mut stripped = None;
+        for d in MULTI {
+            if let Some(rest) = s.strip_prefix(d) {
+                if let Some(rest) = rest.strip_prefix(' ') {
+                    stripped = Some(rest);
+                    break;
+                }
+            }
+        }
+        if stripped.is_none() {
+            for d in SINGLE {
+                if let Some(rest) = s.strip_prefix(d) {
+                    if let Some(rest) = rest.strip_prefix(' ') {
+                        stripped = Some(rest);
+                        break;
+                    }
+                }
+            }
+        }
+        match stripped {
+            Some(rest) if !rest.trim().is_empty() => s = rest,
+            _ => break,
+        }
+    }
+    s.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_leading_size_descriptors() {
+        assert_eq!(normalize_ingredient_name("large eggs"), "eggs");
+        assert_eq!(normalize_ingredient_name("Extra Large Eggs"), "eggs");
+        assert_eq!(
+            normalize_ingredient_name("boneless skinless chicken breast"),
+            "chicken breast"
+        );
+    }
+
+    #[test]
+    fn keeps_meaningful_leading_words() {
+        assert_eq!(
+            normalize_ingredient_name("all-purpose flour"),
+            "all-purpose flour"
+        );
+        assert_eq!(
+            normalize_ingredient_name("red bell pepper"),
+            "red bell pepper"
+        );
+        assert_eq!(normalize_ingredient_name("ground beef"), "ground beef");
+    }
+
+    #[test]
+    fn descriptor_only_name_is_preserved() {
+        assert_eq!(normalize_ingredient_name("large"), "large");
+    }
+
+    #[test]
+    fn key_aggregates_across_descriptor() {
+        assert_eq!(
+            IngredientKey::new("large eggs", UnitKind::Count),
+            IngredientKey::new("eggs", UnitKind::Count)
+        );
+    }
 }
