@@ -67,6 +67,55 @@ static RE_UNIT_THEN_NAME: Lazy<Regex> = Lazy::new(|| {
     .expect("unit name")
 });
 
+/// Rewrite Unicode vulgar fractions to ASCII so the quantity parser handles them.
+/// `1½` and `1 ½` become `1 1/2`; a standalone `¼` becomes `1/4`.
+fn rewrite_unicode_fractions(s: &str) -> String {
+    fn expand(c: char) -> Option<&'static str> {
+        Some(match c {
+            '½' => "1/2",
+            '¼' => "1/4",
+            '¾' => "3/4",
+            '⅓' => "1/3",
+            '⅔' => "2/3",
+            '⅕' => "1/5",
+            '⅖' => "2/5",
+            '⅗' => "3/5",
+            '⅘' => "4/5",
+            '⅙' => "1/6",
+            '⅚' => "5/6",
+            '⅛' => "1/8",
+            '⅜' => "3/8",
+            '⅝' => "5/8",
+            '⅞' => "7/8",
+            _ => return None,
+        })
+    }
+    if !s.chars().any(|c| expand(c).is_some()) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        match expand(c) {
+            Some(frac) => {
+                if out
+                    .trim_end()
+                    .chars()
+                    .last()
+                    .is_some_and(|p| p.is_ascii_digit())
+                {
+                    while out.ends_with(' ') {
+                        out.pop();
+                    }
+                    out.push(' ');
+                }
+                out.push_str(frac);
+            }
+            None => out.push(c),
+        }
+    }
+    out
+}
+
 fn word_quantity(w: &str) -> Option<f64> {
     match w.to_lowercase().as_str() {
         "a" | "an" | "one" => Some(1.0),
@@ -174,6 +223,9 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
             uncertain: true,
         };
     }
+
+    let rewritten = rewrite_unicode_fractions(line);
+    let line = rewritten.as_str();
 
     // "to taste" / "as needed" only when there is no leading quantity — otherwise
     // parse normally and attach a note (preserve qty/unit and original name casing).
@@ -502,5 +554,42 @@ mod tests {
             "got {}",
             u.to_base
         );
+    }
+
+    #[test]
+    fn unicode_fraction_standalone() {
+        let (q, k, n) = qty_unit("¼ cup flour");
+        assert_eq!(q, Some(0.25));
+        assert_eq!(k, Some(UnitKind::Volume));
+        assert_eq!(n, "flour");
+    }
+
+    #[test]
+    fn unicode_fraction_glued() {
+        let (q, k, n) = qty_unit("1½ cups milk");
+        assert_eq!(q, Some(1.5));
+        assert_eq!(k, Some(UnitKind::Volume));
+        assert_eq!(n, "milk");
+    }
+
+    #[test]
+    fn unicode_fraction_spaced() {
+        let (q, _, n) = qty_unit("1 ½ cups milk");
+        assert_eq!(q, Some(1.5));
+        assert_eq!(n, "milk");
+    }
+
+    #[test]
+    fn unicode_fraction_two_thirds() {
+        let (q, k, _) = qty_unit("⅔ cup sugar");
+        assert!((q.unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(k, Some(UnitKind::Volume));
+    }
+
+    #[test]
+    fn ascii_mixed_number_still_parses() {
+        let (q, _, n) = qty_unit("1 1/2 cups milk");
+        assert_eq!(q, Some(1.5));
+        assert_eq!(n, "milk");
     }
 }
