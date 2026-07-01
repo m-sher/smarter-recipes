@@ -3,8 +3,10 @@
 use crate::domain::{MealPlan, Recipe};
 use crate::ingest::ingest_from;
 use crate::planning::{plan_meals, PlanOptions};
-use crate::pricing::PackageCatalog;
-use crate::shopping::shopping_list_for_plan;
+use crate::pricing::{
+    enrich_catalog_from_source, FixtureStoreSource, OpenFoodFactsSource, PackageCatalog,
+};
+use crate::shopping::{shopping_list_for_plan, trip_breakdown_for_plan};
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -90,6 +92,15 @@ pub enum Commands {
         /// Optional JSON catalog overlay for package sizes/prices
         #[arg(long)]
         catalog: Option<PathBuf>,
+        /// Show per-trip / ordering benefit breakdown (new ingredients by meal/day)
+        #[arg(long)]
+        trips: bool,
+        /// Fetch package sizes from a store source (openfoodfacts | fixture)
+        #[arg(long)]
+        fetch_prices: Option<String>,
+        /// Fixture JSON path when --fetch-prices=fixture (default: fixtures/store_catalog.json)
+        #[arg(long)]
+        store_fixture: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -206,6 +217,9 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Shop {
             plan,
             catalog,
+            trips,
+            fetch_prices,
+            store_fixture,
             json,
         } => {
             let plan = resolve_plan(&store, &plan)?;
@@ -214,11 +228,80 @@ pub fn run(cli: Cli) -> Result<()> {
                 cat.load_json_overlay(&path)
                     .with_context(|| format!("loading catalog {}", path.display()))?;
             }
+            if let Some(ref src_name) = fetch_prices {
+                let names: Vec<String> = {
+                    let ids: Vec<_> = plan.meals.iter().map(|m| m.recipe_id.clone()).collect();
+                    let req = store.aggregate_ingredients(&ids)?;
+                    req.into_iter()
+                        .map(|(k, _)| k.name)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect()
+                };
+                let notes = match src_name.to_lowercase().as_str() {
+                    "openfoodfacts" | "off" => {
+                        let src = OpenFoodFactsSource::default();
+                        enrich_catalog_from_source(&mut cat, &src, &names)
+                    }
+                    "fixture" => {
+                        let path = store_fixture
+                            .unwrap_or_else(|| PathBuf::from("fixtures/store_catalog.json"));
+                        let src = FixtureStoreSource::new(path);
+                        enrich_catalog_from_source(&mut cat, &src, &names)
+                    }
+                    other => bail!(
+                        "unknown --fetch-prices source '{other}' (use openfoodfacts or fixture)"
+                    ),
+                };
+                for n in &notes {
+                    eprintln!("{n}");
+                }
+            }
             let list = shopping_list_for_plan(&store, &plan, &cat)?;
+            let trip_info = if trips {
+                Some(trip_breakdown_for_plan(&store, &plan)?)
+            } else {
+                None
+            };
             if json {
-                println!("{}", serde_json::to_string_pretty(&list)?);
+                if let Some(t) = trip_info {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "shopping_list": list,
+                            "trips": t,
+                        }))?
+                    );
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&list)?);
+                }
             } else {
                 print_shopping_list(&list);
+                if let Some(t) = trip_info {
+                    println!(
+                        "
+--- Trip / ordering analysis ---
+"
+                    );
+                    for s in &t.steps {
+                        println!(
+                            "Day {} meal {}: {} — {} new ingredient(s) (cumulative {})",
+                            s.day + 1,
+                            s.meal + 1,
+                            s.recipe_title,
+                            s.new_count,
+                            s.cumulative_unique
+                        );
+                        for k in &s.new_ingredient_keys {
+                            println!("    + {k}");
+                        }
+                    }
+                    println!(
+                        "
+{}",
+                        t.summary
+                    );
+                }
             }
         }
         Commands::Export { id, output } => {

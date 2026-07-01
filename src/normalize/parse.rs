@@ -175,21 +175,24 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
         };
     }
 
-    // Handle "to taste" / "as needed" with no quantity
+    // "to taste" / "as needed" only when there is no leading quantity — otherwise
+    // parse normally and attach a note (preserve qty/unit and original name casing).
     let lower = line.to_lowercase();
-    if lower.contains("to taste") || lower.contains("as needed") || lower.contains("as desired") {
-        let name = lower
-            .replace("to taste", "")
-            .replace("as needed", "")
-            .replace("as desired", "")
-            .trim()
-            .trim_end_matches(',')
-            .trim()
-            .to_string();
+    let has_taste_note =
+        lower.contains("to taste") || lower.contains("as needed") || lower.contains("as desired");
+    if has_taste_note && parse_quantity_prefix(line).is_none() {
+        // Strip trailing taste notes from the name, preserving non-lowercased source when possible.
+        let mut name = line.to_string();
+        for phrase in ["to taste", "as needed", "as desired", "or to taste"] {
+            if let Some(idx) = name.to_lowercase().find(phrase) {
+                name = name[..idx].to_string();
+            }
+        }
+        name = name.trim().trim_end_matches(',').trim().to_string();
         let name = if name.is_empty() {
             clean_name(line)
         } else {
-            name
+            clean_name(&name)
         };
         return ParsedIngredient {
             name,
@@ -287,6 +290,15 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
     let unit: Option<Unit> = unit;
 
     let uncertain = uncertain || (qty.is_some() && unit.is_none() && name.is_empty());
+
+    let note = if has_taste_note {
+        match note {
+            Some(n) => Some(format!("{n}; to taste / as needed")),
+            None => Some("to taste / as needed".into()),
+        }
+    } else {
+        note
+    };
 
     ParsedIngredient {
         name: if name.is_empty() {
@@ -450,5 +462,45 @@ mod tests {
         let p = parse_ingredient_line("1–2 tsp vanilla");
         assert_eq!(p.quantity, Some(1.5));
         assert!(p.uncertain);
+    }
+
+    #[test]
+    fn to_taste_preserves_quantity() {
+        let p = parse_ingredient_line("1 tsp salt, or to taste");
+        assert_eq!(p.quantity, Some(1.0));
+        assert_eq!(p.unit.as_ref().map(|u| u.kind), Some(UnitKind::Volume));
+        assert!(p.name.to_lowercase().contains("salt"));
+        assert!(
+            !p.name
+                .chars()
+                .all(|c| c.is_lowercase() || !c.is_alphabetic())
+                || p.name.contains("salt")
+        );
+        // Name should not be fully forced to a garbage lowercase of the whole line
+        assert!(!p.name.contains("to taste"));
+    }
+
+    #[test]
+    fn t_abbrev_is_teaspoon() {
+        let p = parse_ingredient_line("1 t salt");
+        assert_eq!(p.quantity, Some(1.0));
+        let u = p.unit.unwrap();
+        assert!(
+            (u.to_base - 4.92892159375).abs() < 1e-6,
+            "got {}",
+            u.to_base
+        );
+    }
+
+    #[test]
+    fn uppercase_t_abbrev_is_tablespoon() {
+        let p = parse_ingredient_line("1 T butter");
+        assert_eq!(p.quantity, Some(1.0));
+        let u = p.unit.unwrap();
+        assert!(
+            (u.to_base - 14.78676478125).abs() < 1e-6,
+            "got {}",
+            u.to_base
+        );
     }
 }
