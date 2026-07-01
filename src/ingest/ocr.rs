@@ -24,7 +24,7 @@ impl RecipeSourceIngest for ImageOcrSource {
             bail!("image not found: {}", path.display());
         }
 
-        // Prefer sidecar text for reproducibility / offline use
+        // A `.txt` sidecar with the same stem takes precedence over running OCR.
         let sidecar = path.with_extension("txt");
         let text = if sidecar.exists() {
             std::fs::read_to_string(&sidecar)
