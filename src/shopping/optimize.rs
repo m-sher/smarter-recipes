@@ -67,11 +67,18 @@ pub fn optimize_purchase(
         return (vec![], 0.0, None);
     }
 
-    let mut pkgs: Vec<&Package> = packages.iter().filter(|p| p.size_canonical > 0.0).collect();
+    let mut pkgs: Vec<&Package> = packages
+        .iter()
+        .filter(|p| p.size_canonical.is_finite() && p.size_canonical > 0.0)
+        .collect();
     if pkgs.is_empty() {
         return (vec![], 0.0, None);
     }
-    pkgs.sort_by(|a, b| a.size_canonical.partial_cmp(&b.size_canonical).unwrap());
+    pkgs.sort_by(|a, b| {
+        a.size_canonical
+            .partial_cmp(&b.size_canonical)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut best: Option<Combo> = None;
 
@@ -329,6 +336,33 @@ mod tests {
         assert!((picks[0].size_canonical - oz_mass(16.0)).abs() < 0.01);
         assert!(purchased - req < oz_mass(3.0));
         assert_eq!(cost, None);
+    }
+
+    #[test]
+    fn ignores_non_finite_package_sizes() {
+        let pkgs = vec![
+            Package {
+                label: "nan".into(),
+                size_canonical: f64::NAN,
+                price_cents: Some(50),
+                kind: UnitKind::Mass,
+            },
+            Package {
+                label: "inf".into(),
+                size_canonical: f64::INFINITY,
+                price_cents: Some(50),
+                kind: UnitKind::Mass,
+            },
+            Package {
+                label: "100g".into(),
+                size_canonical: 100.0,
+                price_cents: Some(50),
+                kind: UnitKind::Mass,
+            },
+        ];
+        let (picks, purchased, _) = optimize_purchase(150.0, &pkgs, &OptimizeOptions::default());
+        assert!(picks.iter().all(|p| p.label == "100g"));
+        assert!(purchased.is_finite() && purchased >= 150.0);
     }
 
     #[test]

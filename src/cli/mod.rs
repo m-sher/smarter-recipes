@@ -2,7 +2,8 @@
 
 use crate::domain::{MealPlan, Recipe};
 use crate::ingest::{
-    ingest_from, normalize_url, recipe_source_url, scrape_new_recipes, HttpFetcher, ScrapeEvent,
+    ingest_from, normalize_url, read_manual_recipe, recipe_source_url, scrape_new_recipes,
+    HttpFetcher, ScrapeEvent,
 };
 use crate::planning::{plan_meals, PlanOptions};
 use crate::pricing::{
@@ -32,12 +33,12 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Ingest a recipe from a source (file, url, image, or auto)
+    /// Ingest a recipe from a source (file, url, image, auto, or manual)
     Import {
-        /// Source kind: file | url | image | auto
+        /// Source kind: file | url | image | auto | manual
         source: String,
-        /// Path, URL, or image path
-        input: String,
+        /// Path, URL, or image path. Omit for `manual` to enter interactively.
+        input: Option<String>,
         /// Print recipe as JSON instead of saving
         #[arg(long)]
         dry_run: bool,
@@ -143,7 +144,15 @@ pub fn run(cli: Cli) -> Result<()> {
             input,
             dry_run,
         } => {
-            let recipe = ingest_from(&source, &input)?;
+            let interactive = matches!(source.to_lowercase().as_str(), "manual" | "interactive")
+                && input.as_deref().is_none_or(|s| s.is_empty() || s == "-");
+            let recipe = if interactive {
+                read_manual_recipe(&mut std::io::stdin().lock(), &mut std::io::stderr())?
+            } else {
+                let input = input
+                    .ok_or_else(|| anyhow::anyhow!("input is required for source '{source}'"))?;
+                ingest_from(&source, &input)?
+            };
             print_recipe_summary(&recipe);
             if dry_run {
                 println!("{}", serde_json::to_string_pretty(&recipe)?);

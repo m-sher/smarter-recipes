@@ -11,7 +11,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct UrlSource {
     pub timeout: Duration,
-    /// When set, use this HTML instead of fetching (for offline tests).
+    /// When set, this HTML is parsed instead of fetching over the network.
     pub offline_html: Option<String>,
 }
 

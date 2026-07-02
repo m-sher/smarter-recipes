@@ -53,6 +53,9 @@ smarter-recipes import image scans/recipe.png
 # Auto-detect source from the input
 smarter-recipes import auto recipes/pancakes.json
 
+# Enter a recipe interactively (title, servings, ingredients, steps)
+smarter-recipes import manual
+
 # Crawl an index page for recipe pages and import new ones.
 # Finds same-site links below the given path (e.g. .../recipes/<dish>),
 # fetches candidates concurrently (--jobs) with live progress, and imports the
@@ -122,7 +125,7 @@ src/
   storage/      SQLite persistence + ingredient dedup
   planning/     Min-union meal planner (no repeats)
   shopping/     Package purchase optimizer
-  pricing/      Offline package catalog (+ scrape extension point)
+  pricing/      Package catalog, density table, and store sources (Open Food Facts / fixture)
   cli/          clap commands
 ```
 

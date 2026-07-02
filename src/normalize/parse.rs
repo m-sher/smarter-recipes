@@ -67,6 +67,125 @@ static RE_UNIT_THEN_NAME: Lazy<Regex> = Lazy::new(|| {
     .expect("unit name")
 });
 
+static RE_LEADING_COUNT_PAREN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s*(?P<count>\d+(?:\.\d+)?)?\s*\((?P<inner>[^)]*)\)\s*(?P<rest>.+)$")
+        .expect("paren size regex")
+});
+
+/// Drop a leading container noun ("can", "jars", …) from a name fragment.
+fn strip_container_word(rest: &str) -> &str {
+    const CONTAINERS: &[&str] = &[
+        "cans",
+        "can",
+        "jars",
+        "jar",
+        "bottles",
+        "bottle",
+        "packages",
+        "package",
+        "packets",
+        "packet",
+        "bags",
+        "bag",
+        "boxes",
+        "box",
+        "tins",
+        "tin",
+        "containers",
+        "container",
+        "cartons",
+        "carton",
+    ];
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+    if CONTAINERS.contains(&first.to_lowercase().as_str()) {
+        parts.next().unwrap_or("").trim()
+    } else {
+        rest
+    }
+}
+
+/// Parse "<count> (<qty> <unit>) [container] <name>", e.g. "2 (400g) cans tomatoes".
+/// The parenthetical carries the purchasable size, so `count * size` becomes the quantity.
+/// Returns `None` when the shape doesn't match or the parenthetical is not a quantity+unit.
+fn try_parenthetical_size(line: &str) -> Option<ParsedIngredient> {
+    let caps = RE_LEADING_COUNT_PAREN.captures(line)?;
+    let inner = caps.name("inner")?.as_str().trim();
+    let rest = caps.name("rest")?.as_str().trim();
+
+    let (size_qty, _, end) = parse_quantity_prefix(inner)?;
+    let unit_tok = inner[end..].split_whitespace().next().unwrap_or("");
+    let unit = lookup_unit(unit_tok)?;
+
+    let count: f64 = caps
+        .name("count")
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(1.0);
+
+    let (name, note) = split_note(strip_container_word(rest));
+    let name = clean_name(&name);
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(ParsedIngredient {
+        name,
+        quantity: Some(count * size_qty),
+        unit: Some(unit),
+        note,
+        uncertain: false,
+    })
+}
+
+/// Rewrite Unicode vulgar fractions to ASCII so the quantity parser handles them.
+/// `1½` and `1 ½` become `1 1/2`; a standalone `¼` becomes `1/4`.
+fn rewrite_unicode_fractions(s: &str) -> String {
+    fn expand(c: char) -> Option<&'static str> {
+        Some(match c {
+            '½' => "1/2",
+            '¼' => "1/4",
+            '¾' => "3/4",
+            '⅓' => "1/3",
+            '⅔' => "2/3",
+            '⅕' => "1/5",
+            '⅖' => "2/5",
+            '⅗' => "3/5",
+            '⅘' => "4/5",
+            '⅙' => "1/6",
+            '⅚' => "5/6",
+            '⅛' => "1/8",
+            '⅜' => "3/8",
+            '⅝' => "5/8",
+            '⅞' => "7/8",
+            _ => return None,
+        })
+    }
+    if !s.chars().any(|c| expand(c).is_some()) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        match expand(c) {
+            Some(frac) => {
+                if out
+                    .trim_end()
+                    .chars()
+                    .last()
+                    .is_some_and(|p| p.is_ascii_digit())
+                {
+                    while out.ends_with(' ') {
+                        out.pop();
+                    }
+                    out.push(' ');
+                }
+                out.push_str(frac);
+            }
+            None => out.push(c),
+        }
+    }
+    out
+}
+
 fn word_quantity(w: &str) -> Option<f64> {
     match w.to_lowercase().as_str() {
         "a" | "an" | "one" => Some(1.0),
@@ -175,6 +294,9 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
         };
     }
 
+    let rewritten = rewrite_unicode_fractions(line);
+    let line = rewritten.as_str();
+
     // "to taste" / "as needed" only when there is no leading quantity — otherwise
     // parse normally and attach a note (preserve qty/unit and original name casing).
     let lower = line.to_lowercase();
@@ -201,6 +323,11 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
             note: Some("to taste / as needed".into()),
             uncertain: true,
         };
+    }
+
+    // Leading count + parenthetical package size, e.g. "1 (14 oz) can tomatoes".
+    if let Some(parsed) = try_parenthetical_size(line) {
+        return parsed;
     }
 
     // Glued number+unit at start: "500g pasta"
@@ -502,5 +629,83 @@ mod tests {
             "got {}",
             u.to_base
         );
+    }
+
+    #[test]
+    fn unicode_fraction_standalone() {
+        let (q, k, n) = qty_unit("¼ cup flour");
+        assert_eq!(q, Some(0.25));
+        assert_eq!(k, Some(UnitKind::Volume));
+        assert_eq!(n, "flour");
+    }
+
+    #[test]
+    fn unicode_fraction_glued() {
+        let (q, k, n) = qty_unit("1½ cups milk");
+        assert_eq!(q, Some(1.5));
+        assert_eq!(k, Some(UnitKind::Volume));
+        assert_eq!(n, "milk");
+    }
+
+    #[test]
+    fn unicode_fraction_spaced() {
+        let (q, _, n) = qty_unit("1 ½ cups milk");
+        assert_eq!(q, Some(1.5));
+        assert_eq!(n, "milk");
+    }
+
+    #[test]
+    fn unicode_fraction_two_thirds() {
+        let (q, k, _) = qty_unit("⅔ cup sugar");
+        assert!((q.unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(k, Some(UnitKind::Volume));
+    }
+
+    #[test]
+    fn ascii_mixed_number_still_parses() {
+        let (q, _, n) = qty_unit("1 1/2 cups milk");
+        assert_eq!(q, Some(1.5));
+        assert_eq!(n, "milk");
+    }
+
+    #[test]
+    fn parenthetical_size_single() {
+        let (q, k, n) = qty_unit("1 (14 oz) can tomatoes");
+        assert_eq!(q, Some(14.0));
+        assert_eq!(k, Some(UnitKind::Mass));
+        assert_eq!(n, "tomatoes");
+    }
+
+    #[test]
+    fn parenthetical_size_multiplied_glued() {
+        let (q, k, n) = qty_unit("2 (400g) cans tomatoes");
+        assert_eq!(q, Some(800.0));
+        assert_eq!(k, Some(UnitKind::Mass));
+        assert_eq!(n, "tomatoes");
+    }
+
+    #[test]
+    fn parenthetical_size_volume_carton() {
+        let (q, k, n) = qty_unit("1 (500 ml) carton stock");
+        assert_eq!(q, Some(500.0));
+        assert_eq!(k, Some(UnitKind::Volume));
+        assert_eq!(n, "stock");
+    }
+
+    #[test]
+    fn parenthetical_non_size_not_treated_as_size() {
+        // "(optional)" has no quantity+unit, so it must not be read as a package size.
+        let p = parse_ingredient_line("1 (optional) onion");
+        assert_eq!(p.quantity, Some(1.0));
+        assert!(p.unit.is_none());
+        assert!(p.name.contains("onion"));
+    }
+
+    #[test]
+    fn trailing_parenthetical_note_unchanged() {
+        let p = parse_ingredient_line("2 eggs (large)");
+        assert_eq!(p.quantity, Some(2.0));
+        assert_eq!(p.name, "eggs");
+        assert_eq!(p.note.as_deref(), Some("large"));
     }
 }
