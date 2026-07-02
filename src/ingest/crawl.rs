@@ -137,6 +137,31 @@ pub fn is_denied_url(u: &str) -> bool {
     })
 }
 
+/// True when the URL is a category/tag/pagination/index page that must not
+/// be stored as a recipe (JSON-LD on those pages is usually a featured recipe).
+/// Still allowed as a BFS node for link discovery.
+pub fn is_listing_url(u: &str) -> bool {
+    let Ok(url) = Url::parse(u) else {
+        return true;
+    };
+    let path = url.path().to_lowercase();
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return true;
+    }
+    const LISTING_SEGMENTS: &[&str] = &[
+        "category", "categories", "tag", "tags", "author", "authors",
+    ];
+    if segments.iter().any(|s| LISTING_SEGMENTS.contains(s)) {
+        return true;
+    }
+    // /page/2 or .../page/2
+    segments
+        .windows(2)
+        .any(|w| w[0] == "page" && w[1].chars().all(|c| c.is_ascii_digit()))
+        || (segments.last().is_some_and(|s| *s == "page"))
+}
+
 /// Extract same-host `http(s)` links from `page_url`'s HTML, applying the deny-list.
 /// Order-preserving, deduped. `root_url` is only used for host scoping (same host as seed).
 pub fn discover_scoped_links(page_url: &str, html: &str, root_url: &str) -> Vec<String> {
@@ -447,6 +472,23 @@ mod tests {
         assert!(is_denied_url("https://site.com/author/x"));
         assert!(is_denied_url("https://site.com/foo/bar.jpg"));
         assert!(!is_denied_url("https://site.com/kung-pao-chicken"));
+    }
+
+    #[test]
+    fn listing_urls_detected() {
+        assert!(is_listing_url("https://itsahero.com/category/food"));
+        assert!(is_listing_url("https://itsahero.com/category/crafty/recipes/dairy-free/page/2"));
+        assert!(is_listing_url("https://site.com/page/2"));
+        assert!(is_listing_url("https://site.com/tag/summer"));
+        assert!(is_listing_url("https://site.com/"));
+    }
+
+    #[test]
+    fn recipe_urls_not_listings() {
+        assert!(!is_listing_url("https://itsahero.com/chicken-tortellini-skillet"));
+        assert!(!is_listing_url(
+            "https://itsahero.com/delicious-air-fryer-salsa-verde-recipe"
+        ));
     }
 
     #[test]
