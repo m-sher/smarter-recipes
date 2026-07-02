@@ -149,9 +149,8 @@ pub fn is_listing_url(u: &str) -> bool {
     if segments.is_empty() {
         return true;
     }
-    const LISTING_SEGMENTS: &[&str] = &[
-        "category", "categories", "tag", "tags", "author", "authors",
-    ];
+    const LISTING_SEGMENTS: &[&str] =
+        &["category", "categories", "tag", "tags", "author", "authors"];
     if segments.iter().any(|s| LISTING_SEGMENTS.contains(s)) {
         return true;
     }
@@ -481,7 +480,9 @@ mod tests {
     #[test]
     fn listing_urls_detected() {
         assert!(is_listing_url("https://itsahero.com/category/food"));
-        assert!(is_listing_url("https://itsahero.com/category/crafty/recipes/dairy-free/page/2"));
+        assert!(is_listing_url(
+            "https://itsahero.com/category/crafty/recipes/dairy-free/page/2"
+        ));
         assert!(is_listing_url("https://site.com/page/2"));
         assert!(is_listing_url("https://site.com/tag/summer"));
         assert!(is_listing_url("https://site.com/"));
@@ -489,7 +490,9 @@ mod tests {
 
     #[test]
     fn recipe_urls_not_listings() {
-        assert!(!is_listing_url("https://itsahero.com/chicken-tortellini-skillet"));
+        assert!(!is_listing_url(
+            "https://itsahero.com/chicken-tortellini-skillet"
+        ));
         assert!(!is_listing_url(
             "https://itsahero.com/delicious-air-fryer-salsa-verde-recipe"
         ));
@@ -506,15 +509,14 @@ mod tests {
         // Category page has full Recipe JSON-LD AND a link to a real recipe.
         pages.insert(
             "https://site.com/category/food".to_string(),
-            format!(
-                r#"<html><body>
-              <script type="application/ld+json">{{
+            r#"<html><body>
+              <script type="application/ld+json">{
                 "@type":"Recipe","name":"Grilled S'mores",
                 "recipeIngredient":["bread","chocolate"]
-              }}</script>
+              }</script>
               <a href="/grilled-smores">real</a>
             </body></html>"#
-            ),
+                .to_string(),
         );
         pages.insert(
             "https://site.com/grilled-smores".to_string(),
@@ -524,10 +526,15 @@ mod tests {
         let out = scrape(&f, "https://site.com/recipes", 10, &HashSet::new(), 2);
         assert!(
             out.recipes.iter().all(|r| {
-                recipe_source_url(r).map(|u| !u.contains("/category/")).unwrap_or(true)
+                recipe_source_url(r)
+                    .map(|u| !u.contains("/category/"))
+                    .unwrap_or(true)
             }),
             "must not import category URL as recipe source: {:?}",
-            out.recipes.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
+            out.recipes
+                .iter()
+                .map(|r| r.title.clone())
+                .collect::<Vec<_>>()
         );
         // Real recipe page should still be reachable via BFS.
         assert!(
@@ -536,7 +543,9 @@ mod tests {
             out.recipes.iter().map(|r| &r.title).collect::<Vec<_>>()
         );
         assert!(
-            out.not_recipe.iter().any(|(u, _)| u.contains("/category/food")),
+            out.not_recipe
+                .iter()
+                .any(|(u, _)| u.contains("/category/food")),
             "category page should be classified not_recipe"
         );
     }

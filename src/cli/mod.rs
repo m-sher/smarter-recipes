@@ -166,9 +166,7 @@ pub fn run(cli: Cli) -> Result<()> {
             print_recipe_summary(&recipe);
             if dry_run {
                 println!("{}", serde_json::to_string_pretty(&recipe)?);
-            } else if store
-                .is_duplicate(&recipe.title, recipe_source_url(&recipe).as_deref())?
-            {
+            } else if store.is_duplicate(&recipe.title, recipe_source_url(&recipe).as_deref())? {
                 println!(
                     "Skipped: already have a recipe with this URL or title ({})",
                     recipe.title

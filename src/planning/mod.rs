@@ -49,9 +49,7 @@
 //! Complexity: O(P² · S · K) where P = pool size, S = slots, K = avg keys/recipe
 //! — fine for tens to low hundreds of recipes.
 
-use crate::domain::{
-    normalize_title_key, IngredientKey, MealPlan, PlannedMeal, Recipe, RecipeId,
-};
+use crate::domain::{normalize_title_key, IngredientKey, MealPlan, PlannedMeal, Recipe, RecipeId};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
