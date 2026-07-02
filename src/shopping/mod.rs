@@ -30,14 +30,38 @@ mod optimize;
 
 pub use optimize::{optimize_purchase, optimize_shopping_list, OptimizeOptions};
 
-use crate::domain::{IngredientKey, MealPlan, ShoppingList};
+use crate::domain::{IngredientKey, MealPlan, PantryItem, ShoppingList};
 use crate::pricing::PackageCatalog;
 use crate::storage::Store;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-/// Build an optimized shopping list for a stored plan.
+/// Subtract on-hand pantry quantities from plan requirements.
+///
+/// For each required ingredient, reduces the needed amount by the matching
+/// pantry stock (same [`IngredientKey`]). Items fully covered by the pantry are
+/// omitted. Requirements with no matching pantry entry pass through unchanged.
+pub fn apply_pantry_to_requirements(
+    requirements: &[(IngredientKey, f64)],
+    pantry: &[PantryItem],
+) -> Vec<(IngredientKey, f64)> {
+    let stock: HashMap<&IngredientKey, f64> = pantry
+        .iter()
+        .map(|p| (&p.key, p.quantity_canonical))
+        .collect();
+    let mut out = Vec::with_capacity(requirements.len());
+    for (key, need) in requirements {
+        let have = stock.get(key).copied().unwrap_or(0.0);
+        let remaining = need - have;
+        if remaining > 1e-9 {
+            out.push((key.clone(), remaining));
+        }
+    }
+    out
+}
+
+/// Build an optimized shopping list for a stored plan, net of pantry stock.
 pub fn shopping_list_for_plan(
     store: &Store,
     plan: &MealPlan,
@@ -45,9 +69,11 @@ pub fn shopping_list_for_plan(
 ) -> Result<ShoppingList> {
     let ids: Vec<_> = plan.meals.iter().map(|m| m.recipe_id.clone()).collect();
     let requirements = store.aggregate_ingredients(&ids)?;
+    let pantry = store.list_pantry()?;
+    let net = apply_pantry_to_requirements(&requirements, &pantry);
     Ok(optimize_shopping_list(
         &plan.id,
-        &requirements,
+        &net,
         catalog,
         &OptimizeOptions::default(),
     ))
@@ -148,14 +174,75 @@ pub fn trip_breakdown_for_plan(store: &Store, plan: &MealPlan) -> Result<TripBre
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Recipe;
+    use crate::domain::{Recipe, UnitKind};
     use crate::normalize::normalize_line;
+    use crate::pricing::PackageCatalog;
     use tempfile::TempDir;
 
     fn rec(title: &str, ings: &[&str]) -> Recipe {
         let mut r = Recipe::new(title);
         r.ingredients = ings.iter().map(|l| normalize_line(l)).collect();
         r
+    }
+
+    #[test]
+    fn apply_pantry_subtracts_and_drops_covered() {
+        let milk = IngredientKey::new("milk", UnitKind::Volume);
+        let eggs = IngredientKey::new("eggs", UnitKind::Count);
+        let flour = IngredientKey::new("flour", UnitKind::Mass);
+        let req = vec![
+            (milk.clone(), 500.0),
+            (eggs.clone(), 6.0),
+            (flour.clone(), 200.0),
+        ];
+        let pantry = vec![
+            PantryItem {
+                key: milk.clone(),
+                quantity_canonical: 200.0,
+            },
+            PantryItem {
+                key: eggs.clone(),
+                quantity_canonical: 12.0, // fully covers
+            },
+        ];
+        let net = apply_pantry_to_requirements(&req, &pantry);
+        assert_eq!(net.len(), 2);
+        let milk_need = net.iter().find(|(k, _)| k == &milk).unwrap().1;
+        assert!((milk_need - 300.0).abs() < 1e-9);
+        let flour_need = net.iter().find(|(k, _)| k == &flour).unwrap().1;
+        assert!((flour_need - 200.0).abs() < 1e-9);
+        assert!(!net.iter().any(|(k, _)| k == &eggs));
+    }
+
+    #[test]
+    fn shopping_list_omits_pantry_covered_ingredients() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let a = rec("A", &["1 cup milk", "2 eggs"]);
+        store.save_recipe(&a).unwrap();
+        // Stock far more milk than one cup needs; leave eggs unstocked.
+        let milk_key = IngredientKey::new("milk", UnitKind::Volume);
+        store.pantry_set(&milk_key, 10_000.0).unwrap();
+
+        let plan = MealPlan {
+            id: "p1".into(),
+            days: 1,
+            meals_per_day: 1,
+            meals: vec![crate::domain::PlannedMeal {
+                day: 0,
+                meal: 0,
+                recipe_id: a.id.clone(),
+                recipe_title: a.title.clone(),
+            }],
+            rationale: "test".into(),
+        };
+        let list = shopping_list_for_plan(&store, &plan, &PackageCatalog::with_defaults()).unwrap();
+        assert!(
+            list.items.iter().all(|i| i.ingredient.name != "milk"),
+            "milk should be fully covered by pantry: {:?}",
+            list.items
+        );
+        assert!(list.items.iter().any(|i| i.ingredient.name == "eggs"));
     }
 
     #[test]
