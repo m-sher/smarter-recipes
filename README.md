@@ -8,9 +8,10 @@ CLI tool that ingests recipes from multiple sources, stores them in a local SQLi
 |------|----------------|
 | **Ingestion** | JSON / TOML / plain text files, web pages (schema.org `Recipe` JSON-LD with HTML fallback), images via Tesseract OCR or `.txt` sidecars |
 | **Normalization** | Free-text ingredient lines → name, quantity, unit; units converted to canonical g / ml / ea for aggregation |
-| **Storage** | Embedded SQLite; ingredients deduplicated by `(name, unit kind)` |
-| **Planning** | Multi-start min-union scheduler, no recipe repeats (documented in `src/planning/mod.rs`) |
-| **Shopping** | Package multiset optimization: **cost first**, then **minimum leftover** (documented in `src/shopping/mod.rs`) |
+| **Storage** | Embedded SQLite; ingredients deduplicated by `(name, unit kind)`; pantry stock by same identity |
+| **Pantry** | Track on-hand ingredients; mark shopping results as purchased; plan and shop net of stock |
+| **Planning** | Multi-start min-union scheduler, no recipe repeats; pantry keys not counted as “new” (documented in `src/planning/mod.rs`) |
+| **Shopping** | Package multiset optimization: **cost first**, then **minimum leftover**; requirements reduced by pantry (documented in `src/shopping/mod.rs`) |
 | **Extensibility** | New ingest sources implement `RecipeSourceIngest`; custom package catalogs via JSON overlay |
 
 ## Requirements
@@ -74,14 +75,27 @@ smarter-recipes list --filter pasta
 smarter-recipes show <id-or-prefix>
 smarter-recipes status
 
-# Plan 5 days, 1 meal/day, minimize distinct ingredients (no repeats)
+# Pantry: track what you already have (canonical g / ml / ea)
+smarter-recipes pantry add '2 cups milk'
+smarter-recipes pantry add '12 eggs'
+smarter-recipes pantry set '500g flour'     # absolute quantity
+smarter-recipes pantry list
+smarter-recipes pantry remove milk          # optional: --kind volume
+# smarter-recipes pantry clear --yes
+
+# Plan 5 days, 1 meal/day, minimize distinct ingredients (no repeats).
+# On-hand pantry keys are treated as already covered when scoring plans.
 smarter-recipes plan --days 5 --per-day 1
 
 # Restrict the candidate pool
 smarter-recipes plan --days 3 --pool <id1>,<id2>,<id3>
 
 # Shopping list with package recommendations + leftover flags
+# (amounts already in the pantry are subtracted / omitted)
 smarter-recipes shop <plan-id-or-prefix>
+
+# After buying, mark the plan's package totals as purchased (add to pantry)
+smarter-recipes pantry restock <plan-id-or-prefix>
 
 # Show how plan ordering introduces ingredients (trip analysis)
 smarter-recipes shop <plan-id> --trips
@@ -124,12 +138,12 @@ smarter-recipes reparse --all
 
 ```
 src/
-  domain/       Shared types: Recipe, IngredientLine, MealPlan, units
+  domain/       Shared types: Recipe, IngredientLine, MealPlan, PantryItem, units
   normalize/    Ingredient parsing + unit tables (no I/O)
   ingest/       Pluggable sources: file, url, ocr, crawl (index scraping)
-  storage/      SQLite persistence + ingredient dedup
-  planning/     Min-union meal planner (no repeats)
-  shopping/     Package purchase optimizer
+  storage/      SQLite persistence + ingredient dedup + pantry stock
+  planning/     Min-union meal planner (no repeats; pantry-aware)
+  shopping/     Package purchase optimizer (nets against pantry)
   pricing/      Package catalog, density table, and store sources (Open Food Facts / fixture)
   cli/          clap commands
 ```
@@ -137,19 +151,20 @@ src/
 **Design choices**
 
 1. **Canonical units** — Mass→g, volume→ml, count→ea. Only same `UnitKind` quantities are summed.
-2. **Ingredient identity** — `(normalized_name, UnitKind)` so “2 cups milk” and “500 ml milk” aggregate when both are volume.
+2. **Ingredient identity** — `(normalized_name, UnitKind)` so “2 cups milk” and “500 ml milk” aggregate when both are volume. Pantry rows use the same key.
 3. **Core vs I/O** — Normalization, planning, and purchase optimization are pure and unit-tested without network or OCR.
 4. **New ingest source** — Implement `RecipeSourceIngest` in `ingest/`, wire it in `ingest_from`.
 5. **Density table** — Volume-measured dry goods (flour, sugar, salt, …) convert to mass for realistic packages (`src/pricing/density.rs`).
 6. **Store sources** — `ProductSource` trait with Open Food Facts + fixture backends (`--fetch-prices`). Graceful fallback to the offline catalog.
+7. **Pantry** — On-hand stock is optional input to planning (keys already covered) and shopping (quantities subtracted). `pantry restock <plan>` adds the shopping list’s *purchased* package totals after a trip.
 
 ### Planning algorithm (summary)
 
-Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new ingredient keys; keep the schedule with the smallest final union. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. See module docs in `src/planning/mod.rs`.
+Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new ingredient keys (relative to pantry + already selected); keep the schedule with the smallest **net** union (`|union − pantry|`). Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. See module docs in `src/planning/mod.rs`.
 
 ### Purchase optimization (summary)
 
-Enumerate bounded multisets of packages with total size ≥ required amount; rank by minimum cost, then minimum leftover, then fewer packages. See `src/shopping/mod.rs`.
+Requirements for a plan are reduced by pantry quantities first. Then enumerate bounded multisets of packages with total size ≥ required amount; rank by minimum cost, then minimum leftover, then fewer packages. See `src/shopping/mod.rs`.
 
 ## Development
 
