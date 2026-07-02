@@ -130,8 +130,15 @@ pub enum Commands {
     },
     /// Print database path and recipe/plan counts
     Status,
-    /// Re-parse ingredient lines for a recipe (after normalize improvements)
-    Reparse { id: String },
+    /// Re-parse stored ingredient lines with the current parser (after normalize
+    /// improvements). Pass a recipe id, or `--all` to reparse every recipe.
+    Reparse {
+        /// Recipe id (prefix match). Omit when using --all.
+        id: Option<String>,
+        /// Reparse every stored recipe
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -408,21 +415,39 @@ pub fn run(cli: Cli) -> Result<()> {
             println!("Recipes:  {}", recipes.len());
             println!("Plans:    {}", plans.len());
         }
-        Commands::Reparse { id } => {
-            let mut recipe = resolve_recipe(&store, &id)?;
-            for line in &mut recipe.ingredients {
-                let n = crate::normalize::normalize_line(&line.original);
-                *line = n;
+        Commands::Reparse { id, all } => match (all, id) {
+            (true, _) => {
+                let mut recipes = store.list_recipes(None)?;
+                let total = recipes.len();
+                eprintln!("Reparsing {total} recipe(s) …");
+                for (i, recipe) in recipes.iter_mut().enumerate() {
+                    reparse_recipe(recipe);
+                    store.save_recipe(recipe)?;
+                    eprintln!("  [{}/{}] {}", i + 1, total, recipe.title);
+                }
+                println!("Reparsed {total} recipe(s).");
             }
-            store.save_recipe(&recipe)?;
-            println!(
-                "Reparsed {} ingredient line(s) for {}",
-                recipe.ingredients.len(),
-                recipe.id
-            );
-        }
+            (false, Some(id)) => {
+                let mut recipe = resolve_recipe(&store, &id)?;
+                reparse_recipe(&mut recipe);
+                store.save_recipe(&recipe)?;
+                println!(
+                    "Reparsed {} ingredient line(s) for {}",
+                    recipe.ingredients.len(),
+                    recipe.id
+                );
+            }
+            (false, None) => bail!("provide a recipe id or --all"),
+        },
     }
     Ok(())
+}
+
+/// Re-normalize every ingredient line from its stored original text.
+fn reparse_recipe(recipe: &mut Recipe) {
+    for line in &mut recipe.ingredients {
+        *line = crate::normalize::normalize_line(&line.original);
+    }
 }
 
 fn short_id(id: &str) -> String {
@@ -582,5 +607,30 @@ fn print_shopping_list(list: &crate::domain::ShoppingList) {
         println!("Estimated total: ${:.2}", t as f64 / 100.0);
     } else {
         println!("Estimated total: (incomplete pricing)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::IngredientLine;
+
+    #[test]
+    fn reparse_renormalizes_from_original() {
+        // A line stored with stale parsed fields is re-derived from `original`.
+        let mut recipe = Recipe::new("Test");
+        recipe.ingredients = vec![IngredientLine {
+            original: "¼ cup flour".into(),
+            name: "STALE".into(),
+            quantity: None,
+            unit: None,
+            note: None,
+            parse_uncertain: true,
+        }];
+        reparse_recipe(&mut recipe);
+        let line = &recipe.ingredients[0];
+        assert_eq!(line.original, "¼ cup flour"); // original text preserved
+        assert_eq!(line.name, "flour");
+        assert_eq!(line.quantity, Some(0.25));
     }
 }

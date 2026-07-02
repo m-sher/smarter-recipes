@@ -92,10 +92,14 @@ smarter-recipes shop <plan-id> --fetch-prices fixture --store-fixture fixtures/s
 # Custom package sizes/prices (JSON object: name → [packages])
 smarter-recipes shop <plan-id> --catalog my_catalog.json
 
-# Export / delete / reparse
+# Export / delete
 smarter-recipes export <id> -o out.json
 smarter-recipes delete <id>
+
+# Re-parse stored recipes with the current parser (e.g. after upgrading).
+# Reads each recipe's original ingredient text — no re-import needed.
 smarter-recipes reparse <id>
+smarter-recipes reparse --all
 ```
 
 ### Package catalog JSON overlay
