@@ -503,6 +503,21 @@ impl Store {
         }
         Ok(None)
     }
+
+    /// True if a recipe with the same normalized source URL or title already exists.
+    ///
+    /// URL check (when `source_url` is `Some`) runs first; title uses
+    /// [`normalize_title_key`]. Intended for scrape/import skip-before-save.
+    pub fn is_duplicate(&self, title: &str, source_url: Option<&str>) -> Result<bool> {
+        if let Some(u) = source_url {
+            if self.find_id_by_normalized_source_url(u)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(self
+            .find_id_by_title_key(&normalize_title_key(title))?
+            .is_some())
+    }
 }
 
 #[cfg(test)]
@@ -611,5 +626,43 @@ mod tests {
             .find_id_by_title_key(&normalize_title_key("Other"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn is_duplicate_by_url_or_title() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+
+        assert!(!store
+            .is_duplicate("Anything", Some("https://example.com/a"))
+            .unwrap());
+
+        let mut r = Recipe::new("Grilled S'mores");
+        r.source = RecipeSource::Url {
+            url: "https://example.com/grilled-smores".into(),
+        };
+        r.meta.source_url = Some("https://example.com/grilled-smores".into());
+        store.save_recipe(&r).unwrap();
+
+        // Same URL, different trailing slash / host case → duplicate.
+        assert!(store
+            .is_duplicate(
+                "Different Title",
+                Some("https://EXAMPLE.com/grilled-smores/")
+            )
+            .unwrap());
+
+        // Same title key, different URL → duplicate.
+        assert!(store
+            .is_duplicate("  GRILLED S'MORES  ", Some("https://other.example/x"))
+            .unwrap());
+
+        // Title-only candidate (no URL) still matches existing title.
+        assert!(store.is_duplicate("grilled s'mores", None).unwrap());
+
+        // Unrelated title and URL → not a duplicate.
+        assert!(!store
+            .is_duplicate("Pasta Night", Some("https://example.com/pasta"))
+            .unwrap());
     }
 }
