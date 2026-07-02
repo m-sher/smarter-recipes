@@ -1,7 +1,9 @@
 //! CLI command definitions and handlers.
 
 use crate::domain::{MealPlan, Recipe};
-use crate::ingest::ingest_from;
+use crate::ingest::{
+    ingest_from, normalize_url, recipe_source_url, scrape_new_recipes, HttpFetcher,
+};
 use crate::planning::{plan_meals, PlanOptions};
 use crate::pricing::{
     enrich_catalog_from_source, FixtureStoreSource, OpenFoodFactsSource, PackageCatalog,
@@ -10,6 +12,7 @@ use crate::shopping::{shopping_list_for_plan, trip_breakdown_for_plan};
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -36,6 +39,17 @@ pub enum Commands {
         /// Path, URL, or image path
         input: String,
         /// Print recipe as JSON instead of saving
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Crawl a parent/index URL for recipe pages and import new ones
+    Scrape {
+        /// Index/parent URL, e.g. https://example.com/recipes
+        url: String,
+        /// Max number of new recipes to import this run
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Discover and report without saving
         #[arg(long)]
         dry_run: bool,
     },
@@ -133,6 +147,46 @@ pub fn run(cli: Cli) -> Result<()> {
             } else {
                 store.save_recipe(&recipe)?;
                 println!("Saved recipe {} to {}", recipe.id, store.path().display());
+            }
+        }
+        Commands::Scrape {
+            url,
+            limit,
+            dry_run,
+        } => {
+            let existing: HashSet<String> = store
+                .list_recipes(None)?
+                .iter()
+                .filter_map(recipe_source_url)
+                .map(|u| normalize_url(&u))
+                .collect();
+            let fetcher = HttpFetcher::default();
+            let outcome = scrape_new_recipes(&fetcher, &url, limit, &existing)?;
+
+            println!(
+                "Found {} recipe link(s); {} already imported.",
+                outcome.candidates, outcome.skipped_existing
+            );
+            for recipe in &outcome.recipes {
+                print_recipe_summary(recipe);
+                if !dry_run {
+                    store.save_recipe(recipe)?;
+                }
+            }
+            for (link, err) in &outcome.failed {
+                eprintln!("skipped {link}: {err}");
+            }
+            if dry_run {
+                println!(
+                    "(dry run — {} new recipe(s) found, nothing saved)",
+                    outcome.recipes.len()
+                );
+            } else {
+                println!(
+                    "Imported {} new recipe(s) to {}",
+                    outcome.recipes.len(),
+                    store.path().display()
+                );
             }
         }
         Commands::List { filter, full_id } => {

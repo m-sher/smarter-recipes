@@ -53,6 +53,13 @@ smarter-recipes import image scans/recipe.png
 # Auto-detect source from the input
 smarter-recipes import auto recipes/pancakes.json
 
+# Crawl an index page for recipe pages and import new ones.
+# Finds same-site links below the given path (e.g. .../recipes/<dish>),
+# imports the ones that parse as recipes, and skips any already stored —
+# so re-running only pulls in recipes you don't have yet.
+smarter-recipes scrape 'https://example.com/recipes' --limit 10
+smarter-recipes scrape 'https://example.com/recipes' --dry-run   # preview only
+
 # Browse
 smarter-recipes list
 smarter-recipes list --filter pasta
@@ -107,7 +114,7 @@ smarter-recipes reparse <id>
 src/
   domain/       Shared types: Recipe, IngredientLine, MealPlan, units
   normalize/    Ingredient parsing + unit tables (no I/O)
-  ingest/       Pluggable sources: file, url, ocr
+  ingest/       Pluggable sources: file, url, ocr, crawl (index scraping)
   storage/      SQLite persistence + ingredient dedup
   planning/     Overlap-maximizing meal planner
   shopping/     Package purchase optimizer
