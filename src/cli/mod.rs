@@ -296,7 +296,8 @@ pub fn run(cli: Cli) -> Result<()> {
             let opts = PlanOptions {
                 days,
                 meals_per_day: per_day,
-            };
+            ..Default::default()
+        };
             let plan = plan_meals(&recipes, &opts);
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
