@@ -1,19 +1,27 @@
-//! Crawl an index/parent page for recipe links and ingest new ones.
+//! Crawl a seed page for same-host links and ingest new recipes.
 //!
-//! Discovery follows the pattern "a parent page like `site.com/recipes` links to
-//! child recipe pages like `site.com/recipes/some-dish`": links are kept when they
-//! are same-host descendants of the parent path. Each candidate is parsed with
-//! [`UrlSource`]; pages that do not parse as a recipe are reported as failures so
-//! callers can remember them. Candidate pages are fetched concurrently and
-//! deduplicated by normalized source URL, so repeated scrapes only import recipes
-//! not already stored (or already known to fail).
+//! # Behavior
+//!
+//! 1. Fetch the seed URL and collect **same-host** `http(s)` links (not limited to
+//!    path descendants of the seed — category pages often link to site-root posts).
+//! 2. BFS-fetch candidates up to `--depth` / `max_depth`, scanning each fetched
+//!    page for more same-host links when depth allows.
+//! 3. Try to parse each non-seed page as a recipe. Pages that are not recipes are
+//!    **navigation** (category/index): they expand the frontier but are **not**
+//!    recorded as scrape failures, so re-runs can still traverse them to find
+//!    newly published recipes.
+//! 4. Only **hard** failures (network / HTTP errors) go in [`ScrapeOutcome::failed`]
+//!    for persistence. A small deny-list skips obvious non-content paths and assets.
+//!
+//! Candidates are fetched concurrently per BFS frontier batch and deduplicated by
+//! normalized URL.
 
 use super::url::UrlSource;
 use super::RecipeSourceIngest;
 use crate::domain::{Recipe, RecipeSource};
 use anyhow::{Context, Result};
 use scraper::{Html, Selector};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 use url::Url;
@@ -58,7 +66,7 @@ impl HtmlFetcher for HttpFetcher {
 /// be cheap and thread-safe (e.g. line-buffered `eprintln!`).
 #[derive(Debug, Clone)]
 pub enum ScrapeEvent {
-    /// Emitted once after the index page is parsed.
+    /// Emitted after the seed page is scanned (and when recursion expands the plan).
     Planned {
         candidates: usize,
         skipped: usize,
@@ -66,7 +74,9 @@ pub enum ScrapeEvent {
     },
     /// A candidate page parsed into a recipe.
     Imported { url: String, title: String },
-    /// A candidate page could not be fetched or parsed as a recipe.
+    /// Page fetched OK but is not a recipe (category / nav). Not a persistent failure.
+    NotRecipe { url: String, reason: String },
+    /// Hard fetch/network failure (safe to persist for future skip).
     Failed { url: String, reason: String },
 }
 
@@ -98,14 +108,45 @@ pub fn recipe_source_url(r: &Recipe) -> Option<String> {
     }
 }
 
-/// Extract candidate recipe links from an index page: same-host URLs whose path
-/// is a strict descendant of the parent page's path. Order-preserving, deduped.
-pub fn discover_recipe_links(base_url: &str, html: &str) -> Vec<String> {
-    let Ok(base) = Url::parse(base_url) else {
+/// Path segments that are almost never recipe content (budget protection).
+const DENY_SEGMENTS: &[&str] = &[
+    "about", "author", "authors", "tag", "tags", "feed", "feeds", "wp-admin", "wp-login", "cart",
+    "checkout", "account", "login", "register", "privacy", "terms", "contact", "search", "comment",
+    "comments", "cdn-cgi",
+];
+
+const DENY_EXTENSIONS: &[&str] = &[
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".css", ".js", ".mjs", ".pdf",
+    ".zip", ".xml", ".json", ".mp4", ".mp3", ".woff", ".woff2", ".ttf",
+];
+
+/// True when the URL is an obvious non-content / asset target.
+pub fn is_denied_url(u: &str) -> bool {
+    let Ok(url) = Url::parse(u) else {
+        return true;
+    };
+    let path = url.path().to_lowercase();
+    if DENY_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
+        return true;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    segments.iter().any(|seg| {
+        DENY_SEGMENTS
+            .iter()
+            .any(|d| seg == d || seg.starts_with(&format!("{d}.")))
+    })
+}
+
+/// Extract same-host `http(s)` links from `page_url`'s HTML, applying the deny-list.
+/// Order-preserving, deduped. `root_url` is only used for host scoping (same host as seed).
+pub fn discover_scoped_links(page_url: &str, html: &str, root_url: &str) -> Vec<String> {
+    let Ok(page) = Url::parse(page_url) else {
         return vec![];
     };
-    let base_host = base.host_str().map(str::to_lowercase);
-    let base_path = base.path().trim_end_matches('/').to_string();
+    let Ok(root) = Url::parse(root_url) else {
+        return vec![];
+    };
+    let root_host = root.host_str().map(str::to_lowercase);
 
     let doc = Html::parse_document(html);
     let selector = Selector::parse("a[href]").unwrap();
@@ -116,29 +157,27 @@ pub fn discover_recipe_links(base_url: &str, html: &str) -> Vec<String> {
         let Some(href) = el.value().attr("href") else {
             continue;
         };
-        let Ok(abs) = base.join(href) else {
+        let Ok(abs) = page.join(href) else {
             continue;
         };
         if !matches!(abs.scheme(), "http" | "https") {
             continue;
         }
-        if abs.host_str().map(str::to_lowercase) != base_host {
-            continue;
-        }
-        let path = abs.path().trim_end_matches('/');
-        let is_descendant = if base_path.is_empty() {
-            !path.is_empty() && path != "/"
-        } else {
-            path.len() > base_path.len()
-                && path.starts_with(&base_path)
-                && path.as_bytes().get(base_path.len()) == Some(&b'/')
-        };
-        if !is_descendant {
+        if abs.host_str().map(str::to_lowercase) != root_host {
             continue;
         }
         let mut clean = abs.clone();
         clean.set_fragment(None);
         let link = clean.as_str().trim_end_matches('/').to_string();
+        if is_denied_url(&link) {
+            continue;
+        }
+        // Skip the seed / current page itself when equal after normalize.
+        if normalize_url(&link) == normalize_url(page_url)
+            || normalize_url(&link) == normalize_url(root_url)
+        {
+            continue;
+        }
         if seen.insert(normalize_url(&link)) {
             out.push(link);
         }
@@ -146,109 +185,192 @@ pub fn discover_recipe_links(base_url: &str, html: &str) -> Vec<String> {
     out
 }
 
+/// Extract candidate links from an index page (same-host, deny-listed filtered).
+pub fn discover_recipe_links(base_url: &str, html: &str) -> Vec<String> {
+    discover_scoped_links(base_url, html, base_url)
+}
+
 /// Recipes gathered by a scrape plus counts for reporting.
 #[derive(Debug, Default)]
 pub struct ScrapeOutcome {
     pub recipes: Vec<Recipe>,
-    /// Total recipe-like links found on the index page.
+    /// Total unique same-host links discovered during the crawl (all depths).
     pub candidates: usize,
-    /// Links skipped because their URL was already known (imported or failed).
+    /// Links skipped because their URL was already known (imported or hard-failed).
     pub skipped_existing: usize,
-    /// Links that could not be fetched or parsed as a recipe: (url, error).
+    /// Hard fetch/network failures — safe to persist for skip on future runs.
     pub failed: Vec<(String, String)>,
+    /// Pages that fetched OK but are not recipes (nav/category). **Not** for persistence.
+    pub not_recipe: Vec<(String, String)>,
 }
 
-fn fetch_and_ingest(fetcher: &dyn HtmlFetcher, url: &str) -> Result<Recipe, String> {
-    let html = fetcher.fetch(url).map_err(|e| e.to_string())?;
+fn fetch_html(fetcher: &dyn HtmlFetcher, url: &str) -> Result<String, String> {
+    fetcher.fetch(url).map_err(|e| e.to_string())
+}
+
+fn ingest_html(url: &str, html: &str) -> Result<Recipe, String> {
     let source = UrlSource {
-        offline_html: Some(html),
+        offline_html: Some(html.to_string()),
         ..Default::default()
     };
     source.ingest(url).map_err(|e| e.to_string())
 }
 
-/// Crawl `base_url` and fetch up to `limit` new pages — candidates whose
-/// normalized URL is not in `skip` — importing the ones that parse as recipes.
-/// `limit` bounds fetches, not successes. Pages are fetched `jobs` at a time;
-/// `progress` is invoked as each completes. Pages that fail are returned in
-/// `failed` (in candidate order) so callers can remember them.
+/// Crawl `base_url` and BFS-fetch up to `limit` new same-host pages.
+///
+/// - Depth `1` (default): only links found on the seed page.
+/// - Depth `N`: also scan fetched pages for further same-host links, up to depth `N`.
+///
+/// `limit` bounds non-seed page fetches, not successes. Only hard failures are in
+/// [`ScrapeOutcome::failed`]; non-recipe pages are in [`ScrapeOutcome::not_recipe`].
 pub fn scrape_new_recipes(
     fetcher: &dyn HtmlFetcher,
     base_url: &str,
     limit: usize,
     skip: &HashSet<String>,
     jobs: usize,
+    max_depth: usize,
     progress: &(dyn Fn(ScrapeEvent) + Sync),
 ) -> Result<ScrapeOutcome> {
-    let index_html = fetcher
+    let max_depth = max_depth.max(1);
+    let jobs = jobs.max(1);
+    let root_norm = normalize_url(base_url);
+
+    let seed_html = fetcher
         .fetch(base_url)
         .with_context(|| format!("fetching index page {base_url}"))?;
-    let links = discover_recipe_links(base_url, &index_html);
-    let candidates = links.len();
 
-    let mut skipped_existing = 0;
-    let mut to_fetch = Vec::new();
-    for link in links {
-        if skip.contains(&normalize_url(&link)) {
-            skipped_existing += 1;
-        } else {
-            to_fetch.push(link);
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut enqueued: HashSet<String> = HashSet::new();
+    enqueued.insert(root_norm.clone());
+
+    let mut candidates = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut recipes: Vec<Recipe> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    let mut not_recipe: Vec<(String, String)> = Vec::new();
+    let mut fetches_used = 0usize;
+
+    for link in discover_scoped_links(base_url, &seed_html, base_url) {
+        let n = normalize_url(&link);
+        if !enqueued.insert(n.clone()) {
+            continue;
         }
+        candidates += 1;
+        if skip.contains(&n) {
+            skipped_existing += 1;
+            continue;
+        }
+        queue.push_back((link, 1));
     }
-    // `limit` bounds the number of new pages fetched this run, not successes.
-    to_fetch.truncate(limit);
+
     progress(ScrapeEvent::Planned {
         candidates,
         skipped: skipped_existing,
-        to_fetch: to_fetch.len(),
+        to_fetch: queue.len().min(limit.saturating_sub(fetches_used)),
     });
 
-    let jobs = jobs.max(1);
-    let mut recipes: Vec<(usize, Recipe)> = Vec::new();
-    let mut failed: Vec<(String, String)> = Vec::new();
+    while !queue.is_empty() && fetches_used < limit {
+        let mut batch: Vec<(String, usize)> = Vec::new();
+        while batch.len() < jobs && fetches_used + batch.len() < limit {
+            let Some(item) = queue.pop_front() else {
+                break;
+            };
+            batch.push(item);
+        }
+        if batch.is_empty() {
+            break;
+        }
 
-    // Fetch the selected pages in concurrent batches.
-    let mut start = 0;
-    while start < to_fetch.len() {
-        let end = (start + jobs).min(to_fetch.len());
-        let results: Mutex<Vec<(usize, Result<Recipe, String>)>> = Mutex::new(Vec::new());
+        // batch_idx, url, depth, html (empty on fetch err), fetch_ok, ingest outcome
+        type BatchRow = (usize, String, usize, String, bool, Result<Recipe, String>);
+        let results: Mutex<Vec<BatchRow>> = Mutex::new(Vec::new());
+
         std::thread::scope(|s| {
-            for (offset, url) in to_fetch[start..end].iter().enumerate() {
-                let idx = start + offset;
+            for (bi, (url, depth)) in batch.iter().enumerate() {
                 let results = &results;
                 s.spawn(move || {
-                    let outcome = fetch_and_ingest(fetcher, url);
-                    match &outcome {
+                    let html = match fetch_html(fetcher, url) {
+                        Ok(h) => h,
+                        Err(reason) => {
+                            progress(ScrapeEvent::Failed {
+                                url: url.clone(),
+                                reason: reason.clone(),
+                            });
+                            results.lock().unwrap().push((
+                                bi,
+                                url.clone(),
+                                *depth,
+                                String::new(),
+                                false,
+                                Err(reason),
+                            ));
+                            return;
+                        }
+                    };
+                    let ingest = ingest_html(url, &html);
+                    match &ingest {
                         Ok(recipe) => progress(ScrapeEvent::Imported {
                             url: url.clone(),
                             title: recipe.title.clone(),
                         }),
-                        Err(reason) => progress(ScrapeEvent::Failed {
+                        Err(reason) => progress(ScrapeEvent::NotRecipe {
                             url: url.clone(),
                             reason: reason.clone(),
                         }),
                     }
-                    results.lock().unwrap().push((idx, outcome));
+                    results
+                        .lock()
+                        .unwrap()
+                        .push((bi, url.clone(), *depth, html, true, ingest));
                 });
             }
         });
-        let mut batch = results.into_inner().unwrap();
-        batch.sort_by_key(|(i, _)| *i);
-        for (i, result) in batch {
-            match result {
-                Ok(recipe) => recipes.push((i, recipe)),
-                Err(reason) => failed.push((to_fetch[i].clone(), reason)),
+
+        let mut batch_results = results.into_inner().unwrap();
+        batch_results.sort_by_key(|(bi, _, _, _, _, _)| *bi);
+
+        for (_bi, url, depth, html, fetch_ok, ingest) in batch_results {
+            fetches_used += 1;
+            match (fetch_ok, ingest) {
+                (true, Ok(recipe)) => recipes.push(recipe),
+                (true, Err(reason)) => not_recipe.push((url.clone(), reason)),
+                (false, Err(reason)) => failed.push((url.clone(), reason)),
+                (false, Ok(_)) => unreachable!("fetch failed cannot produce recipe"),
+            }
+
+            if depth < max_depth && !html.is_empty() {
+                let mut new_queued = 0usize;
+                for link in discover_scoped_links(&url, &html, base_url) {
+                    let n = normalize_url(&link);
+                    if !enqueued.insert(n.clone()) {
+                        continue;
+                    }
+                    candidates += 1;
+                    if skip.contains(&n) {
+                        skipped_existing += 1;
+                        continue;
+                    }
+                    queue.push_back((link, depth + 1));
+                    new_queued += 1;
+                }
+                if new_queued > 0 {
+                    progress(ScrapeEvent::Planned {
+                        candidates,
+                        skipped: skipped_existing,
+                        to_fetch: queue.len().min(limit.saturating_sub(fetches_used)),
+                    });
+                }
             }
         }
-        start = end;
     }
 
-    recipes.sort_by_key(|(i, _)| *i);
     Ok(ScrapeOutcome {
-        recipes: recipes.into_iter().map(|(_, r)| r).collect(),
+        recipes,
         candidates,
         skipped_existing,
         failed,
+        not_recipe,
     })
 }
 
@@ -289,11 +411,12 @@ mod tests {
             <a href="/about">About</a>
             <a href="/recipes">Index itself</a>
             <a href="https://other.com/recipes/stew">External</a>
+            <a href="/logo.png">Asset</a>
         </body></html>"#
     }
 
     #[test]
-    fn discovers_only_child_recipe_links() {
+    fn discovers_same_host_recipe_links_skips_deny() {
         let links = discover_recipe_links("https://site.com/recipes", index_html());
         assert_eq!(
             links,
@@ -303,6 +426,27 @@ mod tests {
                 "https://site.com/recipes/carrot-cake",
             ]
         );
+    }
+
+    #[test]
+    fn same_host_allows_root_level_posts_from_category_page() {
+        // Woks-of-Life style: category seed links to root-level post.
+        let html = r#"<a href="/kung-pao-chicken">Kung Pao</a>
+                      <a href="/author/bleung">Author</a>"#;
+        let links = discover_scoped_links(
+            "https://site.com/category/recipes/chicken",
+            html,
+            "https://site.com/category/recipes/chicken",
+        );
+        assert_eq!(links, vec!["https://site.com/kung-pao-chicken"]);
+    }
+
+    #[test]
+    fn denied_paths_and_extensions() {
+        assert!(is_denied_url("https://site.com/about"));
+        assert!(is_denied_url("https://site.com/author/x"));
+        assert!(is_denied_url("https://site.com/foo/bar.jpg"));
+        assert!(!is_denied_url("https://site.com/kung-pao-chicken"));
     }
 
     #[test]
@@ -340,23 +484,31 @@ mod tests {
 
     fn noop(_: ScrapeEvent) {}
 
+    fn scrape(
+        fetcher: &dyn HtmlFetcher,
+        base: &str,
+        limit: usize,
+        skip: &HashSet<String>,
+        depth: usize,
+    ) -> ScrapeOutcome {
+        scrape_new_recipes(fetcher, base, limit, skip, 4, depth, &noop).unwrap()
+    }
+
     #[test]
     fn scrapes_all_new_recipes_in_order() {
-        let out = scrape_new_recipes(
+        let out = scrape(
             &fetcher(),
             "https://site.com/recipes",
             10,
             &HashSet::new(),
-            4,
-            &noop,
-        )
-        .unwrap();
+            1,
+        );
         assert_eq!(out.candidates, 3);
-        // Parallel fetch, but results are returned in candidate order.
         let titles: Vec<_> = out.recipes.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles, ["Apple Pie", "Banana Bread", "Carrot Cake"]);
         assert_eq!(out.skipped_existing, 0);
         assert!(out.failed.is_empty());
+        assert!(out.not_recipe.is_empty());
     }
 
     #[test]
@@ -365,8 +517,7 @@ mod tests {
             .iter()
             .map(|u| normalize_url(u))
             .collect();
-        let out = scrape_new_recipes(&fetcher(), "https://site.com/recipes", 10, &skip, 4, &noop)
-            .unwrap();
+        let out = scrape(&fetcher(), "https://site.com/recipes", 10, &skip, 1);
         assert_eq!(out.recipes.len(), 2);
         assert_eq!(out.skipped_existing, 1);
         assert!(out.recipes.iter().all(|r| r.title != "Apple Pie"));
@@ -374,22 +525,18 @@ mod tests {
 
     #[test]
     fn limit_bounds_number_of_fetches() {
-        // limit = 1 → fetch a single new page → one recipe, others untouched.
-        let out = scrape_new_recipes(
+        let out = scrape(
             &fetcher(),
             "https://site.com/recipes",
             1,
             &HashSet::new(),
-            4,
-            &noop,
-        )
-        .unwrap();
+            1,
+        );
         assert_eq!(out.recipes.len(), 1);
     }
 
     #[test]
-    fn limit_counts_fetches_including_failures() {
-        // Index lists a non-recipe page first, then two valid recipes.
+    fn limit_counts_fetches_including_not_recipe() {
         let mut pages = HashMap::new();
         pages.insert(
             "https://site.com/recipes".to_string(),
@@ -413,16 +560,15 @@ mod tests {
             recipe_html("Banana Bread"),
         );
         let f = MapFetcher { pages };
-        // limit = 2 fetches the first two links (broken + apple-pie), not two successes.
-        let out = scrape_new_recipes(&f, "https://site.com/recipes", 2, &HashSet::new(), 4, &noop)
-            .unwrap();
-        assert_eq!(out.recipes.len(), 1); // only apple-pie parsed
-        assert_eq!(out.failed.len(), 1); // broken counted against the limit
+        let out = scrape(&f, "https://site.com/recipes", 2, &HashSet::new(), 1);
+        assert_eq!(out.recipes.len(), 1);
+        assert_eq!(out.not_recipe.len(), 1);
+        assert!(out.failed.is_empty());
         assert!(out.recipes.iter().all(|r| r.title != "Banana Bread"));
     }
 
     #[test]
-    fn non_recipe_pages_reported_as_failed() {
+    fn non_recipe_pages_are_not_hard_failures() {
         let mut pages = HashMap::new();
         pages.insert(
             "https://site.com/recipes".to_string(),
@@ -433,47 +579,155 @@ mod tests {
             "<html><body>no recipe here</body></html>".to_string(),
         );
         let f = MapFetcher { pages };
-        let out = scrape_new_recipes(
-            &f,
-            "https://site.com/recipes",
-            10,
-            &HashSet::new(),
-            4,
-            &noop,
-        )
-        .unwrap();
+        let out = scrape(&f, "https://site.com/recipes", 10, &HashSet::new(), 1);
         assert_eq!(out.recipes.len(), 0);
-        assert_eq!(
-            out.failed,
-            vec![(
-                "https://site.com/recipes/not-a-recipe".to_string(),
-                out.failed[0].1.clone()
-            )]
+        assert!(out.failed.is_empty());
+        assert_eq!(out.not_recipe.len(), 1);
+        assert_eq!(out.not_recipe[0].0, "https://site.com/recipes/not-a-recipe");
+    }
+
+    #[test]
+    fn hard_fetch_failure_is_recorded() {
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://site.com/recipes".to_string(),
+            r#"<a href="/recipes/missing">x</a>"#.to_string(),
+        );
+        // no page for missing → fetch error
+        let f = MapFetcher { pages };
+        let out = scrape(&f, "https://site.com/recipes", 10, &HashSet::new(), 1);
+        assert_eq!(out.failed.len(), 1);
+        assert!(out.not_recipe.is_empty());
+        assert!(out.recipes.is_empty());
+    }
+
+    #[test]
+    fn recursion_follows_nested_index() {
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://site.com/recipes".to_string(),
+            r#"<a href="/recipes/italian">Italian</a>"#.to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/italian".to_string(),
+            r#"<html><body><a href="/recipes/italian/pasta">Pasta</a></body></html>"#.to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/italian/pasta".to_string(),
+            recipe_html("Pasta"),
+        );
+        let f = MapFetcher { pages };
+
+        let shallow = scrape(&f, "https://site.com/recipes", 10, &HashSet::new(), 1);
+        assert_eq!(shallow.recipes.len(), 0);
+        assert_eq!(shallow.not_recipe.len(), 1); // italian is nav, not hard fail
+        assert!(shallow.failed.is_empty());
+
+        let deep = scrape(&f, "https://site.com/recipes", 10, &HashSet::new(), 2);
+        assert_eq!(deep.recipes.len(), 1);
+        assert_eq!(deep.recipes[0].title, "Pasta");
+        assert_eq!(deep.candidates, 2);
+    }
+
+    #[test]
+    fn cross_run_still_traverses_nav_pages() {
+        // Run 1: discover pasta via italian nav. Nav must NOT enter skip via failed.
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://site.com/recipes".to_string(),
+            r#"<a href="/recipes/italian">Italian</a>"#.to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/italian".to_string(),
+            r#"<a href="/recipes/italian/pasta">Pasta</a>"#.to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/italian/pasta".to_string(),
+            recipe_html("Pasta"),
+        );
+        let f = MapFetcher {
+            pages: pages.clone(),
+        };
+        let run1 = scrape(&f, "https://site.com/recipes", 10, &HashSet::new(), 2);
+        assert_eq!(run1.recipes.len(), 1);
+        assert!(run1.failed.is_empty());
+        // Simulate CLI: only hard failures + imported URLs enter skip.
+        let mut skip: HashSet<String> = run1
+            .recipes
+            .iter()
+            .filter_map(recipe_source_url)
+            .map(|u| normalize_url(&u))
+            .collect();
+        for (u, _) in &run1.failed {
+            skip.insert(normalize_url(u));
+        }
+        // Publish pizza under italian for run 2.
+        let mut pages2 = pages;
+        pages2.insert(
+            "https://site.com/recipes/italian".to_string(),
+            r#"<a href="/recipes/italian/pasta">Pasta</a>
+               <a href="/recipes/italian/pizza">Pizza</a>"#
+                .to_string(),
+        );
+        pages2.insert(
+            "https://site.com/recipes/italian/pizza".to_string(),
+            recipe_html("Pizza"),
+        );
+        let f2 = MapFetcher { pages: pages2 };
+        let run2 = scrape(&f2, "https://site.com/recipes", 10, &skip, 2);
+        assert!(
+            run2.recipes.iter().any(|r| r.title == "Pizza"),
+            "re-run must find new recipe under previously-seen nav page; got {:?}",
+            run2.recipes.iter().map(|r| &r.title).collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn emits_progress_events() {
-        let events: Mutex<Vec<ScrapeEvent>> = Mutex::new(Vec::new());
-        let out = scrape_new_recipes(
-            &fetcher(),
-            "https://site.com/recipes",
-            10,
-            &HashSet::new(),
-            4,
-            &|e| events.lock().unwrap().push(e),
-        )
-        .unwrap();
-        let events = events.into_inner().unwrap();
-        assert!(matches!(
-            events[0],
-            ScrapeEvent::Planned { to_fetch: 3, .. }
-        ));
-        let imported = events
-            .iter()
-            .filter(|e| matches!(e, ScrapeEvent::Imported { .. }))
-            .count();
-        assert_eq!(imported, out.recipes.len());
+    fn cycle_links_do_not_loop_forever() {
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://site.com/recipes".to_string(),
+            r#"<a href="/recipes/a">A</a>"#.to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/a".to_string(),
+            r#"<a href="/recipes/b">B</a>"#.to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/b".to_string(),
+            r#"<a href="/recipes/a">A again</a>"#.to_string(),
+        );
+        let f = MapFetcher { pages };
+        let out = scrape(&f, "https://site.com/recipes", 50, &HashSet::new(), 10);
+        // Only two non-seed fetches possible; enqueued set stops A↔B explosion.
+        assert!(out.recipes.is_empty());
+        assert_eq!(out.not_recipe.len(), 2);
+        assert!(out.failed.is_empty());
+    }
+
+    #[test]
+    fn recursion_respects_limit_across_depths() {
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://site.com/recipes".to_string(),
+            r#"<a href="/recipes/cat">Cat</a>"#.to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/cat".to_string(),
+            r#"<a href="/recipes/cat/a">A</a><a href="/recipes/cat/b">B</a>"#.to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/cat/a".to_string(),
+            recipe_html("A"),
+        );
+        pages.insert(
+            "https://site.com/recipes/cat/b".to_string(),
+            recipe_html("B"),
+        );
+        let f = MapFetcher { pages };
+        let out = scrape(&f, "https://site.com/recipes", 2, &HashSet::new(), 2);
+        assert_eq!(out.recipes.len(), 1);
+        assert_eq!(out.recipes[0].title, "A");
     }
 
     #[test]
@@ -484,9 +738,33 @@ mod tests {
             10,
             &HashSet::new(),
             1,
+            1,
             &noop,
         )
         .unwrap();
         assert_eq!(out.recipes.len(), 3);
+    }
+
+    #[test]
+    fn emits_progress_events() {
+        let events = Mutex::new(Vec::new());
+        let _ = scrape_new_recipes(
+            &fetcher(),
+            "https://site.com/recipes",
+            10,
+            &HashSet::new(),
+            4,
+            1,
+            &|e| events.lock().unwrap().push(e),
+        )
+        .unwrap();
+        let ev = events.into_inner().unwrap();
+        assert!(ev.iter().any(|e| matches!(e, ScrapeEvent::Planned { .. })));
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, ScrapeEvent::Imported { .. }))
+                .count(),
+            3
+        );
     }
 }

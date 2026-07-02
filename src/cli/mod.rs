@@ -53,6 +53,9 @@ pub enum Commands {
         /// Number of pages to fetch concurrently
         #[arg(long, default_value_t = 8)]
         jobs: usize,
+        /// How deep to follow descendant links under the seed path (1 = seed's links only)
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
         /// Re-attempt URLs previously recorded as failures
         #[arg(long)]
         retry_failed: bool,
@@ -172,6 +175,7 @@ pub fn run(cli: Cli) -> Result<()> {
             url,
             limit,
             jobs,
+            depth,
             retry_failed,
             dry_run,
         } => {
@@ -186,21 +190,34 @@ pub fn run(cli: Cli) -> Result<()> {
                 skip.extend(store.failed_scrape_urls()?);
             }
 
-            eprintln!("Scanning {url} …");
+            eprintln!("Scanning {url} (depth {depth}) …");
             let fetcher = HttpFetcher::default();
-            let outcome = scrape_new_recipes(&fetcher, &url, limit, &skip, jobs, &|event| {
-                match event {
+            let outcome = scrape_new_recipes(
+                &fetcher,
+                &url,
+                limit,
+                &skip,
+                jobs,
+                depth,
+                &|event| {
+                    match event {
                     ScrapeEvent::Planned {
                         candidates,
                         skipped,
                         to_fetch,
                     } => eprintln!(
-                        "Found {candidates} recipe link(s); {skipped} already known; fetching {to_fetch} …"
+                        "Found {candidates} same-host link(s); {skipped} already known; queue {to_fetch} …"
                     ),
                     ScrapeEvent::Imported { url, title } => eprintln!("  ✓ {title}  ({url})"),
-                    ScrapeEvent::Failed { url, reason } => eprintln!("  ✗ {url}  ({reason})"),
+                    ScrapeEvent::NotRecipe { url, reason } => {
+                        eprintln!("  · nav {url}  ({reason})")
+                    }
+                    ScrapeEvent::Failed { url, reason } => {
+                        eprintln!("  ✗ fetch {url}  ({reason})")
+                    }
                 }
-            })?;
+                },
+            )?;
 
             for recipe in &outcome.recipes {
                 if !dry_run {
@@ -211,6 +228,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            // Persist only hard fetch failures — nav/category pages stay re-crawlable.
             if !dry_run {
                 for (link, reason) in &outcome.failed {
                     store.record_scrape_failure(&normalize_url(link), reason)?;
@@ -219,16 +237,18 @@ pub fn run(cli: Cli) -> Result<()> {
 
             if dry_run {
                 println!(
-                    "(dry run) {} new recipe(s) found, {} failed, {} skipped — nothing saved",
+                    "(dry run) {} new recipe(s), {} nav (not recipe), {} fetch failed, {} skipped — nothing saved",
                     outcome.recipes.len(),
+                    outcome.not_recipe.len(),
                     outcome.failed.len(),
                     outcome.skipped_existing
                 );
             } else {
                 println!(
-                    "Imported {} new recipe(s) to {} ({} failed, {} skipped)",
+                    "Imported {} new recipe(s) to {} ({} nav, {} fetch failed, {} skipped)",
                     outcome.recipes.len(),
                     store.path().display(),
+                    outcome.not_recipe.len(),
                     outcome.failed.len(),
                     outcome.skipped_existing
                 );
