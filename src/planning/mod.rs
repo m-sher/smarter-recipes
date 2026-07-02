@@ -1,60 +1,58 @@
-//! Meal planning that maximizes ingredient overlap across the schedule.
+//! Meal planning that minimizes the total number of distinct ingredients.
+//!
+//! # Objective
+//!
+//! Fill up to `days * meals_per_day` slots from a candidate pool **without
+//! repeating any recipe** (by [`RecipeId`]), choosing a set whose combined
+//! ingredient vocabulary is as small as possible. Fewer distinct ingredients →
+//! shorter shopping lists and better package utilization.
+//!
+//! Ingredient identity uses [`IngredientKey`] (normalized name + unit kind),
+//! matching aggregation and shopping.
 //!
 //! # Algorithm
 //!
-//! We need to fill `days * meals_per_day` slots from a pool of candidate recipes,
-//! ordering them so ingredients purchased for earlier meals are reused later
-//! (fewer one-off ingredients → fewer shopping trips and less waste).
+//! Exact minimum-union subset selection is combinatorial. For household-scale
+//! pools we use a **multi-start greedy** construction:
 //!
-//! Pure maximum-overlap scheduling on a multiset of recipes is combinatorial.
-//! We use a practical greedy heuristic that works well for household-scale pools
-//! (tens to low hundreds of recipes):
+//! 1. **Normalize the pool** — keep the first occurrence of each `recipe_id`
+//!    (duplicate entries cannot be scheduled twice). Recipes with **no**
+//!    ingredient keys are dropped when any non-empty recipe exists, so failed
+//!    or stub ingests do not crowd out real meals; if every recipe is empty,
+//!    they are kept so the planner can still fill slots.
 //!
-//! 1. **Score the pool** — for each recipe, compute its *ingredient key set*
-//!    (`IngredientKey` = normalized name + unit kind). Recipes with more keys
-//!    that appear in other pool recipes get a higher *global popularity* bonus.
+//! 2. **Target size** — `S = min(slots, unique_pool.len())`. If the pool is
+//!    smaller than the number of slots, the plan is partial (never reuse a
+//!    recipe).
 //!
-//! 2. **Seed** — pick the recipe with the highest popularity as the first meal
-//!    (day 0, meal 0). Ties break by title for determinism.
+//! 3. **Greedy growth from a seed** — start with one recipe as the first meal.
+//!    While fewer than `S` recipes are selected, append the unused candidate
+//!    that minimizes the number of **new** ingredient keys (keys not already in
+//!    the running union). Ties break by:
+//!    - smaller `|keys(candidate)|` (prefer compact recipes),
+//!    - then lexicographically smaller title,
+//!    - then lexicographically smaller `recipe_id` (full pool-order independence).
 //!
-//! 3. **Greedy extension** — while slots remain, choose the unused candidate that
-//!    maximizes:
-//!    ```text
-//!    score(r) = |keys(r) ∩ coverage| * W_overlap
-//!             + |keys(r) ∩ recent_window| * W_recency
-//!             + popularity(r) * W_pop
-//!             - |keys(r) - coverage| * W_new
-//!    ```
-//!    where `coverage` is the set of ingredient keys already used by selected
-//!    recipes, and `recent_window` is keys from the last `window` meals (default 3)
-//!    to prefer reusing *soon* after purchase.
+//! 4. **Multi-start** — run the greedy growth once for **every** pool member as
+//!    seed. Keep the schedule with the smallest final `|union|`. If two
+//!    schedules tie on union size, prefer the one whose sequence of
+//!    `(title, recipe_id)` pairs is lexicographically smaller. Equal schedules
+//!    keep the incumbent. When `S == pool.len()`, multi-start is skipped and a
+//!    single greedy order is built from the lex-smallest seed.
 //!
-//! 4. **Optional repeats** — if the pool is smaller than the number of slots,
-//!    recipes may be reused only after every pool member has been used once in
-//!    the current pass (round-robin reuse), unless `allow_repeats` is false, in
-//!    which case we stop early with a partial plan.
+//! Construction order is the plan order: ingredients tend to appear when first
+//! needed, which keeps [`crate::shopping::trip_breakdown_for_plan`] meaningful.
 //!
-//! The result is a locally optimal ordering biased toward early consolidation of
-//! shopping needs. Exact ILP/CP-SAT solvers would be more optimal for large pools
-//! but are heavyweight; this keeps planning offline, fast, and fully testable.
-//!
-//! Complexity: O(S * P * K) where S = slots, P = pool size, K = avg keys/recipe.
+//! Complexity: O(P² · S · K) where P = pool size, S = slots, K = avg keys/recipe
+//! — fine for tens to low hundreds of recipes.
 
 use crate::domain::{IngredientKey, MealPlan, PlannedMeal, Recipe, RecipeId};
 use std::collections::{HashMap, HashSet};
-
-const W_OVERLAP: f64 = 3.0;
-const W_RECENCY: f64 = 2.0;
-const W_POP: f64 = 0.5;
-const W_NEW: f64 = 0.25;
-const RECENT_WINDOW: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
     pub days: u32,
     pub meals_per_day: u32,
-    /// Allow using the same recipe more than once when the pool is small.
-    pub allow_repeats: bool,
 }
 
 impl Default for PlanOptions {
@@ -62,7 +60,6 @@ impl Default for PlanOptions {
         Self {
             days: 7,
             meals_per_day: 1,
-            allow_repeats: true,
         }
     }
 }
@@ -75,10 +72,122 @@ fn recipe_keys(recipe: &Recipe) -> HashSet<IngredientKey> {
         .collect()
 }
 
-/// Build a meal plan from a candidate pool.
+/// Deduplicate by `recipe_id` (first wins) and drop empty-ingredient recipes when
+/// any non-empty recipe exists. Returns recipes paired with precomputed key sets
+/// so `recipe_keys` runs once per unique recipe.
+fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>) {
+    let mut seen_ids = HashSet::new();
+    let mut recipes: Vec<&Recipe> = Vec::new();
+    let mut keys: Vec<HashSet<IngredientKey>> = Vec::new();
+    for r in pool {
+        if !seen_ids.insert(r.id.as_str()) {
+            continue;
+        }
+        recipes.push(r);
+        keys.push(recipe_keys(r));
+    }
+    let any_nonempty = keys.iter().any(|ks| !ks.is_empty());
+    if any_nonempty {
+        let mut i = 0;
+        while i < recipes.len() {
+            if keys[i].is_empty() {
+                recipes.remove(i);
+                keys.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    (recipes, keys)
+}
+
+/// Union size of ingredient keys for recipes at the given pool indices.
+fn union_size(keys: &[HashSet<IngredientKey>], indices: &[usize]) -> usize {
+    let mut u: HashSet<&IngredientKey> = HashSet::new();
+    for &i in indices {
+        u.extend(keys[i].iter());
+    }
+    u.len()
+}
+
+/// Greedy growth from `seed`: always add the unused recipe that introduces the
+/// fewest new keys. Returns selected pool indices in plan order.
+fn greedy_from_seed(
+    pool: &[&Recipe],
+    keys: &[HashSet<IngredientKey>],
+    seed: usize,
+    target: usize,
+) -> Vec<usize> {
+    let mut selected = Vec::with_capacity(target);
+    selected.push(seed);
+    let mut coverage = keys[seed].clone();
+    let mut used_ids: HashSet<&str> = HashSet::new();
+    used_ids.insert(pool[seed].id.as_str());
+
+    while selected.len() < target {
+        // Tie-break key: fewest new keys, then compact recipe, then title, then id.
+        let choice = (0..pool.len())
+            .filter(|&i| !used_ids.contains(pool[i].id.as_str()))
+            .min_by_key(|&i| {
+                let new_keys = keys[i].difference(&coverage).count();
+                (
+                    new_keys,
+                    keys[i].len(),
+                    pool[i].title.as_str(),
+                    pool[i].id.as_str(),
+                )
+            });
+        let Some(choice) = choice else {
+            break;
+        };
+        selected.push(choice);
+        coverage.extend(keys[choice].iter().cloned());
+        used_ids.insert(pool[choice].id.as_str());
+    }
+    selected
+}
+
+/// True if `a` beats incumbent `b`: smaller union wins; ties by lex
+/// `(title, id)` sequence. Equal schedules keep the incumbent (`false`).
+fn better_schedule(pool: &[&Recipe], a: &[usize], ua: usize, b: &[usize], ub: usize) -> bool {
+    if ua != ub {
+        return ua < ub;
+    }
+    for (&ia, &ib) in a.iter().zip(b.iter()) {
+        match (
+            pool[ia].title.as_str().cmp(pool[ib].title.as_str()),
+            pool[ia].id.as_str().cmp(pool[ib].id.as_str()),
+        ) {
+            (std::cmp::Ordering::Less, _) => return true,
+            (std::cmp::Ordering::Greater, _) => return false,
+            (std::cmp::Ordering::Equal, std::cmp::Ordering::Less) => return true,
+            (std::cmp::Ordering::Equal, std::cmp::Ordering::Greater) => return false,
+            (std::cmp::Ordering::Equal, std::cmp::Ordering::Equal) => {}
+        }
+    }
+    // Lengths are always `target` under greedy_from_seed; keep incumbent.
+    false
+}
+
+/// When every recipe must be used, multi-start only reorders. Build one order
+/// greedily from the lexicographically smallest (title, id) seed.
+fn order_full_pool(pool: &[&Recipe], keys: &[HashSet<IngredientKey>]) -> Vec<usize> {
+    let seed = (0..pool.len())
+        .min_by_key(|&i| (pool[i].title.as_str(), pool[i].id.as_str()))
+        .expect("non-empty pool");
+    greedy_from_seed(pool, keys, seed, pool.len())
+}
+
+/// Build a meal plan from a candidate pool (no recipe repeats by id).
 pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
-    let slots = (opts.days * opts.meals_per_day) as usize;
+    let slots = opts
+        .days
+        .checked_mul(opts.meals_per_day)
+        .map(|n| n as usize)
+        .unwrap_or(0);
     let plan_id = uuid::Uuid::new_v4().to_string();
+
+    let (pool, keys) = normalize_pool(pool);
 
     if pool.is_empty() || slots == 0 {
         return MealPlan {
@@ -90,96 +199,38 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         };
     }
 
-    let keys: Vec<HashSet<IngredientKey>> = pool.iter().map(recipe_keys).collect();
+    let target = slots.min(pool.len());
 
-    // Global popularity: how many other recipes share each key, summed per recipe.
-    let mut key_freq: HashMap<IngredientKey, usize> = HashMap::new();
-    for ks in &keys {
-        for k in ks {
-            *key_freq.entry(k.clone()).or_insert(0) += 1;
-        }
-    }
-    let popularity: Vec<f64> = keys
-        .iter()
-        .map(|ks| {
-            ks.iter()
-                .map(|k| (*key_freq.get(k).unwrap_or(&1) - 1) as f64)
-                .sum::<f64>()
-        })
-        .collect();
-
-    // Seed: highest popularity, then title
-    let mut seed = 0usize;
-    for i in 1..pool.len() {
-        let better = popularity[i] > popularity[seed]
-            || (popularity[i] == popularity[seed] && pool[i].title < pool[seed].title);
-        if better {
-            seed = i;
-        }
-    }
-
-    let mut selected: Vec<usize> = Vec::with_capacity(slots);
-    selected.push(seed);
-    let mut coverage: HashSet<IngredientKey> = keys[seed].clone();
-    let mut used_in_pass: HashSet<usize> = HashSet::new();
-    used_in_pass.insert(seed);
-
-    while selected.len() < slots {
-        let recent: HashSet<IngredientKey> = selected
-            .iter()
-            .rev()
-            .take(RECENT_WINDOW)
-            .flat_map(|&i| keys[i].iter().cloned())
-            .collect();
-
-        let mut best: Option<(usize, f64)> = None;
-        for (i, ks) in keys.iter().enumerate() {
-            if !opts.allow_repeats && selected.contains(&i) {
-                continue;
-            }
-            // Prefer unused recipes in the current pass
-            let repeat_penalty = if used_in_pass.contains(&i) {
-                if used_in_pass.len() < pool.len() {
-                    continue; // still have unused in this pass
-                }
-                -1.0 // mild penalty when forced to reuse
-            } else {
-                0.0
-            };
-
-            let overlap = ks.intersection(&coverage).count() as f64;
-            let recency = ks.intersection(&recent).count() as f64;
-            let new_keys = ks.difference(&coverage).count() as f64;
-            let score = overlap * W_OVERLAP + recency * W_RECENCY + popularity[i] * W_POP
-                - new_keys * W_NEW
-                + repeat_penalty;
-
-            let take = match best {
+    let selected = if target == pool.len() {
+        // Set is forced; only construction order matters.
+        order_full_pool(&pool, &keys)
+    } else {
+        let mut best: Option<(Vec<usize>, usize)> = None; // (schedule, union_size)
+        for seed in 0..pool.len() {
+            let candidate = greedy_from_seed(&pool, &keys, seed, target);
+            let ua = union_size(&keys, &candidate);
+            let take = match &best {
                 None => true,
-                Some((bi, bs)) => score > bs || (score == bs && pool[i].title < pool[bi].title),
+                Some((b, ub)) => better_schedule(&pool, &candidate, ua, b, *ub),
             };
             if take {
-                best = Some((i, score));
+                best = Some((candidate, ua));
             }
         }
+        best.map(|(s, _)| s).unwrap_or_default()
+    };
 
-        let Some((choice, _)) = best else {
-            break;
-        };
-        selected.push(choice);
-        coverage.extend(keys[choice].iter().cloned());
-        used_in_pass.insert(choice);
-        if used_in_pass.len() == pool.len() {
-            used_in_pass.clear(); // new pass for repeats
-        }
-    }
+    let total_unique = union_size(&keys, &selected);
+
+    // meals_per_day is non-zero when slots > 0 (checked_mul path); guard for safety.
+    let mpd = opts.meals_per_day.max(1);
 
     let meals: Vec<PlannedMeal> = selected
         .iter()
         .enumerate()
         .map(|(idx, &ri)| {
-            let day = (idx as u32) / opts.meals_per_day;
-            let meal = (idx as u32) % opts.meals_per_day;
+            let day = (idx as u32) / mpd;
+            let meal = (idx as u32) % mpd;
             PlannedMeal {
                 day,
                 meal,
@@ -189,17 +240,25 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         })
         .collect();
 
-    let shared = coverage.len();
+    let partial_note = if meals.len() < slots {
+        format!(
+            " Pool has only {} unique non-empty recipe(s); requested {} slot(s), so the plan is partial (repeats are never used).",
+            pool.len(),
+            slots
+        )
+    } else {
+        String::new()
+    };
+
     let rationale = format!(
-        "Greedy overlap planner: {} meal(s) over {} day(s) from a pool of {} recipe(s). \
-         Seeded with highest cross-recipe ingredient popularity, then repeatedly chose \
-         the candidate maximizing weighted overlap with already-covered ingredients \
-         (and a short recency window of {} meal(s)). Plan covers {} distinct ingredient key(s).",
+        "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
+         Multi-start greedy selection minimizes distinct ingredient keys \
+         (no recipe repeats). Plan uses {} distinct ingredient key(s).{}",
         meals.len(),
         opts.days,
         pool.len(),
-        RECENT_WINDOW,
-        shared
+        total_unique,
+        partial_note
     );
 
     MealPlan {
@@ -225,6 +284,18 @@ pub fn coverage_prefix(pool: &[Recipe], order: &[RecipeId]) -> Vec<usize> {
     out
 }
 
+/// Distinct ingredient key count for a plan's recipes (for tests/analysis).
+pub fn plan_union_size(pool: &[Recipe], plan: &MealPlan) -> usize {
+    let by_id: HashMap<&str, &Recipe> = pool.iter().map(|r| (r.id.as_str(), r)).collect();
+    let mut cov = HashSet::new();
+    for m in &plan.meals {
+        if let Some(r) = by_id.get(m.recipe_id.as_str()) {
+            cov.extend(recipe_keys(r));
+        }
+    }
+    cov.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,9 +307,26 @@ mod tests {
         r
     }
 
+    fn rec_with_id(id: &str, title: &str, ings: &[&str]) -> Recipe {
+        let mut r = rec(title, ings);
+        r.id = RecipeId::from(id);
+        r
+    }
+
+    fn titles(plan: &MealPlan) -> Vec<&str> {
+        plan.meals.iter().map(|m| m.recipe_title.as_str()).collect()
+    }
+
+    fn unique_recipe_ids(plan: &MealPlan) -> usize {
+        plan.meals
+            .iter()
+            .map(|m| m.recipe_id.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
     #[test]
-    fn prefers_shared_ingredients_early() {
-        // A and B share milk/eggs; C is disjoint spices only
+    fn prefers_compact_shared_cluster_over_disjoint() {
         let a = rec("Pancakes", &["2 cups flour", "1 cup milk", "2 eggs"]);
         let b = rec("French Toast", &["4 slices bread", "1 cup milk", "2 eggs"]);
         let c = rec(
@@ -249,22 +337,20 @@ mod tests {
         let plan = plan_meals(
             &pool,
             &PlanOptions {
-                days: 3,
+                days: 2,
                 meals_per_day: 1,
-                allow_repeats: false,
             },
         );
-        assert_eq!(plan.meals.len(), 3);
-        // First two should be A and B (order may vary but C should not be first if popularity works)
-        let titles: Vec<_> = plan.meals.iter().map(|m| m.recipe_title.as_str()).collect();
-        // C should be last because it shares nothing with A/B cluster
-        assert_eq!(titles[2], "Spice Mix");
-        assert!(titles[0] == "Pancakes" || titles[0] == "French Toast");
-        assert!(titles[1] == "Pancakes" || titles[1] == "French Toast");
+        assert_eq!(plan.meals.len(), 2);
+        let t = titles(&plan);
+        assert!(t.contains(&"Pancakes"));
+        assert!(t.contains(&"French Toast"));
+        assert!(!t.contains(&"Spice Mix"));
+        assert_eq!(plan_union_size(&pool, &plan), 4); // flour, milk, eggs, bread
     }
 
     #[test]
-    fn fills_slots_with_repeats() {
+    fn never_repeats_recipes() {
         let a = rec("A", &["1 cup rice"]);
         let b = rec("B", &["1 cup rice", "1 onion"]);
         let pool = vec![a, b];
@@ -272,11 +358,28 @@ mod tests {
             &pool,
             &PlanOptions {
                 days: 2,
-                meals_per_day: 2,
-                allow_repeats: true,
+                meals_per_day: 2, // 4 slots, only 2 recipes
             },
         );
-        assert_eq!(plan.meals.len(), 4);
+        assert_eq!(plan.meals.len(), 2);
+        assert_eq!(unique_recipe_ids(&plan), 2);
+        assert!(plan.rationale.contains("partial"));
+    }
+
+    #[test]
+    fn duplicate_pool_entries_do_not_repeat_by_id() {
+        let a = rec_with_id("id-a", "A", &["1 cup rice"]);
+        let pool = vec![a.clone(), a.clone(), a];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 3,
+                meals_per_day: 1,
+            },
+        );
+        assert_eq!(plan.meals.len(), 1);
+        assert_eq!(unique_recipe_ids(&plan), 1);
+        assert_eq!(plan.meals[0].recipe_id.as_str(), "id-a");
     }
 
     #[test]
@@ -286,29 +389,195 @@ mod tests {
     }
 
     #[test]
+    fn zero_slots() {
+        let a = rec("A", &["1 cup water"]);
+        let plan = plan_meals(
+            &[a],
+            &PlanOptions {
+                days: 0,
+                meals_per_day: 1,
+            },
+        );
+        assert!(plan.meals.is_empty());
+    }
+
+    #[test]
+    fn overflow_slots_treated_as_empty() {
+        let a = rec("A", &["1 cup water"]);
+        let plan = plan_meals(
+            &[a],
+            &PlanOptions {
+                days: u32::MAX,
+                meals_per_day: 2,
+            },
+        );
+        assert!(plan.meals.is_empty());
+    }
+
+    #[test]
     fn deterministic_tiebreak() {
         let a = rec("Alpha", &["1 cup water"]);
         let b = rec("Beta", &["1 cup water"]);
         let pool1 = vec![a.clone(), b.clone()];
         let pool2 = vec![b, a];
-        let p1 = plan_meals(
-            &pool1,
-            &PlanOptions {
-                days: 1,
-                meals_per_day: 1,
-                allow_repeats: false,
-            },
-        );
-        let p2 = plan_meals(
-            &pool2,
-            &PlanOptions {
-                days: 1,
-                meals_per_day: 1,
-                allow_repeats: false,
-            },
-        );
-        // Same popularity → alphabetical title wins as seed
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 1,
+        };
+        let p1 = plan_meals(&pool1, &opts);
+        let p2 = plan_meals(&pool2, &opts);
         assert_eq!(p1.meals[0].recipe_title, p2.meals[0].recipe_title);
         assert_eq!(p1.meals[0].recipe_title, "Alpha");
+    }
+
+    #[test]
+    fn schedule_order_independent_of_pool_order() {
+        let a = rec("Pancakes", &["2 cups flour", "1 cup milk", "2 eggs"]);
+        let b = rec("French Toast", &["4 slices bread", "1 cup milk", "2 eggs"]);
+        let c = rec("Spice Mix", &["1 tsp cumin", "1 tsp coriander"]);
+        let opts = PlanOptions {
+            days: 2,
+            meals_per_day: 1,
+        };
+        let p1 = plan_meals(&[a.clone(), b.clone(), c.clone()], &opts);
+        let p2 = plan_meals(&[c, b, a], &opts);
+        // Full ordered sequence, not merely the set of titles.
+        assert_eq!(titles(&p1), titles(&p2));
+    }
+
+    #[test]
+    fn selects_all_when_slots_equal_pool() {
+        let pool = vec![
+            rec("A", &["1 egg"]),
+            rec("B", &["1 egg", "1 milk"]),
+            rec("C", &["1 milk"]),
+        ];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 3,
+                meals_per_day: 1,
+            },
+        );
+        assert_eq!(plan.meals.len(), 3);
+        assert_eq!(unique_recipe_ids(&plan), 3);
+        assert_eq!(plan_union_size(&pool, &plan), 2);
+    }
+
+    #[test]
+    fn multi_start_avoids_bad_singleton_seed() {
+        let salt = rec("Just Salt", &["1 tsp salt"]);
+        let a = rec("Omelette", &["2 eggs", "1 tbsp butter"]);
+        let b = rec("Scramble", &["3 eggs", "1 tbsp butter"]);
+        let exotic = rec(
+            "Exotic Solo",
+            &["1 cup dragonfruit", "1 tsp saffron", "1 leaf gold"],
+        );
+        let pool = vec![salt, a, b, exotic];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+            },
+        );
+        assert_eq!(plan.meals.len(), 2);
+        let t = titles(&plan);
+        assert!(t.contains(&"Omelette"));
+        assert!(t.contains(&"Scramble"));
+        assert!(!t.contains(&"Just Salt"));
+        assert!(!t.contains(&"Exotic Solo"));
+        assert_eq!(plan_union_size(&pool, &plan), 2);
+    }
+
+    #[test]
+    fn no_duplicate_ids_in_full_plan() {
+        let pool: Vec<_> = (0..5)
+            .map(|i| rec(&format!("R{i}"), &["1 cup flour", "1 egg"]))
+            .collect();
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 5,
+                meals_per_day: 1,
+            },
+        );
+        assert_eq!(plan.meals.len(), 5);
+        assert_eq!(unique_recipe_ids(&plan), 5);
+    }
+
+    #[test]
+    fn day_and_meal_indices_pack_row_major() {
+        let pool: Vec<_> = (0..4)
+            .map(|i| rec(&format!("R{i}"), &["1 cup flour"]))
+            .collect();
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 2,
+            },
+        );
+        assert_eq!(plan.meals.len(), 4);
+        let pairs: Vec<_> = plan.meals.iter().map(|m| (m.day, m.meal)).collect();
+        assert_eq!(pairs, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn empty_ingredient_recipes_dropped_when_nonempty_exist() {
+        let empty = rec("Stub", &[]);
+        let real = rec("Soup", &["1 cup broth", "1 onion"]);
+        let plan = plan_meals(
+            &[empty, real.clone()],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+            },
+        );
+        assert_eq!(plan.meals.len(), 1);
+        assert_eq!(plan.meals[0].recipe_title, "Soup");
+    }
+
+    #[test]
+    fn all_empty_recipes_still_schedule_without_repeats() {
+        let a = rec_with_id("e1", "Empty A", &[]);
+        let b = rec_with_id("e2", "Empty B", &[]);
+        let plan = plan_meals(
+            &[a, b],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+            },
+        );
+        assert_eq!(plan.meals.len(), 2);
+        assert_eq!(unique_recipe_ids(&plan), 2);
+    }
+
+    #[test]
+    fn coverage_prefix_tracks_growth() {
+        let a = rec("A", &["1 cup milk"]);
+        let b = rec("B", &["1 cup milk", "1 egg"]);
+        let pool = vec![a.clone(), b.clone()];
+        let order = vec![a.id.clone(), b.id.clone()];
+        let prefix = coverage_prefix(&pool, &order);
+        assert_eq!(prefix, vec![1, 2]);
+    }
+
+    #[test]
+    fn pool_order_does_not_change_selected_set_for_ties() {
+        let a = rec("Pancakes", &["2 cups flour", "1 cup milk", "2 eggs"]);
+        let b = rec("French Toast", &["4 slices bread", "1 cup milk", "2 eggs"]);
+        let c = rec("Spice Mix", &["1 tsp cumin", "1 tsp coriander"]);
+        let opts = PlanOptions {
+            days: 2,
+            meals_per_day: 1,
+        };
+        let p1 = plan_meals(&[a.clone(), b.clone(), c.clone()], &opts);
+        let p2 = plan_meals(&[c, b, a], &opts);
+        let mut s1: Vec<_> = titles(&p1);
+        let mut s2: Vec<_> = titles(&p2);
+        s1.sort();
+        s2.sort();
+        assert_eq!(s1, s2);
     }
 }
