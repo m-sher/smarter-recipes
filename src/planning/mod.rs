@@ -15,12 +15,14 @@
 //! Exact minimum-union subset selection is combinatorial. For household-scale
 //! pools we use a **multi-start greedy** construction:
 //!
-//! 1. **Normalize the pool** — keep the first occurrence of each `recipe_id`
-//!    **and** of each non-empty normalized title key (duplicate titles cannot be
-//!    scheduled twice even with different ids). Recipes with **no** ingredient
-//!    keys are dropped when any non-empty recipe exists, so failed or stub
-//!    ingests do not crowd out real meals; if every recipe is empty, they are
-//!    kept so the planner can still fill slots.
+//! 1. **Normalize the pool** — (a) keep the first occurrence of each
+//!    `recipe_id`, (b) drop recipes with **no** ingredient keys when any
+//!    non-empty recipe exists (failed/stub ingests must not crowd out real
+//!    meals; if every recipe is empty they are kept so the planner can still
+//!    fill slots), then (c) among survivors keep the first of each non-empty
+//!    normalized title key (duplicate titles cannot be scheduled twice even
+//!    with different ids). Empty filtering runs **before** title collapse so an
+//!    empty stub cannot claim a title and block a fuller same-title recipe.
 //!
 //! 2. **Target size** — `S = min(slots, unique_pool.len())`. If the pool is
 //!    smaller than the number of slots, the plan is partial (never reuse a
@@ -75,26 +77,26 @@ fn recipe_keys(recipe: &Recipe) -> HashSet<IngredientKey> {
         .collect()
 }
 
-/// Deduplicate by `recipe_id` and normalized title key (first wins each) and
-/// drop empty-ingredient recipes when any non-empty recipe exists. Returns
-/// recipes paired with precomputed key sets so `recipe_keys` runs once per
-/// unique recipe.
+/// Deduplicate by `recipe_id`, drop empty-ingredient recipes when any non-empty
+/// recipe exists, then collapse by normalized title key (first wins among
+/// survivors). Empty filtering must run before title collapse so an empty stub
+/// cannot claim a title and block a fuller same-title recipe. Returns recipes
+/// paired with precomputed key sets so `recipe_keys` runs once per id-unique
+/// recipe.
 fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>) {
+    // Phase 1: id-dedupe and precompute keys.
     let mut seen_ids = HashSet::new();
-    let mut seen_titles = HashSet::new();
     let mut recipes: Vec<&Recipe> = Vec::new();
     let mut keys: Vec<HashSet<IngredientKey>> = Vec::new();
     for r in pool {
         if !seen_ids.insert(r.id.as_str()) {
             continue;
         }
-        let title_key = normalize_title_key(&r.title);
-        if !title_key.is_empty() && !seen_titles.insert(title_key) {
-            continue;
-        }
         recipes.push(r);
         keys.push(recipe_keys(r));
     }
+
+    // Phase 2: drop empties when any non-empty candidate remains.
     let any_nonempty = keys.iter().any(|ks| !ks.is_empty());
     if any_nonempty {
         let mut i = 0;
@@ -107,7 +109,20 @@ fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>
             }
         }
     }
-    (recipes, keys)
+
+    // Phase 3: title-key first-wins among survivors only.
+    let mut seen_titles = HashSet::new();
+    let mut out_recipes: Vec<&Recipe> = Vec::new();
+    let mut out_keys: Vec<HashSet<IngredientKey>> = Vec::new();
+    for (r, k) in recipes.into_iter().zip(keys) {
+        let title_key = normalize_title_key(&r.title);
+        if !title_key.is_empty() && !seen_titles.insert(title_key) {
+            continue;
+        }
+        out_recipes.push(r);
+        out_keys.push(k);
+    }
+    (out_recipes, out_keys)
 }
 
 /// Union size of ingredient keys for recipes at the given pool indices.
@@ -561,6 +576,34 @@ mod tests {
         );
         assert_eq!(plan.meals.len(), 1);
         assert_eq!(plan.meals[0].recipe_title, "Soup");
+    }
+
+    /// Empty stub must not title-claim ahead of a fuller same-title recipe
+    /// (different ids). Regression: title first-wins before empty filter
+    /// dropped both when the stub arrived first.
+    #[test]
+    fn empty_stub_does_not_block_fuller_same_title() {
+        let empty = rec_with_id("stub", "S'mores", &[]);
+        let full = rec_with_id(
+            "full",
+            "S'mores",
+            &["1 graham cracker", "1 chocolate", "1 marshmallow"],
+        );
+        let other = rec_with_id("other", "Soup", &["1 cup broth"]);
+        let plan = plan_meals(
+            &[empty, full, other],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+            },
+        );
+        let ids: HashSet<_> = plan.meals.iter().map(|m| m.recipe_id.as_str()).collect();
+        assert!(
+            ids.contains("full"),
+            "pool/plan must retain fuller S'mores, got ids {ids:?}"
+        );
+        assert!(!ids.contains("stub"));
+        assert_eq!(plan.meals.len(), 2);
     }
 
     #[test]
