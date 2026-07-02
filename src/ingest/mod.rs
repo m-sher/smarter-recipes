@@ -10,7 +10,7 @@ mod ocr;
 mod url;
 
 pub use crawl::{
-    discover_recipe_links, discover_scoped_links, normalize_url, recipe_source_url,
+    discover_recipe_links, discover_scoped_links, is_listing_url, normalize_url, recipe_source_url,
     scrape_new_recipes, HttpFetcher, ScrapeEvent, ScrapeOutcome,
 };
 pub use file::FileSource;

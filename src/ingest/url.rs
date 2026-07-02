@@ -38,12 +38,16 @@ impl RecipeSourceIngest for UrlSource {
         };
 
         if let Some(mut recipe) = extract_json_ld_recipe(&html)? {
+            // Prefer schema.org canonical url/@id for identity; else fetch URL.
+            let identity = recipe
+                .meta
+                .source_url
+                .clone()
+                .unwrap_or_else(|| url.to_string());
             recipe.source = RecipeSource::Url {
-                url: url.to_string(),
+                url: identity.clone(),
             };
-            if recipe.meta.source_url.is_none() {
-                recipe.meta.source_url = Some(url.to_string());
-            }
+            recipe.meta.source_url = Some(identity);
             return Ok(recipe);
         }
 
@@ -172,6 +176,20 @@ fn recipe_from_json_ld(obj: &Value) -> Option<Recipe> {
     }
     if let Some(cats) = obj.get("recipeCategory") {
         meta.tags = json_ld_string_list(cats);
+    }
+    // Prefer schema.org Recipe url, then absolute http(s) @id.
+    if let Some(u) = obj
+        .get("url")
+        .and_then(|v| v.as_str())
+        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+    {
+        meta.source_url = Some(u.to_string());
+    } else if let Some(u) = obj
+        .get("@id")
+        .and_then(|v| v.as_str())
+        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+    {
+        meta.source_url = Some(u.to_string());
     }
     recipe.meta = meta;
     Some(recipe)
@@ -356,5 +374,84 @@ mod tests {
         let r = src.ingest("https://example.com/soup").unwrap();
         assert_eq!(r.title, "Soup");
         assert_eq!(r.ingredients.len(), 1);
+    }
+
+    #[test]
+    fn json_ld_canonical_url_overrides_fetch_url() {
+        let html = r#"
+        <script type="application/ld+json">
+        {
+          "@type": "Recipe",
+          "name": "Test Cake",
+          "url": "https://example.com/test-cake",
+          "recipeIngredient": ["1 cup flour"]
+        }
+        </script>"#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let recipe = src.ingest("https://example.com/category/dessert").unwrap();
+        match &recipe.source {
+            RecipeSource::Url { url } => {
+                assert_eq!(url, "https://example.com/test-cake");
+            }
+            other => panic!("expected RecipeSource::Url, got {other:?}"),
+        }
+        assert_eq!(
+            recipe.meta.source_url.as_deref(),
+            Some("https://example.com/test-cake")
+        );
+    }
+
+    #[test]
+    fn json_ld_at_id_used_when_url_missing() {
+        let html = r#"
+        <script type="application/ld+json">
+        {
+          "@type": "Recipe",
+          "name": "Test Bread",
+          "@id": "https://example.com/test-bread",
+          "recipeIngredient": ["2 cups flour"]
+        }
+        </script>"#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let recipe = src.ingest("https://example.com/category/bread").unwrap();
+        match &recipe.source {
+            RecipeSource::Url { url } => {
+                assert_eq!(url, "https://example.com/test-bread");
+            }
+            other => panic!("expected RecipeSource::Url, got {other:?}"),
+        }
+        assert_eq!(
+            recipe.meta.source_url.as_deref(),
+            Some("https://example.com/test-bread")
+        );
+    }
+
+    #[test]
+    fn fetch_url_kept_when_json_ld_has_no_canonical() {
+        let html = r#"
+        <script type="application/ld+json">
+        {
+          "@type": "Recipe",
+          "name": "Plain Soup",
+          "recipeIngredient": ["1 onion"]
+        }
+        </script>"#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let fetch = "https://example.com/plain-soup";
+        let recipe = src.ingest(fetch).unwrap();
+        match &recipe.source {
+            RecipeSource::Url { url } => assert_eq!(url, fetch),
+            other => panic!("expected RecipeSource::Url, got {other:?}"),
+        }
+        assert_eq!(recipe.meta.source_url.as_deref(), Some(fetch));
     }
 }

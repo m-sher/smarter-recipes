@@ -64,6 +64,8 @@ smarter-recipes import manual
 # re-runs can still walk them to find newly published recipes. Only hard fetch
 # errors are persisted (skipped unless --retry-failed). Asset/author/tag URLs
 # are deny-listed to save budget.
+# Identity: recipes are unique by source URL and by title (normalized) — scrape
+# skips already-known URLs/titles; the planner never schedules the same title twice.
 smarter-recipes scrape 'https://example.com/recipes' --limit 10 --jobs 8
 smarter-recipes scrape 'https://example.com/category/chicken' --depth 3 --limit 50
 smarter-recipes scrape 'https://example.com/recipes' --dry-run
@@ -83,7 +85,7 @@ smarter-recipes pantry list
 smarter-recipes pantry remove milk          # optional: --kind volume
 # smarter-recipes pantry clear --yes
 
-# Plan 5 days, 1 meal/day, minimize distinct ingredients (no repeats).
+# Plan 5 days, 1 meal/day, minimize distinct ingredients (no recipe-id or title repeats).
 # On-hand pantry keys are treated as already covered when scoring plans.
 smarter-recipes plan --days 5 --per-day 1
 

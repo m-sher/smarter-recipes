@@ -226,6 +226,11 @@ pub fn run(cli: Cli) -> Result<()> {
             print_recipe_summary(&recipe);
             if dry_run {
                 println!("{}", serde_json::to_string_pretty(&recipe)?);
+            } else if store.is_duplicate(&recipe.title, recipe_source_url(&recipe).as_deref())? {
+                println!(
+                    "Skipped: already have a recipe with this URL or title ({})",
+                    recipe.title
+                );
             } else {
                 store.save_recipe(&recipe)?;
                 println!("Saved recipe {} to {}", recipe.id, store.path().display());
@@ -279,14 +284,22 @@ pub fn run(cli: Cli) -> Result<()> {
                 },
             )?;
 
+            let mut skipped_dup = 0usize;
+            let mut saved = 0usize;
             for recipe in &outcome.recipes {
+                let source = recipe_source_url(recipe);
+                if store.is_duplicate(&recipe.title, source.as_deref())? {
+                    skipped_dup += 1;
+                    continue;
+                }
                 if !dry_run {
                     store.save_recipe(recipe)?;
                     // A URL that now succeeds should no longer be remembered as failed.
-                    if let Some(u) = recipe_source_url(recipe) {
+                    if let Some(u) = source {
                         store.clear_scrape_failure(&normalize_url(&u))?;
                     }
                 }
+                saved += 1;
             }
             // Persist only hard fetch failures — nav/category pages stay re-crawlable.
             if !dry_run {
@@ -297,20 +310,22 @@ pub fn run(cli: Cli) -> Result<()> {
 
             if dry_run {
                 println!(
-                    "(dry run) {} new recipe(s), {} nav (not recipe), {} fetch failed, {} skipped — nothing saved",
-                    outcome.recipes.len(),
+                    "(dry run) {} new recipe(s), {} nav (not recipe), {} fetch failed, {} skipped known URL, {} would skip URL/title dup — nothing saved",
+                    saved,
                     outcome.not_recipe.len(),
                     outcome.failed.len(),
-                    outcome.skipped_existing
+                    outcome.skipped_existing,
+                    skipped_dup
                 );
             } else {
                 println!(
-                    "Imported {} new recipe(s) to {} ({} nav, {} fetch failed, {} skipped)",
-                    outcome.recipes.len(),
+                    "Imported {} new recipe(s) to {} ({} nav, {} fetch failed, {} skipped known URL, {} skipped URL/title dup)",
+                    saved,
                     store.path().display(),
                     outcome.not_recipe.len(),
                     outcome.failed.len(),
-                    outcome.skipped_existing
+                    outcome.skipped_existing,
+                    skipped_dup
                 );
             }
         }

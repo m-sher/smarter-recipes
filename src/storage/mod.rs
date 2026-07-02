@@ -4,9 +4,10 @@
 //! can be aggregated across recipes, plans, and the pantry.
 
 use crate::domain::{
-    IngredientKey, IngredientLine, MealPlan, PantryItem, PlannedMeal, Recipe, RecipeId, RecipeMeta,
-    RecipeSource, Unit, UnitKind,
+    normalize_title_key, IngredientKey, IngredientLine, MealPlan, PantryItem, PlannedMeal, Recipe,
+    RecipeId, RecipeMeta, RecipeSource, Unit, UnitKind,
 };
+use crate::ingest::{normalize_url, recipe_source_url};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -488,6 +489,48 @@ impl Store {
         Ok(())
     }
 
+    /// Find a recipe id whose source URL matches `url` after [`normalize_url`].
+    ///
+    /// Both the argument and each stored source (via [`recipe_source_url`]) are
+    /// normalized. Scans all recipes; returns the first match in `list_recipes` order.
+    pub fn find_id_by_normalized_source_url(&self, url: &str) -> Result<Option<String>> {
+        let target = normalize_url(url);
+        for r in self.list_recipes(None)? {
+            if let Some(src) = recipe_source_url(&r) {
+                if normalize_url(&src) == target {
+                    return Ok(Some(r.id.as_str().to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Find a recipe id whose title normalizes to `title_key` (caller should use
+    /// [`normalize_title_key`]). Returns the first match in `list_recipes` order.
+    pub fn find_id_by_title_key(&self, title_key: &str) -> Result<Option<String>> {
+        for r in self.list_recipes(None)? {
+            if normalize_title_key(&r.title) == title_key {
+                return Ok(Some(r.id.as_str().to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// True if a recipe with the same normalized source URL or title already exists.
+    ///
+    /// URL check (when `source_url` is `Some`) runs first; title uses
+    /// [`normalize_title_key`]. Intended for scrape/import skip-before-save.
+    pub fn is_duplicate(&self, title: &str, source_url: Option<&str>) -> Result<bool> {
+        if let Some(u) = source_url {
+            if self.find_id_by_normalized_source_url(u)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(self
+            .find_id_by_title_key(&normalize_title_key(title))?
+            .is_some())
+    }
+
     /// List all pantry items, sorted by ingredient name.
     pub fn list_pantry(&self) -> Result<Vec<PantryItem>> {
         let mut stmt = self.conn.prepare(
@@ -668,6 +711,71 @@ mod tests {
         let failed = store.failed_scrape_urls().unwrap();
         assert!(!failed.contains("https://x.com/a"));
         assert_eq!(failed.len(), 1);
+    }
+
+    #[test]
+    fn find_by_source_url_and_title_key() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let mut r = Recipe::new("Grilled S'mores");
+        r.source = RecipeSource::Url {
+            url: "https://example.com/grilled-smores".into(),
+        };
+        r.meta.source_url = Some("https://example.com/grilled-smores".into());
+        store.save_recipe(&r).unwrap();
+
+        let by_url = store
+            .find_id_by_normalized_source_url("https://example.com/grilled-smores/")
+            .unwrap();
+        assert_eq!(by_url.as_deref(), Some(r.id.as_str()));
+
+        let by_title = store
+            .find_id_by_title_key(&normalize_title_key("GRILLED S'MORES"))
+            .unwrap();
+        assert_eq!(by_title.as_deref(), Some(r.id.as_str()));
+
+        assert!(store
+            .find_id_by_title_key(&normalize_title_key("Other"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn is_duplicate_by_url_or_title() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+
+        assert!(!store
+            .is_duplicate("Anything", Some("https://example.com/a"))
+            .unwrap());
+
+        let mut r = Recipe::new("Grilled S'mores");
+        r.source = RecipeSource::Url {
+            url: "https://example.com/grilled-smores".into(),
+        };
+        r.meta.source_url = Some("https://example.com/grilled-smores".into());
+        store.save_recipe(&r).unwrap();
+
+        // Same URL, different trailing slash / host case → duplicate.
+        assert!(store
+            .is_duplicate(
+                "Different Title",
+                Some("https://EXAMPLE.com/grilled-smores/")
+            )
+            .unwrap());
+
+        // Same title key, different URL → duplicate.
+        assert!(store
+            .is_duplicate("  GRILLED S'MORES  ", Some("https://other.example/x"))
+            .unwrap());
+
+        // Title-only candidate (no URL) still matches existing title.
+        assert!(store.is_duplicate("grilled s'mores", None).unwrap());
+
+        // Unrelated title and URL → not a duplicate.
+        assert!(!store
+            .is_duplicate("Pasta Night", Some("https://example.com/pasta"))
+            .unwrap());
     }
 
     #[test]
