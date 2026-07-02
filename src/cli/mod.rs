@@ -46,7 +46,7 @@ pub enum Commands {
     Scrape {
         /// Index/parent URL, e.g. https://example.com/recipes
         url: String,
-        /// Max number of new recipes to import this run
+        /// Max number of new (not-yet-known) pages to fetch this run
         #[arg(long, default_value_t = 10)]
         limit: usize,
         /// Number of pages to fetch concurrently

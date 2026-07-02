@@ -167,10 +167,11 @@ fn fetch_and_ingest(fetcher: &dyn HtmlFetcher, url: &str) -> Result<Recipe, Stri
     source.ingest(url).map_err(|e| e.to_string())
 }
 
-/// Crawl `base_url`, importing up to `limit` recipes whose normalized URL is not
-/// in `skip`. Candidate pages are fetched `jobs` at a time; `progress` is invoked
-/// as each completes. Pages that fail are returned in `failed` (in candidate
-/// order) so callers can remember them.
+/// Crawl `base_url` and fetch up to `limit` new pages — candidates whose
+/// normalized URL is not in `skip` — importing the ones that parse as recipes.
+/// `limit` bounds fetches, not successes. Pages are fetched `jobs` at a time;
+/// `progress` is invoked as each completes. Pages that fail are returned in
+/// `failed` (in candidate order) so callers can remember them.
 pub fn scrape_new_recipes(
     fetcher: &dyn HtmlFetcher,
     base_url: &str,
@@ -194,6 +195,8 @@ pub fn scrape_new_recipes(
             to_fetch.push(link);
         }
     }
+    // `limit` bounds the number of new pages fetched this run, not successes.
+    to_fetch.truncate(limit);
     progress(ScrapeEvent::Planned {
         candidates,
         skipped: skipped_existing,
@@ -204,9 +207,9 @@ pub fn scrape_new_recipes(
     let mut recipes: Vec<(usize, Recipe)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
 
-    // Fetch in concurrent batches, stopping once `limit` recipes are collected.
+    // Fetch the selected pages in concurrent batches.
     let mut start = 0;
-    while recipes.len() < limit && start < to_fetch.len() {
+    while start < to_fetch.len() {
         let end = (start + jobs).min(to_fetch.len());
         let results: Mutex<Vec<(usize, Result<Recipe, String>)>> = Mutex::new(Vec::new());
         std::thread::scope(|s| {
@@ -233,8 +236,7 @@ pub fn scrape_new_recipes(
         batch.sort_by_key(|(i, _)| *i);
         for (i, result) in batch {
             match result {
-                Ok(recipe) if recipes.len() < limit => recipes.push((i, recipe)),
-                Ok(_) => {}
+                Ok(recipe) => recipes.push((i, recipe)),
                 Err(reason) => failed.push((to_fetch[i].clone(), reason)),
             }
         }
@@ -371,7 +373,8 @@ mod tests {
     }
 
     #[test]
-    fn respects_limit() {
+    fn limit_bounds_number_of_fetches() {
+        // limit = 1 → fetch a single new page → one recipe, others untouched.
         let out = scrape_new_recipes(
             &fetcher(),
             "https://site.com/recipes",
@@ -382,6 +385,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.recipes.len(), 1);
+    }
+
+    #[test]
+    fn limit_counts_fetches_including_failures() {
+        // Index lists a non-recipe page first, then two valid recipes.
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://site.com/recipes".to_string(),
+            r#"<html><body>
+                <a href="/recipes/broken">broken</a>
+                <a href="/recipes/apple-pie">Apple Pie</a>
+                <a href="/recipes/banana-bread">Banana Bread</a>
+            </body></html>"#
+                .to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/broken".to_string(),
+            "<html><body>no recipe</body></html>".to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/apple-pie".to_string(),
+            recipe_html("Apple Pie"),
+        );
+        pages.insert(
+            "https://site.com/recipes/banana-bread".to_string(),
+            recipe_html("Banana Bread"),
+        );
+        let f = MapFetcher { pages };
+        // limit = 2 fetches the first two links (broken + apple-pie), not two successes.
+        let out = scrape_new_recipes(&f, "https://site.com/recipes", 2, &HashSet::new(), 4, &noop)
+            .unwrap();
+        assert_eq!(out.recipes.len(), 1); // only apple-pie parsed
+        assert_eq!(out.failed.len(), 1); // broken counted against the limit
+        assert!(out.recipes.iter().all(|r| r.title != "Banana Bread"));
     }
 
     #[test]
