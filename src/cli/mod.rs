@@ -418,11 +418,14 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Reparse { id, all } => match (all, id) {
             (true, _) => {
                 let mut recipes = store.list_recipes(None)?;
-                for recipe in &mut recipes {
+                let total = recipes.len();
+                eprintln!("Reparsing {total} recipe(s) …");
+                for (i, recipe) in recipes.iter_mut().enumerate() {
                     reparse_recipe(recipe);
                     store.save_recipe(recipe)?;
+                    eprintln!("  [{}/{}] {}", i + 1, total, recipe.title);
                 }
-                println!("Reparsed {} recipe(s).", recipes.len());
+                println!("Reparsed {total} recipe(s).");
             }
             (false, Some(id)) => {
                 let mut recipe = resolve_recipe(&store, &id)?;
