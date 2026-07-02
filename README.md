@@ -57,15 +57,14 @@ smarter-recipes import auto recipes/pancakes.json
 smarter-recipes import manual
 
 # Crawl an index page for recipe pages and import new ones.
-# Finds same-site links below the given path (e.g. .../recipes/<dish>),
-# fetches candidates concurrently (--jobs) with live progress, and imports the
-# ones that parse as recipes. URLs already imported — or previously recorded as
-# failures — are skipped without re-fetching, so re-running only pulls in new
-# recipes. --limit caps how many new pages to fetch this run (not how many parse
-# successfully); use --retry-failed to re-attempt known failures.
+# Finds same-site links below the seed path (e.g. .../recipes/<dish>).
+# --depth N walks nested category pages (BFS) up to N levels under the seed.
+# --limit caps how many new pages to fetch this run; --jobs is concurrency.
+# Known URLs (imported or failed) are skipped; --retry-failed re-attempts failures.
 smarter-recipes scrape 'https://example.com/recipes' --limit 10 --jobs 8
-smarter-recipes scrape 'https://example.com/recipes' --dry-run        # preview only
-smarter-recipes scrape 'https://example.com/recipes' --retry-failed   # retry past failures
+smarter-recipes scrape 'https://example.com/recipes' --depth 3 --limit 50
+smarter-recipes scrape 'https://example.com/recipes' --dry-run
+smarter-recipes scrape 'https://example.com/recipes' --retry-failed
 
 # Browse
 smarter-recipes list
