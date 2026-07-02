@@ -302,7 +302,6 @@ pub fn plan_union_size(pool: &[Recipe], plan: &MealPlan) -> usize {
 mod tests {
     use super::*;
     use crate::normalize::normalize_line;
-    use std::collections::HashSet as StdHashSet;
 
     fn rec(title: &str, ings: &[&str]) -> Recipe {
         let mut r = Recipe::new(title);
@@ -324,7 +323,7 @@ mod tests {
         plan.meals
             .iter()
             .map(|m| m.recipe_id.as_str())
-            .collect::<StdHashSet<_>>()
+            .collect::<HashSet<_>>()
             .len()
     }
 
