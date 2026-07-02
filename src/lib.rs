@@ -3,7 +3,7 @@
 //! Core modules are independent of network/OCR so they can be tested offline:
 //! - [`domain`] — shared types (recipes, ingredients, plans, units)
 //! - [`normalize`] — free-text ingredient parsing and unit normalization
-//! - [`planning`] — meal plans maximizing ingredient overlap
+//! - [`planning`] — meal plans minimizing distinct ingredients (no repeats)
 //! - [`shopping`] — package-size purchase optimization
 //!
 //! I/O modules:
