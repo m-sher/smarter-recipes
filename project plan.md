@@ -15,7 +15,7 @@ Here are some of the primary goals:
 
 3. Persist recipes, ingredients, and plans in a local embedded database (don't reinvent). Make sure to dedup ingredients so quantities can be aggregated.
 
-4. Given a number of days, recipes per day, and the candidate recipe pool, produce a plan that orders/selects recipes to maximize ingredient overlap, so ingredients bought for early recipes are reused later. Make sure to explain the algorithm in comments/docs.
+4. Given a number of days, recipes per day, and the candidate recipe pool, produce a plan that selects recipes to **minimize the total number of distinct ingredients** (no recipe repeats), so shopping lists stay short and packages are reused. Make sure to explain the algorithm in comments/docs.
 
 5. For the shopping list, determine purchasable package sizes per ingredient and choose quantities that cover the required amount while minimizing cost first, then minimizing leftover. Examples: 14oz milk needed, available as 16oz or 32oz -> prefer the one with less extra (16oz, 2oz leftover) and flag the leftover amount; 32oz milk needed, same options available -> prefer whichever of 2x16oz or 32oz has the lowest cost (since both have 0 extra).
    - Pull package sizes/prices from store websites. Use public APIs where available, otherwise, just best-effort scraping.
@@ -29,7 +29,7 @@ Here are some of the primary goals:
 7. Engineering expectations
    - Rust w/ format linter 
    - Keep the core logic (normalization, planning, purchase optimization) testable offline, independent of network/OCR/scraping.
-   - Unit tests for the parts where correctness matters most: ingredient/unit normalization, overlap planning, and package optimization.
+   - Unit tests for the parts where correctness matters most: ingredient/unit normalization, min-union planning, and package optimization.
    - A README.md covering setup (including any system deps), usage, and architecture.
    - Sensible module boundaries; document non-obvious decisions inline.
    - Keep comments concise and describe only current behavior - don't write comments to describe the decision process, debugging, or any previous behavior.

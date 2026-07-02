@@ -36,6 +36,19 @@ fn import_plan_shop() {
         },
     );
     assert_eq!(plan.meals.len(), 4);
+    let unique_ids: std::collections::HashSet<_> =
+        plan.meals.iter().map(|m| m.recipe_id.as_str()).collect();
+    assert_eq!(
+        unique_ids.len(),
+        plan.meals.len(),
+        "plan must not repeat recipes"
+    );
+    assert!(
+        plan.rationale.to_lowercase().contains("min-union")
+            || plan.rationale.to_lowercase().contains("no recipe repeats"),
+        "rationale should describe min-union / no-repeat planner: {}",
+        plan.rationale
+    );
     store.save_plan(&plan).unwrap();
 
     let list = shopping_list_for_plan(&store, &plan, &PackageCatalog::with_defaults()).unwrap();

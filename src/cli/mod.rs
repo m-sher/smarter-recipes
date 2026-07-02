@@ -459,12 +459,16 @@ fn load_pool(store: &Store, pool: Option<&str>) -> Result<Vec<Recipe>> {
         None => store.list_recipes(None),
         Some(s) => {
             let mut out = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for part in s.split(',') {
                 let part = part.trim();
                 if part.is_empty() {
                     continue;
                 }
-                out.push(resolve_recipe(store, part)?);
+                let r = resolve_recipe(store, part)?;
+                if seen.insert(r.id.clone()) {
+                    out.push(r);
+                }
             }
             Ok(out)
         }
