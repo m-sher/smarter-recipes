@@ -53,6 +53,9 @@ pub enum Commands {
         /// Number of pages to fetch concurrently
         #[arg(long, default_value_t = 8)]
         jobs: usize,
+        /// How deep to follow descendant links under the seed path (1 = seed's links only)
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
         /// Re-attempt URLs previously recorded as failures
         #[arg(long)]
         retry_failed: bool,
@@ -172,6 +175,7 @@ pub fn run(cli: Cli) -> Result<()> {
             url,
             limit,
             jobs,
+            depth,
             retry_failed,
             dry_run,
         } => {
@@ -186,21 +190,29 @@ pub fn run(cli: Cli) -> Result<()> {
                 skip.extend(store.failed_scrape_urls()?);
             }
 
-            eprintln!("Scanning {url} …");
+            eprintln!("Scanning {url} (depth {depth}) …");
             let fetcher = HttpFetcher::default();
-            let outcome = scrape_new_recipes(&fetcher, &url, limit, &skip, jobs, &|event| {
-                match event {
+            let outcome = scrape_new_recipes(
+                &fetcher,
+                &url,
+                limit,
+                &skip,
+                jobs,
+                depth,
+                &|event| {
+                    match event {
                     ScrapeEvent::Planned {
                         candidates,
                         skipped,
                         to_fetch,
                     } => eprintln!(
-                        "Found {candidates} recipe link(s); {skipped} already known; fetching {to_fetch} …"
+                        "Found {candidates} link(s) under seed path; {skipped} already known; queue {to_fetch} …"
                     ),
                     ScrapeEvent::Imported { url, title } => eprintln!("  ✓ {title}  ({url})"),
                     ScrapeEvent::Failed { url, reason } => eprintln!("  ✗ {url}  ({reason})"),
                 }
-            })?;
+                },
+            )?;
 
             for recipe in &outcome.recipes {
                 if !dry_run {
