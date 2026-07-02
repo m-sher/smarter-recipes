@@ -2,7 +2,7 @@
 
 use crate::domain::{MealPlan, Recipe};
 use crate::ingest::{
-    ingest_from, normalize_url, recipe_source_url, scrape_new_recipes, HttpFetcher,
+    ingest_from, normalize_url, recipe_source_url, scrape_new_recipes, HttpFetcher, ScrapeEvent,
 };
 use crate::planning::{plan_meals, PlanOptions};
 use crate::pricing::{
@@ -49,6 +49,12 @@ pub enum Commands {
         /// Max number of new recipes to import this run
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Number of pages to fetch concurrently
+        #[arg(long, default_value_t = 8)]
+        jobs: usize,
+        /// Re-attempt URLs previously recorded as failures
+        #[arg(long)]
+        retry_failed: bool,
         /// Discover and report without saving
         #[arg(long)]
         dry_run: bool,
@@ -152,40 +158,66 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Scrape {
             url,
             limit,
+            jobs,
+            retry_failed,
             dry_run,
         } => {
-            let existing: HashSet<String> = store
+            // Skip URLs already imported, plus previously-failed URLs unless retrying.
+            let mut skip: HashSet<String> = store
                 .list_recipes(None)?
                 .iter()
                 .filter_map(recipe_source_url)
                 .map(|u| normalize_url(&u))
                 .collect();
-            let fetcher = HttpFetcher::default();
-            let outcome = scrape_new_recipes(&fetcher, &url, limit, &existing)?;
+            if !retry_failed {
+                skip.extend(store.failed_scrape_urls()?);
+            }
 
-            println!(
-                "Found {} recipe link(s); {} already imported.",
-                outcome.candidates, outcome.skipped_existing
-            );
+            eprintln!("Scanning {url} …");
+            let fetcher = HttpFetcher::default();
+            let outcome = scrape_new_recipes(&fetcher, &url, limit, &skip, jobs, &|event| {
+                match event {
+                    ScrapeEvent::Planned {
+                        candidates,
+                        skipped,
+                        to_fetch,
+                    } => eprintln!(
+                        "Found {candidates} recipe link(s); {skipped} already known; fetching {to_fetch} …"
+                    ),
+                    ScrapeEvent::Imported { url, title } => eprintln!("  ✓ {title}  ({url})"),
+                    ScrapeEvent::Failed { url, reason } => eprintln!("  ✗ {url}  ({reason})"),
+                }
+            })?;
+
             for recipe in &outcome.recipes {
-                print_recipe_summary(recipe);
                 if !dry_run {
                     store.save_recipe(recipe)?;
+                    // A URL that now succeeds should no longer be remembered as failed.
+                    if let Some(u) = recipe_source_url(recipe) {
+                        store.clear_scrape_failure(&normalize_url(&u))?;
+                    }
                 }
             }
-            for (link, err) in &outcome.failed {
-                eprintln!("skipped {link}: {err}");
+            if !dry_run {
+                for (link, reason) in &outcome.failed {
+                    store.record_scrape_failure(&normalize_url(link), reason)?;
+                }
             }
+
             if dry_run {
                 println!(
-                    "(dry run — {} new recipe(s) found, nothing saved)",
-                    outcome.recipes.len()
+                    "(dry run) {} new recipe(s) found, {} failed, {} skipped — nothing saved",
+                    outcome.recipes.len(),
+                    outcome.failed.len(),
+                    outcome.skipped_existing
                 );
             } else {
                 println!(
-                    "Imported {} new recipe(s) to {}",
+                    "Imported {} new recipe(s) to {} ({} failed, {} skipped)",
                     outcome.recipes.len(),
-                    store.path().display()
+                    store.path().display(),
+                    outcome.failed.len(),
+                    outcome.skipped_existing
                 );
             }
         }

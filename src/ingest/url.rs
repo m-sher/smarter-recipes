@@ -56,7 +56,7 @@ impl RecipeSourceIngest for UrlSource {
     }
 }
 
-pub(crate) fn fetch_html(url: &str, timeout: Duration) -> Result<String> {
+fn fetch_html(url: &str, timeout: Duration) -> Result<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .user_agent(concat!(
