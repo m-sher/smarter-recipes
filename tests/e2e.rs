@@ -33,7 +33,6 @@ fn import_plan_shop() {
         &PlanOptions {
             days: 4,
             meals_per_day: 1,
-            allow_repeats: false,
         },
     );
     assert_eq!(plan.meals.len(), 4);

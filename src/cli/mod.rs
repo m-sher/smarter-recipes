@@ -19,7 +19,7 @@ use std::path::PathBuf;
 #[command(
     name = "smarter-recipes",
     version,
-    about = "Ingest recipes, plan meals to maximize ingredient overlap, optimize shopping lists"
+    about = "Ingest recipes, plan meals to minimize distinct ingredients, optimize shopping lists"
 )]
 pub struct Cli {
     /// Path to SQLite database (default: platform data dir)
@@ -76,7 +76,7 @@ pub enum Commands {
     },
     /// Delete a recipe by id
     Delete { id: String },
-    /// Generate a meal plan maximizing ingredient overlap
+    /// Generate a meal plan minimizing distinct ingredients (no recipe repeats)
     Plan {
         /// Number of days
         #[arg(long, default_value_t = 7)]
@@ -87,9 +87,6 @@ pub enum Commands {
         /// Restrict pool to these recipe ids (comma-separated); default: all
         #[arg(long)]
         pool: Option<String>,
-        /// Do not reuse recipes even if pool is smaller than slots
-        #[arg(long)]
-        no_repeats: bool,
         /// Print plan as JSON
         #[arg(long)]
         json: bool,
@@ -253,7 +250,6 @@ pub fn run(cli: Cli) -> Result<()> {
             days,
             per_day,
             pool,
-            no_repeats,
             json,
             dry_run,
         } => {
@@ -264,7 +260,6 @@ pub fn run(cli: Cli) -> Result<()> {
             let opts = PlanOptions {
                 days,
                 meals_per_day: per_day,
-                allow_repeats: !no_repeats,
             };
             let plan = plan_meals(&recipes, &opts);
             if json {
