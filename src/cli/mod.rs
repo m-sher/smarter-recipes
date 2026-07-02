@@ -1,15 +1,19 @@
 //! CLI command definitions and handlers.
 
-use crate::domain::{MealPlan, Recipe};
+use crate::domain::{IngredientKey, MealPlan, Recipe, ShoppingList, UnitKind};
 use crate::ingest::{
     ingest_from, normalize_url, read_manual_recipe, recipe_source_url, scrape_new_recipes,
     HttpFetcher, ScrapeEvent,
 };
+use crate::normalize::normalize_line;
 use crate::planning::{plan_meals, PlanOptions};
 use crate::pricing::{
     enrich_catalog_from_source, FixtureStoreSource, OpenFoodFactsSource, PackageCatalog,
 };
-use crate::shopping::{shopping_list_for_plan, trip_breakdown_for_plan};
+use crate::shopping::{
+    pantry_keys_for_planning, restock_plan_from_shop, shopping_list_for_plan,
+    trip_breakdown_for_plan,
+};
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -142,6 +146,62 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
     },
+    /// Track on-hand ingredients (pantry stock)
+    Pantry {
+        #[command(subcommand)]
+        action: PantryCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PantryCmd {
+    /// List on-hand stock (canonical quantities)
+    List,
+    /// Add quantity from a free-text ingredient line (e.g. "2 cups milk")
+    Add {
+        /// Free-text ingredient line with quantity and unit
+        line: String,
+    },
+    /// Set absolute quantity from a free-text ingredient line
+    Set {
+        /// Free-text ingredient line with quantity and unit
+        line: String,
+    },
+    /// Remove an ingredient from the pantry by name
+    Remove {
+        /// Ingredient name (normalized match)
+        name: String,
+        /// Disambiguate when the same name exists under multiple unit kinds
+        #[arg(long, value_parser = parse_kind_arg)]
+        kind: Option<UnitKind>,
+    },
+    /// Clear the entire pantry
+    Clear {
+        /// Required confirmation flag
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Complete a shopping trip for a plan: add purchased packages, then deduct
+    /// cooked recipe amounts (net = packaging leftovers). Once per plan.
+    Restock {
+        /// Plan id (prefix match allowed if unique)
+        plan: String,
+        /// Optional JSON catalog overlay (same as `shop`)
+        #[arg(long)]
+        catalog: Option<PathBuf>,
+    },
+}
+
+fn parse_kind_arg(s: &str) -> std::result::Result<UnitKind, String> {
+    match s.to_lowercase().as_str() {
+        "mass" | "g" | "weight" => Ok(UnitKind::Mass),
+        "volume" | "vol" | "ml" => Ok(UnitKind::Volume),
+        "count" | "ea" | "each" => Ok(UnitKind::Count),
+        "other" => Ok(UnitKind::Other),
+        other => Err(format!(
+            "unknown kind '{other}' (use mass, volume, count, or other)"
+        )),
+    }
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -308,9 +368,12 @@ pub fn run(cli: Cli) -> Result<()> {
             if recipes.is_empty() {
                 bail!("recipe pool is empty; import recipes first");
             }
+            let pantry_items = store.list_pantry()?;
+            let pantry = pantry_keys_for_planning(&pantry_items);
             let opts = PlanOptions {
                 days,
                 meals_per_day: per_day,
+                pantry,
             };
             let plan = plan_meals(&recipes, &opts);
             if json {
@@ -446,10 +509,79 @@ pub fn run(cli: Cli) -> Result<()> {
         Commands::Status => {
             let recipes = store.list_recipes(None)?;
             let plans = store.list_plans()?;
+            let pantry = store.list_pantry()?;
             println!("Database: {}", store.path().display());
             println!("Recipes:  {}", recipes.len());
             println!("Plans:    {}", plans.len());
+            println!("Pantry:   {} item(s)", pantry.len());
         }
+        Commands::Pantry { action } => match action {
+            PantryCmd::List => {
+                let items = store.list_pantry()?;
+                if items.is_empty() {
+                    println!("Pantry is empty.");
+                } else {
+                    for item in items {
+                        let unit = ShoppingList::kind_label(item.key.kind);
+                        println!(
+                            "• {} — {:.1} {} ({:?})",
+                            item.key.name, item.quantity_canonical, unit, item.key.kind
+                        );
+                    }
+                }
+            }
+            PantryCmd::Add { line } => {
+                let (key, qty) = parse_pantry_line(&line)?;
+                store.pantry_add(&key, qty)?;
+                let unit = ShoppingList::kind_label(key.kind);
+                println!("Added {qty:.1} {unit} of {} to pantry.", key.name);
+                warn_kind_mismatch(&store, &key)?;
+            }
+            PantryCmd::Set { line } => {
+                let (key, qty) = parse_pantry_line(&line)?;
+                store.pantry_set(&key, qty)?;
+                if qty <= 0.0 {
+                    println!("Removed {} from pantry (quantity set to 0).", key.name);
+                } else {
+                    let unit = ShoppingList::kind_label(key.kind);
+                    println!("Set {} to {qty:.1} {unit} in pantry.", key.name);
+                    warn_kind_mismatch(&store, &key)?;
+                }
+            }
+            PantryCmd::Remove { name, kind } => {
+                let key = resolve_pantry_name(&store, &name, kind)?;
+                if store.pantry_remove(&key)? {
+                    println!("Removed {} ({:?}) from pantry.", key.name, key.kind);
+                } else {
+                    println!("Nothing to remove for {}.", key.name);
+                }
+            }
+            PantryCmd::Clear { yes } => {
+                if !yes {
+                    bail!("refusing to clear pantry without --yes");
+                }
+                store.pantry_clear()?;
+                println!("Pantry cleared.");
+            }
+            PantryCmd::Restock { plan, catalog } => {
+                let plan = resolve_plan(&store, &plan)?;
+                let mut cat = PackageCatalog::with_defaults();
+                if let Some(path) = catalog {
+                    cat.load_json_overlay(&path)
+                        .with_context(|| format!("loading catalog {}", path.display()))?;
+                }
+                // Buy packages then cook the plan: net empty-pantry state is
+                // packaging leftover only. Refuses a second restock of the same plan.
+                let delta = restock_plan_from_shop(&store, &plan, &cat)?;
+                println!(
+                    "Restocked plan {}: added {} purchase line(s), deducted {} cooked ingredient(s) \
+                     (leftovers remain in pantry).",
+                    short_id(&plan.id),
+                    delta.additions.len(),
+                    delta.deductions.len()
+                );
+            }
+        },
         Commands::Reparse { id, all } => match (all, id) {
             (true, _) => {
                 let mut recipes = store.list_recipes(None)?;
@@ -483,6 +615,74 @@ fn reparse_recipe(recipe: &mut Recipe) {
     for line in &mut recipe.ingredients {
         *line = crate::normalize::normalize_line(&line.original);
     }
+}
+
+/// Parse a free-text ingredient line into an identity key and canonical quantity.
+fn parse_pantry_line(line: &str) -> Result<(IngredientKey, f64)> {
+    let parsed = normalize_line(line);
+    let key = IngredientKey::from_line(&parsed);
+    let Some((qty, _)) = parsed.canonical_quantity() else {
+        bail!(
+            "could not parse a quantity from '{line}' \
+             (use a line like \"2 cups milk\" or \"500g flour\")"
+        );
+    };
+    if !qty.is_finite() || qty <= 0.0 {
+        bail!("quantity must be a positive finite number (got {qty})");
+    }
+    Ok((key, qty))
+}
+
+/// Resolve a pantry item by name, optionally disambiguating by unit kind.
+fn resolve_pantry_name(store: &Store, name: &str, kind: Option<UnitKind>) -> Result<IngredientKey> {
+    let want = crate::domain::normalize_ingredient_name(name);
+    let items = store.list_pantry()?;
+    let matches: Vec<_> = items
+        .into_iter()
+        .filter(|p| p.key.name == want)
+        .filter(|p| kind.map(|k| p.key.kind == k).unwrap_or(true))
+        .collect();
+    match matches.as_slice() {
+        [] => bail!("no pantry item matching '{name}'"),
+        [one] => Ok(one.key.clone()),
+        many => {
+            let kinds: Vec<_> = many.iter().map(|p| format!("{:?}", p.key.kind)).collect();
+            bail!(
+                "ambiguous pantry name '{name}' (kinds: {}); pass --kind",
+                kinds.join(", ")
+            )
+        }
+    }
+}
+
+/// Warn when a pantry key's unit kind differs from how recipes store the same name.
+/// Shopping still bridges mass↔volume via density; this makes the trap visible.
+fn warn_kind_mismatch(store: &Store, key: &IngredientKey) -> Result<()> {
+    let recipes = store.list_recipes(None)?;
+    let mut recipe_kinds = HashSet::new();
+    for r in &recipes {
+        for line in &r.ingredients {
+            let k = IngredientKey::from_line(line);
+            if k.name == key.name {
+                recipe_kinds.insert(k.kind);
+            }
+        }
+    }
+    if recipe_kinds.is_empty() {
+        return Ok(());
+    }
+    if !recipe_kinds.contains(&key.kind) {
+        let kinds: Vec<_> = recipe_kinds.iter().map(|k| format!("{k:?}")).collect();
+        eprintln!(
+            "note: recipes use {} as {} — pantry stored as {:?}. \
+             Shopping bridges mass↔volume via density when possible; \
+             prefer matching the recipe unit (e.g. cups/ml for flour) when unsure.",
+            key.name,
+            kinds.join("/"),
+            key.kind
+        );
+    }
+    Ok(())
 }
 
 fn short_id(id: &str) -> String {
@@ -667,5 +867,19 @@ mod tests {
         assert_eq!(line.original, "¼ cup flour"); // original text preserved
         assert_eq!(line.name, "flour");
         assert_eq!(line.quantity, Some(0.25));
+    }
+
+    #[test]
+    fn parse_pantry_line_extracts_key_and_canonical_qty() {
+        let (key, qty) = parse_pantry_line("2 cups milk").unwrap();
+        assert_eq!(key.name, "milk");
+        assert_eq!(key.kind, UnitKind::Volume);
+        // 2 cups ≈ 473.176 ml
+        assert!((qty - 473.176).abs() < 0.1);
+    }
+
+    #[test]
+    fn parse_pantry_line_rejects_no_quantity() {
+        assert!(parse_pantry_line("salt to taste").is_err());
     }
 }

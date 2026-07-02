@@ -79,6 +79,11 @@ pub fn volume_ml_to_mass_g(name: &str, ml: f64) -> Option<f64> {
     density_g_per_ml(name).map(|d| ml * d)
 }
 
+/// Convert mass (g) to volume (ml) using density, if known.
+pub fn mass_g_to_volume_ml(name: &str, g: f64) -> Option<f64> {
+    density_g_per_ml(name).filter(|d| *d > 0.0).map(|d| g / d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
