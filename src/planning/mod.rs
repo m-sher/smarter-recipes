@@ -43,15 +43,8 @@
 //! Construction order is the plan order: ingredients tend to appear when first
 //! needed, which keeps [`crate::shopping::trip_breakdown_for_plan`] meaningful.
 //!
-<<<<<<< HEAD
 //! Complexity: O(P² · S · K) where P = pool size, S = slots, K = avg keys/recipe
 //! — fine for tens to low hundreds of recipes.
-=======
-//! The result is a locally optimal ordering biased toward early consolidation of
-//! shopping needs.
-//!
-//! Complexity: O(S * P * K) where S = slots, P = pool size, K = avg keys/recipe.
->>>>>>> 94b7f4e (Doc/comment hygiene: refresh README, trim rationale comments)
 
 use crate::domain::{IngredientKey, MealPlan, PlannedMeal, Recipe, RecipeId};
 use std::collections::{HashMap, HashSet};
