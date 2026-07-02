@@ -259,10 +259,15 @@ fn split_note(rest: &str) -> (String, Option<String>) {
     }
     // Comma-separated note (common in recipes: "chicken breast, diced")
     if let Some(idx) = rest.find(',') {
-        let name = rest[..idx].trim().to_string();
-        let note = rest[idx + 1..].trim().to_string();
-        if !name.is_empty() && !note.is_empty() {
-            return (name, Some(note));
+        let before = rest[..idx].trim();
+        let after = rest[idx + 1..].trim();
+        if !before.is_empty() && !after.is_empty() {
+            // "skinless, boneless chicken breasts": a leading list of descriptors
+            // isn't the name — keep scanning the remainder for the real noun.
+            if crate::domain::is_all_descriptors(before) {
+                return split_note(after);
+            }
+            return (before.to_string(), Some(after.to_string()));
         }
     }
     (rest.to_string(), None)
@@ -310,7 +315,9 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
                 name = name[..idx].to_string();
             }
         }
-        name = name.trim().trim_end_matches(',').trim().to_string();
+        // Also drop a dangling "(" left when the note was parenthesized, e.g.
+        // "salt (to taste)" -> "salt (" -> "salt".
+        name = name.trim().trim_end_matches([',', '(']).trim().to_string();
         let name = if name.is_empty() {
             clean_name(line)
         } else {
@@ -707,5 +714,32 @@ mod tests {
         assert_eq!(p.quantity, Some(2.0));
         assert_eq!(p.name, "eggs");
         assert_eq!(p.note.as_deref(), Some("large"));
+    }
+
+    #[test]
+    fn to_taste_in_parentheses_no_dangling_paren() {
+        let p = parse_ingredient_line("salt (to taste)");
+        assert_eq!(p.name, "salt");
+        assert!(p.quantity.is_none());
+    }
+
+    #[test]
+    fn comma_descriptor_prefix_keeps_noun() {
+        use crate::domain::IngredientKey;
+        use crate::normalize::normalize_line;
+        let p = parse_ingredient_line("2 skinless, boneless chicken breasts");
+        assert_eq!(p.quantity, Some(2.0));
+        // The real noun is retained (not reduced to "skinless").
+        assert!(p.name.contains("chicken breast"), "got {:?}", p.name);
+        let key = IngredientKey::from_line(&normalize_line("2 skinless, boneless chicken breasts"));
+        assert_eq!(key.name, "chicken breasts");
+    }
+
+    #[test]
+    fn comma_prep_note_still_splits() {
+        // A real prep note after the comma is still separated (regression guard).
+        let p = parse_ingredient_line("2.5 lb chicken breast, diced");
+        assert_eq!(p.name, "chicken breast");
+        assert_eq!(p.note.as_deref(), Some("diced"));
     }
 }
