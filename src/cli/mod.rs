@@ -206,10 +206,15 @@ pub fn run(cli: Cli) -> Result<()> {
                         skipped,
                         to_fetch,
                     } => eprintln!(
-                        "Found {candidates} link(s) under seed path; {skipped} already known; queue {to_fetch} …"
+                        "Found {candidates} same-host link(s); {skipped} already known; queue {to_fetch} …"
                     ),
                     ScrapeEvent::Imported { url, title } => eprintln!("  ✓ {title}  ({url})"),
-                    ScrapeEvent::Failed { url, reason } => eprintln!("  ✗ {url}  ({reason})"),
+                    ScrapeEvent::NotRecipe { url, reason } => {
+                        eprintln!("  · nav {url}  ({reason})")
+                    }
+                    ScrapeEvent::Failed { url, reason } => {
+                        eprintln!("  ✗ fetch {url}  ({reason})")
+                    }
                 }
                 },
             )?;
@@ -223,6 +228,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            // Persist only hard fetch failures — nav/category pages stay re-crawlable.
             if !dry_run {
                 for (link, reason) in &outcome.failed {
                     store.record_scrape_failure(&normalize_url(link), reason)?;
@@ -231,16 +237,18 @@ pub fn run(cli: Cli) -> Result<()> {
 
             if dry_run {
                 println!(
-                    "(dry run) {} new recipe(s) found, {} failed, {} skipped — nothing saved",
+                    "(dry run) {} new recipe(s), {} nav (not recipe), {} fetch failed, {} skipped — nothing saved",
                     outcome.recipes.len(),
+                    outcome.not_recipe.len(),
                     outcome.failed.len(),
                     outcome.skipped_existing
                 );
             } else {
                 println!(
-                    "Imported {} new recipe(s) to {} ({} failed, {} skipped)",
+                    "Imported {} new recipe(s) to {} ({} nav, {} fetch failed, {} skipped)",
                     outcome.recipes.len(),
                     store.path().display(),
+                    outcome.not_recipe.len(),
                     outcome.failed.len(),
                     outcome.skipped_existing
                 );
