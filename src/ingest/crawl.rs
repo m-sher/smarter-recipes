@@ -333,7 +333,11 @@ pub fn scrape_new_recipes(
                             return;
                         }
                     };
-                    let ingest = ingest_html(url, &html);
+                    let ingest = if is_listing_url(url) {
+                        Err("listing/index page".to_string())
+                    } else {
+                        ingest_html(url, &html)
+                    };
                     match &ingest {
                         Ok(recipe) => progress(ScrapeEvent::Imported {
                             url: url.clone(),
@@ -489,6 +493,52 @@ mod tests {
         assert!(!is_listing_url(
             "https://itsahero.com/delicious-air-fryer-salsa-verde-recipe"
         ));
+    }
+
+    #[test]
+    fn listing_page_with_json_ld_is_not_imported_but_links_expand() {
+        let mut pages = HashMap::new();
+        // Index links only to a category page.
+        pages.insert(
+            "https://site.com/recipes".to_string(),
+            r#"<a href="/category/food">Food</a>"#.to_string(),
+        );
+        // Category page has full Recipe JSON-LD AND a link to a real recipe.
+        pages.insert(
+            "https://site.com/category/food".to_string(),
+            format!(
+                r#"<html><body>
+              <script type="application/ld+json">{{
+                "@type":"Recipe","name":"Grilled S'mores",
+                "recipeIngredient":["bread","chocolate"]
+              }}</script>
+              <a href="/grilled-smores">real</a>
+            </body></html>"#
+            ),
+        );
+        pages.insert(
+            "https://site.com/grilled-smores".to_string(),
+            recipe_html("Grilled S'mores"),
+        );
+        let f = MapFetcher { pages };
+        let out = scrape(&f, "https://site.com/recipes", 10, &HashSet::new(), 2);
+        assert!(
+            out.recipes.iter().all(|r| {
+                recipe_source_url(r).map(|u| !u.contains("/category/")).unwrap_or(true)
+            }),
+            "must not import category URL as recipe source: {:?}",
+            out.recipes.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
+        );
+        // Real recipe page should still be reachable via BFS.
+        assert!(
+            out.recipes.iter().any(|r| r.title == "Grilled S'mores"),
+            "expected real recipe via expanded link, got {:?}",
+            out.recipes.iter().map(|r| &r.title).collect::<Vec<_>>()
+        );
+        assert!(
+            out.not_recipe.iter().any(|(u, _)| u.contains("/category/food")),
+            "category page should be classified not_recipe"
+        );
     }
 
     #[test]
