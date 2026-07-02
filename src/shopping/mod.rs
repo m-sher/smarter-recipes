@@ -96,7 +96,7 @@ pub fn trip_breakdown_for_plan(store: &Store, plan: &MealPlan) -> Result<TripBre
         for line in &recipe.ingredients {
             let key = IngredientKey::from_line(line);
             if coverage.insert(key.clone()) {
-                new_keys.push(format!("{} ({:?})", key.name, key.kind));
+                new_keys.push(key.name.clone());
             }
         }
         let n = new_keys.len();
@@ -192,5 +192,11 @@ mod tests {
         assert_eq!(t.total_unique_ingredients, 3);
         assert!(!t.summary.contains("positive advantage"));
         assert!(!t.summary.contains("reversed"));
+        // Ingredient keys read as plain names, not "name (Kind)".
+        assert!(t.steps[0]
+            .new_ingredient_keys
+            .iter()
+            .all(|k| !k.contains('(')));
+        assert!(t.steps[0].new_ingredient_keys.contains(&"milk".to_string()));
     }
 }

@@ -94,15 +94,16 @@ pub fn normalize_ingredient_name(name: &str) -> String {
 /// Remove leading size/quality descriptors used only for identity matching.
 /// Conservative and leading-only: words that change the ingredient itself
 /// (ground, whole, colors, brown/white, sweet, …) are intentionally excluded.
+const MULTI_DESCRIPTORS: &[&str] = &["extra large", "extra-large"];
+const SINGLE_DESCRIPTORS: &[&str] = &[
+    "large", "medium", "small", "jumbo", "fresh", "ripe", "boneless", "skinless",
+];
+
 fn strip_leading_descriptors(name: &str) -> String {
-    const MULTI: &[&str] = &["extra large", "extra-large"];
-    const SINGLE: &[&str] = &[
-        "large", "medium", "small", "jumbo", "fresh", "ripe", "boneless", "skinless",
-    ];
     let mut s = name;
     loop {
         let mut stripped = None;
-        for d in MULTI {
+        for d in MULTI_DESCRIPTORS {
             if let Some(rest) = s.strip_prefix(d) {
                 if let Some(rest) = rest.strip_prefix(' ') {
                     stripped = Some(rest);
@@ -111,7 +112,7 @@ fn strip_leading_descriptors(name: &str) -> String {
             }
         }
         if stripped.is_none() {
-            for d in SINGLE {
+            for d in SINGLE_DESCRIPTORS {
                 if let Some(rest) = s.strip_prefix(d) {
                     if let Some(rest) = rest.strip_prefix(' ') {
                         stripped = Some(rest);
@@ -126,6 +127,16 @@ fn strip_leading_descriptors(name: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// True if every whitespace-separated token of `s` is a size/quality descriptor.
+/// Used to detect "skinless, boneless chicken breasts", where the noun follows a
+/// comma-separated list of descriptors rather than preceding it.
+pub fn is_all_descriptors(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.split_whitespace()
+            .all(|w| SINGLE_DESCRIPTORS.contains(&w.to_lowercase().as_str()))
 }
 
 #[cfg(test)]
@@ -166,5 +177,14 @@ mod tests {
             IngredientKey::new("large eggs", UnitKind::Count),
             IngredientKey::new("eggs", UnitKind::Count)
         );
+    }
+
+    #[test]
+    fn is_all_descriptors_detects_descriptor_lists() {
+        assert!(is_all_descriptors("skinless"));
+        assert!(is_all_descriptors("boneless skinless"));
+        assert!(!is_all_descriptors("chicken breast"));
+        assert!(!is_all_descriptors("boneless chicken"));
+        assert!(!is_all_descriptors(""));
     }
 }
