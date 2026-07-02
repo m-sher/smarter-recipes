@@ -36,8 +36,9 @@
 //! 4. **Multi-start** — run the greedy growth once for **every** pool member as
 //!    seed. Keep the schedule with the smallest final `|union|`. If two
 //!    schedules tie on union size, prefer the one whose sequence of
-//!    `(title, recipe_id)` pairs is lexicographically smaller. Length ties keep
-//!    the incumbent (schedules are built to the same target under normal inputs).
+//!    `(title, recipe_id)` pairs is lexicographically smaller. Equal schedules
+//!    keep the incumbent. When `S == pool.len()`, multi-start is skipped and a
+//!    single greedy order is built from the lex-smallest seed.
 //!
 //! Construction order is the plan order: ingredients tend to appear when first
 //! needed, which keeps [`crate::shopping::trip_breakdown_for_plan`] meaningful.
@@ -71,21 +72,33 @@ fn recipe_keys(recipe: &Recipe) -> HashSet<IngredientKey> {
         .collect()
 }
 
-/// First occurrence of each `recipe_id`, dropping empty-ingredient recipes when
-/// any non-empty recipe is present.
-fn normalize_pool(pool: &[Recipe]) -> Vec<&Recipe> {
+/// Deduplicate by `recipe_id` (first wins) and drop empty-ingredient recipes when
+/// any non-empty recipe exists. Returns recipes paired with precomputed key sets
+/// so `recipe_keys` runs once per unique recipe.
+fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>) {
     let mut seen_ids = HashSet::new();
-    let mut unique: Vec<&Recipe> = Vec::new();
+    let mut recipes: Vec<&Recipe> = Vec::new();
+    let mut keys: Vec<HashSet<IngredientKey>> = Vec::new();
     for r in pool {
-        if seen_ids.insert(r.id.as_str()) {
-            unique.push(r);
+        if !seen_ids.insert(r.id.as_str()) {
+            continue;
+        }
+        recipes.push(r);
+        keys.push(recipe_keys(r));
+    }
+    let any_nonempty = keys.iter().any(|ks| !ks.is_empty());
+    if any_nonempty {
+        let mut i = 0;
+        while i < recipes.len() {
+            if keys[i].is_empty() {
+                recipes.remove(i);
+                keys.remove(i);
+            } else {
+                i += 1;
+            }
         }
     }
-    let any_nonempty = unique.iter().any(|r| !recipe_keys(r).is_empty());
-    if any_nonempty {
-        unique.retain(|r| !recipe_keys(r).is_empty());
-    }
-    unique
+    (recipes, keys)
 }
 
 /// Union size of ingredient keys for recipes at the given pool indices.
@@ -95,25 +108,6 @@ fn union_size(keys: &[HashSet<IngredientKey>], indices: &[usize]) -> usize {
         u.extend(keys[i].iter());
     }
     u.len()
-}
-
-/// Prefer candidate `i` over current best `bi` under greedy tie-breaks.
-fn better_candidate(
-    pool: &[&Recipe],
-    i: usize,
-    bi: usize,
-    new_keys: usize,
-    bn: usize,
-    key_count: usize,
-    bk: usize,
-) -> bool {
-    new_keys < bn
-        || (new_keys == bn && key_count < bk)
-        || (new_keys == bn && key_count == bk && pool[i].title < pool[bi].title)
-        || (new_keys == bn
-            && key_count == bk
-            && pool[i].title == pool[bi].title
-            && pool[i].id.as_str() < pool[bi].id.as_str())
 }
 
 /// Greedy growth from `seed`: always add the unused recipe that introduces the
@@ -131,22 +125,19 @@ fn greedy_from_seed(
     used_ids.insert(pool[seed].id.as_str());
 
     while selected.len() < target {
-        let mut best: Option<(usize, usize, usize)> = None; // (idx, new_keys, key_count)
-        for (i, ks) in keys.iter().enumerate() {
-            if used_ids.contains(pool[i].id.as_str()) {
-                continue;
-            }
-            let new_keys = ks.difference(&coverage).count();
-            let key_count = ks.len();
-            let take = match best {
-                None => true,
-                Some((bi, bn, bk)) => better_candidate(pool, i, bi, new_keys, bn, key_count, bk),
-            };
-            if take {
-                best = Some((i, new_keys, key_count));
-            }
-        }
-        let Some((choice, _, _)) = best else {
+        // Tie-break key: fewest new keys, then compact recipe, then title, then id.
+        let choice = (0..pool.len())
+            .filter(|&i| !used_ids.contains(pool[i].id.as_str()))
+            .min_by_key(|&i| {
+                let new_keys = keys[i].difference(&coverage).count();
+                (
+                    new_keys,
+                    keys[i].len(),
+                    pool[i].title.as_str(),
+                    pool[i].id.as_str(),
+                )
+            });
+        let Some(choice) = choice else {
             break;
         };
         selected.push(choice);
@@ -156,33 +147,35 @@ fn greedy_from_seed(
     selected
 }
 
-/// Compare two schedules for multi-start selection: smaller union wins; ties by
-/// lexicographic `(title, id)` sequence. Equal schedules keep the incumbent.
-fn better_schedule(
-    pool: &[&Recipe],
-    keys: &[HashSet<IngredientKey>],
-    a: &[usize],
-    b: &[usize],
-) -> bool {
-    let ua = union_size(keys, a);
-    let ub = union_size(keys, b);
+/// True if `a` beats incumbent `b`: smaller union wins; ties by lex
+/// `(title, id)` sequence. Equal schedules keep the incumbent (`false`).
+fn better_schedule(pool: &[&Recipe], a: &[usize], ua: usize, b: &[usize], ub: usize) -> bool {
     if ua != ub {
         return ua < ub;
     }
     for (&ia, &ib) in a.iter().zip(b.iter()) {
-        match pool[ia].title.cmp(&pool[ib].title) {
-            std::cmp::Ordering::Less => return true,
-            std::cmp::Ordering::Greater => return false,
-            std::cmp::Ordering::Equal => {}
-        }
-        match pool[ia].id.as_str().cmp(pool[ib].id.as_str()) {
-            std::cmp::Ordering::Less => return true,
-            std::cmp::Ordering::Greater => return false,
-            std::cmp::Ordering::Equal => {}
+        match (
+            pool[ia].title.as_str().cmp(pool[ib].title.as_str()),
+            pool[ia].id.as_str().cmp(pool[ib].id.as_str()),
+        ) {
+            (std::cmp::Ordering::Less, _) => return true,
+            (std::cmp::Ordering::Greater, _) => return false,
+            (std::cmp::Ordering::Equal, std::cmp::Ordering::Less) => return true,
+            (std::cmp::Ordering::Equal, std::cmp::Ordering::Greater) => return false,
+            (std::cmp::Ordering::Equal, std::cmp::Ordering::Equal) => {}
         }
     }
-    // Prefer more meals if lengths differ (partial vs full); otherwise keep incumbent.
-    a.len() > b.len()
+    // Lengths are always `target` under greedy_from_seed; keep incumbent.
+    false
+}
+
+/// When every recipe must be used, multi-start only reorders. Build one order
+/// greedily from the lexicographically smallest (title, id) seed.
+fn order_full_pool(pool: &[&Recipe], keys: &[HashSet<IngredientKey>]) -> Vec<usize> {
+    let seed = (0..pool.len())
+        .min_by_key(|&i| (pool[i].title.as_str(), pool[i].id.as_str()))
+        .expect("non-empty pool");
+    greedy_from_seed(pool, keys, seed, pool.len())
 }
 
 /// Build a meal plan from a candidate pool (no recipe repeats by id).
@@ -194,7 +187,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         .unwrap_or(0);
     let plan_id = uuid::Uuid::new_v4().to_string();
 
-    let pool = normalize_pool(pool);
+    let (pool, keys) = normalize_pool(pool);
 
     if pool.is_empty() || slots == 0 {
         return MealPlan {
@@ -206,22 +199,27 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         };
     }
 
-    let keys: Vec<HashSet<IngredientKey>> = pool.iter().map(|r| recipe_keys(r)).collect();
     let target = slots.min(pool.len());
 
-    let mut best: Option<Vec<usize>> = None;
-    for seed in 0..pool.len() {
-        let candidate = greedy_from_seed(&pool, &keys, seed, target);
-        let take = match &best {
-            None => true,
-            Some(b) => better_schedule(&pool, &keys, &candidate, b),
-        };
-        if take {
-            best = Some(candidate);
+    let selected = if target == pool.len() {
+        // Set is forced; only construction order matters.
+        order_full_pool(&pool, &keys)
+    } else {
+        let mut best: Option<(Vec<usize>, usize)> = None; // (schedule, union_size)
+        for seed in 0..pool.len() {
+            let candidate = greedy_from_seed(&pool, &keys, seed, target);
+            let ua = union_size(&keys, &candidate);
+            let take = match &best {
+                None => true,
+                Some((b, ub)) => better_schedule(&pool, &candidate, ua, b, *ub),
+            };
+            if take {
+                best = Some((candidate, ua));
+            }
         }
-    }
+        best.map(|(s, _)| s).unwrap_or_default()
+    };
 
-    let selected = best.unwrap_or_default();
     let total_unique = union_size(&keys, &selected);
 
     // meals_per_day is non-zero when slots > 0 (checked_mul path); guard for safety.
