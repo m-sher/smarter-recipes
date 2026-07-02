@@ -10,6 +10,10 @@
 //! Ingredient identity uses [`IngredientKey`] (normalized name + unit kind),
 //! matching aggregation and shopping.
 //!
+//! Keys already present in the optional **pantry** (on-hand stock) do not count
+//! as "new" when scoring candidates, and the reported plan cost is the size of
+//! the union **minus** pantry keys (ingredients you still need to source).
+//!
 //! # Algorithm
 //!
 //! Exact minimum-union subset selection is combinatorial. For household-scale
@@ -26,19 +30,20 @@
 //!    recipe).
 //!
 //! 3. **Greedy growth from a seed** — start with one recipe as the first meal.
-//!    While fewer than `S` recipes are selected, append the unused candidate
-//!    that minimizes the number of **new** ingredient keys (keys not already in
-//!    the running union). Ties break by:
+//!    The running coverage is seeded with pantry keys. While fewer than `S`
+//!    recipes are selected, append the unused candidate that minimizes the
+//!    number of **new** ingredient keys (keys not already in the running
+//!    coverage). Ties break by:
 //!    - smaller `|keys(candidate)|` (prefer compact recipes),
 //!    - then lexicographically smaller title,
 //!    - then lexicographically smaller `recipe_id` (full pool-order independence).
 //!
 //! 4. **Multi-start** — run the greedy growth once for **every** pool member as
-//!    seed. Keep the schedule with the smallest final `|union|`. If two
-//!    schedules tie on union size, prefer the one whose sequence of
-//!    `(title, recipe_id)` pairs is lexicographically smaller. Equal schedules
-//!    keep the incumbent. When `S == pool.len()`, multi-start is skipped and a
-//!    single greedy order is built from the lex-smallest seed.
+//!    seed. Keep the schedule with the smallest final **net** union size
+//!    (`|union − pantry|`). If two schedules tie on that size, prefer the one
+//!    whose sequence of `(title, recipe_id)` pairs is lexicographically smaller.
+//!    Equal schedules keep the incumbent. When `S == pool.len()`, multi-start
+//!    is skipped and a single greedy order is built from the lex-smallest seed.
 //!
 //! Construction order is the plan order: ingredients tend to appear when first
 //! needed, which keeps [`crate::shopping::trip_breakdown_for_plan`] meaningful.
@@ -53,6 +58,8 @@ use std::collections::{HashMap, HashSet};
 pub struct PlanOptions {
     pub days: u32,
     pub meals_per_day: u32,
+    /// Ingredient keys already on hand; excluded from "new" cost and net union.
+    pub pantry: HashSet<IngredientKey>,
 }
 
 impl Default for PlanOptions {
@@ -60,6 +67,7 @@ impl Default for PlanOptions {
         Self {
             days: 7,
             meals_per_day: 1,
+            pantry: HashSet::new(),
         }
     }
 }
@@ -101,7 +109,7 @@ fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>
     (recipes, keys)
 }
 
-/// Union size of ingredient keys for recipes at the given pool indices.
+/// Full union size of ingredient keys for recipes at the given pool indices.
 fn union_size(keys: &[HashSet<IngredientKey>], indices: &[usize]) -> usize {
     let mut u: HashSet<&IngredientKey> = HashSet::new();
     for &i in indices {
@@ -110,17 +118,38 @@ fn union_size(keys: &[HashSet<IngredientKey>], indices: &[usize]) -> usize {
     u.len()
 }
 
+/// Keys in the selected recipes that are **not** already covered by the pantry
+/// (i.e. still need to be sourced).
+fn net_union_size(
+    keys: &[HashSet<IngredientKey>],
+    indices: &[usize],
+    pantry: &HashSet<IngredientKey>,
+) -> usize {
+    let mut u: HashSet<&IngredientKey> = HashSet::new();
+    for &i in indices {
+        for k in &keys[i] {
+            if !pantry.contains(k) {
+                u.insert(k);
+            }
+        }
+    }
+    u.len()
+}
+
 /// Greedy growth from `seed`: always add the unused recipe that introduces the
-/// fewest new keys. Returns selected pool indices in plan order.
+/// fewest new keys (relative to pantry + already selected). Returns selected
+/// pool indices in plan order.
 fn greedy_from_seed(
     pool: &[&Recipe],
     keys: &[HashSet<IngredientKey>],
     seed: usize,
     target: usize,
+    pantry: &HashSet<IngredientKey>,
 ) -> Vec<usize> {
     let mut selected = Vec::with_capacity(target);
     selected.push(seed);
-    let mut coverage = keys[seed].clone();
+    let mut coverage = pantry.clone();
+    coverage.extend(keys[seed].iter().cloned());
     let mut used_ids: HashSet<&str> = HashSet::new();
     used_ids.insert(pool[seed].id.as_str());
 
@@ -171,14 +200,22 @@ fn better_schedule(pool: &[&Recipe], a: &[usize], ua: usize, b: &[usize], ub: us
 
 /// When every recipe must be used, multi-start only reorders. Build one order
 /// greedily from the lexicographically smallest (title, id) seed.
-fn order_full_pool(pool: &[&Recipe], keys: &[HashSet<IngredientKey>]) -> Vec<usize> {
+fn order_full_pool(
+    pool: &[&Recipe],
+    keys: &[HashSet<IngredientKey>],
+    pantry: &HashSet<IngredientKey>,
+) -> Vec<usize> {
     let seed = (0..pool.len())
         .min_by_key(|&i| (pool[i].title.as_str(), pool[i].id.as_str()))
         .expect("non-empty pool");
-    greedy_from_seed(pool, keys, seed, pool.len())
+    greedy_from_seed(pool, keys, seed, pool.len(), pantry)
 }
 
 /// Build a meal plan from a candidate pool (no recipe repeats by id).
+///
+/// When `opts.pantry` is non-empty, those ingredient keys are treated as already
+/// covered: they do not count as new when scoring, and the reported distinct
+/// count is net of pantry stock.
 pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let slots = opts
         .days
@@ -186,6 +223,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         .map(|n| n as usize)
         .unwrap_or(0);
     let plan_id = uuid::Uuid::new_v4().to_string();
+    let pantry = &opts.pantry;
 
     let (pool, keys) = normalize_pool(pool);
 
@@ -203,12 +241,12 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
 
     let selected = if target == pool.len() {
         // Set is forced; only construction order matters.
-        order_full_pool(&pool, &keys)
+        order_full_pool(&pool, &keys, pantry)
     } else {
-        let mut best: Option<(Vec<usize>, usize)> = None; // (schedule, union_size)
+        let mut best: Option<(Vec<usize>, usize)> = None; // (schedule, net_union_size)
         for seed in 0..pool.len() {
-            let candidate = greedy_from_seed(&pool, &keys, seed, target);
-            let ua = union_size(&keys, &candidate);
+            let candidate = greedy_from_seed(&pool, &keys, seed, target, pantry);
+            let ua = net_union_size(&keys, &candidate, pantry);
             let take = match &best {
                 None => true,
                 Some((b, ub)) => better_schedule(&pool, &candidate, ua, b, *ub),
@@ -221,6 +259,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     };
 
     let total_unique = union_size(&keys, &selected);
+    let net_unique = net_union_size(&keys, &selected, pantry);
 
     // meals_per_day is non-zero when slots > 0 (checked_mul path); guard for safety.
     let mpd = opts.meals_per_day.max(1);
@@ -250,15 +289,23 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         String::new()
     };
 
+    let pantry_note = if pantry.is_empty() {
+        format!("Plan uses {total_unique} distinct ingredient key(s).")
+    } else {
+        format!(
+            "Plan uses {total_unique} distinct ingredient key(s) \
+             ({net_unique} not already in pantry; {} pantry key(s) considered).",
+            pantry.len()
+        )
+    };
+
     let rationale = format!(
         "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
          Multi-start greedy selection minimizes distinct ingredient keys \
-         (no recipe repeats). Plan uses {} distinct ingredient key(s).{}",
+         (no recipe repeats). {pantry_note}{partial_note}",
         meals.len(),
         opts.days,
         pool.len(),
-        total_unique,
-        partial_note
     );
 
     MealPlan {
@@ -299,6 +346,7 @@ pub fn plan_union_size(pool: &[Recipe], plan: &MealPlan) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::UnitKind;
     use crate::normalize::normalize_line;
 
     fn rec(title: &str, ings: &[&str]) -> Recipe {
@@ -339,6 +387,7 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 1,
+                ..Default::default()
             },
         );
         assert_eq!(plan.meals.len(), 2);
@@ -358,7 +407,8 @@ mod tests {
             &pool,
             &PlanOptions {
                 days: 2,
-                meals_per_day: 2, // 4 slots, only 2 recipes
+                meals_per_day: 2, // 4 slots, only 2 recipes,
+                ..Default::default()
             },
         );
         assert_eq!(plan.meals.len(), 2);
@@ -375,6 +425,7 @@ mod tests {
             &PlanOptions {
                 days: 3,
                 meals_per_day: 1,
+                ..Default::default()
             },
         );
         assert_eq!(plan.meals.len(), 1);
@@ -396,6 +447,7 @@ mod tests {
             &PlanOptions {
                 days: 0,
                 meals_per_day: 1,
+                ..Default::default()
             },
         );
         assert!(plan.meals.is_empty());
@@ -409,6 +461,7 @@ mod tests {
             &PlanOptions {
                 days: u32::MAX,
                 meals_per_day: 2,
+                ..Default::default()
             },
         );
         assert!(plan.meals.is_empty());
@@ -423,6 +476,7 @@ mod tests {
         let opts = PlanOptions {
             days: 1,
             meals_per_day: 1,
+            ..Default::default()
         };
         let p1 = plan_meals(&pool1, &opts);
         let p2 = plan_meals(&pool2, &opts);
@@ -438,6 +492,7 @@ mod tests {
         let opts = PlanOptions {
             days: 2,
             meals_per_day: 1,
+            ..Default::default()
         };
         let p1 = plan_meals(&[a.clone(), b.clone(), c.clone()], &opts);
         let p2 = plan_meals(&[c, b, a], &opts);
@@ -457,6 +512,7 @@ mod tests {
             &PlanOptions {
                 days: 3,
                 meals_per_day: 1,
+                ..Default::default()
             },
         );
         assert_eq!(plan.meals.len(), 3);
@@ -479,6 +535,7 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 1,
+                ..Default::default()
             },
         );
         assert_eq!(plan.meals.len(), 2);
@@ -500,6 +557,7 @@ mod tests {
             &PlanOptions {
                 days: 5,
                 meals_per_day: 1,
+                ..Default::default()
             },
         );
         assert_eq!(plan.meals.len(), 5);
@@ -516,6 +574,7 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 2,
+                ..Default::default()
             },
         );
         assert_eq!(plan.meals.len(), 4);
@@ -532,6 +591,7 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 1,
+                ..Default::default()
             },
         );
         assert_eq!(plan.meals.len(), 1);
@@ -547,6 +607,7 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 1,
+                ..Default::default()
             },
         );
         assert_eq!(plan.meals.len(), 2);
@@ -571,6 +632,7 @@ mod tests {
         let opts = PlanOptions {
             days: 2,
             meals_per_day: 1,
+            ..Default::default()
         };
         let p1 = plan_meals(&[a.clone(), b.clone(), c.clone()], &opts);
         let p2 = plan_meals(&[c, b, a], &opts);
@@ -579,5 +641,83 @@ mod tests {
         s1.sort();
         s2.sort();
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn pantry_prefers_recipe_using_only_stocked_ingredients() {
+        // Without pantry, Omelette+Scramble (2 keys) beat Spice+Salt paths.
+        // With all spice ingredients stocked, "Spice Mix" alone costs 0 new keys
+        // and a second spice-adjacent recipe would still be cheap — but more
+        // simply: stock flour/milk/eggs/bread so breakfast cluster is free, then
+        // the planner can still pick it; instead stock the exotic cluster so it
+        // becomes free and is preferred when we need only 1 meal.
+        let breakfast = rec("Pancakes", &["2 cups flour", "1 cup milk", "2 eggs"]);
+        let spice = rec(
+            "Spice Mix",
+            &["1 tsp cumin", "1 tsp coriander", "1 tsp turmeric"],
+        );
+        let pool = vec![breakfast, spice];
+        let pantry: HashSet<_> = [
+            IngredientKey::new("cumin", UnitKind::Volume),
+            IngredientKey::new("coriander", UnitKind::Volume),
+            IngredientKey::new("turmeric", UnitKind::Volume),
+        ]
+        .into_iter()
+        .collect();
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 1,
+            pantry,
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 1);
+        assert_eq!(plan.meals[0].recipe_title, "Spice Mix");
+        assert!(plan.rationale.contains("pantry"));
+    }
+
+    #[test]
+    fn pantry_reduces_reported_net_unique_count() {
+        let a = rec("Pancakes", &["2 cups flour", "1 cup milk", "2 eggs"]);
+        let b = rec("French Toast", &["4 slices bread", "1 cup milk", "2 eggs"]);
+        let pool = vec![a, b];
+        let pantry: HashSet<_> = [
+            IngredientKey::new("milk", UnitKind::Volume),
+            IngredientKey::new("eggs", UnitKind::Count),
+        ]
+        .into_iter()
+        .collect();
+        let opts = PlanOptions {
+            days: 2,
+            meals_per_day: 1,
+            pantry,
+        };
+        let plan = plan_meals(&pool, &opts);
+        // Full union is 4 (flour, milk, eggs, bread); net after pantry is 2.
+        assert!(
+            plan.rationale.contains("2") && plan.rationale.to_lowercase().contains("pantry"),
+            "rationale should report net uniques with pantry: {}",
+            plan.rationale
+        );
+        assert_eq!(plan_union_size(&pool, &plan), 4);
+    }
+
+    #[test]
+    fn empty_pantry_matches_prior_behavior() {
+        let a = rec("Pancakes", &["2 cups flour", "1 cup milk", "2 eggs"]);
+        let b = rec("French Toast", &["4 slices bread", "1 cup milk", "2 eggs"]);
+        let c = rec(
+            "Spice Mix",
+            &["1 tsp cumin", "1 tsp coriander", "1 tsp turmeric"],
+        );
+        let pool = vec![a, b, c];
+        let opts = PlanOptions {
+            days: 2,
+            meals_per_day: 1,
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        let t = titles(&plan);
+        assert!(t.contains(&"Pancakes"));
+        assert!(t.contains(&"French Toast"));
     }
 }
