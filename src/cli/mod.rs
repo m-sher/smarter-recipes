@@ -1,7 +1,9 @@
 //! CLI command definitions and handlers.
 
 use crate::domain::{MealPlan, Recipe};
-use crate::ingest::ingest_from;
+use crate::ingest::{
+    ingest_from, normalize_url, recipe_source_url, scrape_new_recipes, HttpFetcher, ScrapeEvent,
+};
 use crate::planning::{plan_meals, PlanOptions};
 use crate::pricing::{
     enrich_catalog_from_source, FixtureStoreSource, OpenFoodFactsSource, PackageCatalog,
@@ -10,6 +12,7 @@ use crate::shopping::{shopping_list_for_plan, trip_breakdown_for_plan};
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -36,6 +39,23 @@ pub enum Commands {
         /// Path, URL, or image path
         input: String,
         /// Print recipe as JSON instead of saving
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Crawl a parent/index URL for recipe pages and import new ones
+    Scrape {
+        /// Index/parent URL, e.g. https://example.com/recipes
+        url: String,
+        /// Max number of new (not-yet-known) pages to fetch this run
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Number of pages to fetch concurrently
+        #[arg(long, default_value_t = 8)]
+        jobs: usize,
+        /// Re-attempt URLs previously recorded as failures
+        #[arg(long)]
+        retry_failed: bool,
+        /// Discover and report without saving
         #[arg(long)]
         dry_run: bool,
     },
@@ -133,6 +153,72 @@ pub fn run(cli: Cli) -> Result<()> {
             } else {
                 store.save_recipe(&recipe)?;
                 println!("Saved recipe {} to {}", recipe.id, store.path().display());
+            }
+        }
+        Commands::Scrape {
+            url,
+            limit,
+            jobs,
+            retry_failed,
+            dry_run,
+        } => {
+            // Skip URLs already imported, plus previously-failed URLs unless retrying.
+            let mut skip: HashSet<String> = store
+                .list_recipes(None)?
+                .iter()
+                .filter_map(recipe_source_url)
+                .map(|u| normalize_url(&u))
+                .collect();
+            if !retry_failed {
+                skip.extend(store.failed_scrape_urls()?);
+            }
+
+            eprintln!("Scanning {url} …");
+            let fetcher = HttpFetcher::default();
+            let outcome = scrape_new_recipes(&fetcher, &url, limit, &skip, jobs, &|event| {
+                match event {
+                    ScrapeEvent::Planned {
+                        candidates,
+                        skipped,
+                        to_fetch,
+                    } => eprintln!(
+                        "Found {candidates} recipe link(s); {skipped} already known; fetching {to_fetch} …"
+                    ),
+                    ScrapeEvent::Imported { url, title } => eprintln!("  ✓ {title}  ({url})"),
+                    ScrapeEvent::Failed { url, reason } => eprintln!("  ✗ {url}  ({reason})"),
+                }
+            })?;
+
+            for recipe in &outcome.recipes {
+                if !dry_run {
+                    store.save_recipe(recipe)?;
+                    // A URL that now succeeds should no longer be remembered as failed.
+                    if let Some(u) = recipe_source_url(recipe) {
+                        store.clear_scrape_failure(&normalize_url(&u))?;
+                    }
+                }
+            }
+            if !dry_run {
+                for (link, reason) in &outcome.failed {
+                    store.record_scrape_failure(&normalize_url(link), reason)?;
+                }
+            }
+
+            if dry_run {
+                println!(
+                    "(dry run) {} new recipe(s) found, {} failed, {} skipped — nothing saved",
+                    outcome.recipes.len(),
+                    outcome.failed.len(),
+                    outcome.skipped_existing
+                );
+            } else {
+                println!(
+                    "Imported {} new recipe(s) to {} ({} failed, {} skipped)",
+                    outcome.recipes.len(),
+                    store.path().display(),
+                    outcome.failed.len(),
+                    outcome.skipped_existing
+                );
             }
         }
         Commands::List { filter, full_id } => {

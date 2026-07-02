@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS plan_meals (
     PRIMARY KEY (plan_id, day, meal)
 );
 
+CREATE TABLE IF NOT EXISTS scrape_failures (
+    url TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    failed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_recipes_title ON recipes(title);
 CREATE INDEX IF NOT EXISTS idx_ri_ingredient ON recipe_ingredients(ingredient_id);
 "#;
@@ -443,6 +449,32 @@ impl Store {
         v.sort_by(|a, b| a.0.name.cmp(&b.0.name));
         Ok(v)
     }
+
+    /// Record (or refresh) a URL that failed to scrape, so future runs can skip it.
+    pub fn record_scrape_failure(&self, url: &str, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO scrape_failures (url, reason) VALUES (?1, ?2)
+             ON CONFLICT(url) DO UPDATE SET reason=excluded.reason, failed_at=datetime('now')",
+            params![url, reason],
+        )?;
+        Ok(())
+    }
+
+    /// URLs recorded as previously failed.
+    pub fn failed_scrape_urls(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT url FROM scrape_failures")?;
+        let urls = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+        Ok(urls)
+    }
+
+    /// Forget a recorded failure (e.g. once the URL scrapes successfully).
+    pub fn clear_scrape_failure(&self, url: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM scrape_failures WHERE url = ?1", params![url])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -504,5 +536,25 @@ mod tests {
         let milk = agg.iter().find(|(k, _)| k.name == "milk").unwrap();
         // 2 cups → ~473.176 ml
         assert!((milk.1 - 473.176).abs() < 0.1);
+    }
+
+    #[test]
+    fn scrape_failures_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        store
+            .record_scrape_failure("https://x.com/a", "no recipe")
+            .unwrap();
+        store
+            .record_scrape_failure("https://x.com/b", "http 404")
+            .unwrap();
+        let failed = store.failed_scrape_urls().unwrap();
+        assert!(failed.contains("https://x.com/a"));
+        assert_eq!(failed.len(), 2);
+
+        store.clear_scrape_failure("https://x.com/a").unwrap();
+        let failed = store.failed_scrape_urls().unwrap();
+        assert!(!failed.contains("https://x.com/a"));
+        assert_eq!(failed.len(), 1);
     }
 }

@@ -3,10 +3,15 @@
 //! Add a new source by implementing [`RecipeSource`] and registering it in
 //! [`ingest_from`] / the CLI `import` command.
 
+mod crawl;
 mod file;
 mod ocr;
 mod url;
 
+pub use crawl::{
+    discover_recipe_links, normalize_url, recipe_source_url, scrape_new_recipes, HttpFetcher,
+    ScrapeEvent, ScrapeOutcome,
+};
 pub use file::FileSource;
 pub use ocr::ImageOcrSource;
 pub use url::UrlSource;
