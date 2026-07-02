@@ -19,7 +19,7 @@ use std::path::PathBuf;
 #[command(
     name = "smarter-recipes",
     version,
-    about = "Ingest recipes, plan meals to minimize distinct ingredients, optimize shopping lists"
+    about = "Ingest recipes, plan meals to maximize ingredient overlap, optimize shopping lists"
 )]
 pub struct Cli {
     /// Path to SQLite database (default: platform data dir)
@@ -76,7 +76,7 @@ pub enum Commands {
     },
     /// Delete a recipe by id
     Delete { id: String },
-    /// Generate a meal plan minimizing distinct ingredients (no recipe repeats)
+    /// Generate a meal plan maximizing ingredient overlap
     Plan {
         /// Number of days
         #[arg(long, default_value_t = 7)]
@@ -87,6 +87,9 @@ pub enum Commands {
         /// Restrict pool to these recipe ids (comma-separated); default: all
         #[arg(long)]
         pool: Option<String>,
+        /// Do not reuse recipes even if pool is smaller than slots
+        #[arg(long)]
+        no_repeats: bool,
         /// Print plan as JSON
         #[arg(long)]
         json: bool,
@@ -250,6 +253,7 @@ pub fn run(cli: Cli) -> Result<()> {
             days,
             per_day,
             pool,
+            no_repeats,
             json,
             dry_run,
         } => {
@@ -260,6 +264,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let opts = PlanOptions {
                 days,
                 meals_per_day: per_day,
+                allow_repeats: !no_repeats,
             };
             let plan = plan_meals(&recipes, &opts);
             if json {
@@ -459,16 +464,12 @@ fn load_pool(store: &Store, pool: Option<&str>) -> Result<Vec<Recipe>> {
         None => store.list_recipes(None),
         Some(s) => {
             let mut out = Vec::new();
-            let mut seen = std::collections::HashSet::new();
             for part in s.split(',') {
                 let part = part.trim();
                 if part.is_empty() {
                     continue;
                 }
-                let r = resolve_recipe(store, part)?;
-                if seen.insert(r.id.clone()) {
-                    out.push(r);
-                }
+                out.push(resolve_recipe(store, part)?);
             }
             Ok(out)
         }

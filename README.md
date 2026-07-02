@@ -1,6 +1,6 @@
 # smarter-recipes
 
-CLI tool that ingests recipes from multiple sources, stores them in a local SQLite database, plans meals to **minimize distinct ingredients** (no recipe repeats; fewer shopping-list line items), and builds **optimized shopping lists** that minimize cost then leftover waste.
+CLI tool that ingests recipes from multiple sources, stores them in a local SQLite database, plans meals to **maximize ingredient overlap** (fewer shopping trips), and builds **optimized shopping lists** that minimize cost then leftover waste.
 
 ## Features
 
@@ -9,7 +9,7 @@ CLI tool that ingests recipes from multiple sources, stores them in a local SQLi
 | **Ingestion** | JSON / TOML / plain text files, web pages (schema.org `Recipe` JSON-LD with HTML fallback), images via Tesseract OCR or `.txt` sidecars |
 | **Normalization** | Free-text ingredient lines → name, quantity, unit; units converted to canonical g / ml / ea for aggregation |
 | **Storage** | Embedded SQLite; ingredients deduplicated by `(name, unit kind)` |
-| **Planning** | Multi-start min-union scheduler, no recipe repeats (documented in `src/planning/mod.rs`) |
+| **Planning** | Greedy overlap scheduler with recency window (documented in `src/planning/mod.rs`) |
 | **Shopping** | Package multiset optimization: **cost first**, then **minimum leftover** (documented in `src/shopping/mod.rs`) |
 | **Extensibility** | New ingest sources implement `RecipeSourceIngest`; custom package catalogs via JSON overlay |
 
@@ -70,7 +70,7 @@ smarter-recipes list --filter pasta
 smarter-recipes show <id-or-prefix>
 smarter-recipes status
 
-# Plan 5 days, 1 meal/day, minimize distinct ingredients (no repeats)
+# Plan 5 days, 1 meal/day, maximize ingredient reuse
 smarter-recipes plan --days 5 --per-day 1
 
 # Restrict the candidate pool
@@ -120,7 +120,7 @@ src/
   normalize/    Ingredient parsing + unit tables (no I/O)
   ingest/       Pluggable sources: file, url, ocr, crawl (index scraping)
   storage/      SQLite persistence + ingredient dedup
-  planning/     Min-union meal planner (no repeats)
+  planning/     Overlap-maximizing meal planner
   shopping/     Package purchase optimizer
   pricing/      Offline package catalog (+ scrape extension point)
   cli/          clap commands
@@ -137,7 +137,7 @@ src/
 
 ### Planning algorithm (summary)
 
-Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new ingredient keys; keep the schedule with the smallest final union. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. See module docs in `src/planning/mod.rs`.
+Seed with the recipe that shares the most ingredients with the rest of the pool, then greedily append the candidate maximizing weighted overlap with already covered ingredients plus a short recency window. See module docs in `src/planning/mod.rs`.
 
 ### Purchase optimization (summary)
 
