@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS pantry (
     quantity_canonical REAL NOT NULL CHECK (quantity_canonical > 0)
 );
 
+-- Plans that have already been restocked (buy + cook applied once).
+CREATE TABLE IF NOT EXISTS plan_restocks (
+    plan_id TEXT PRIMARY KEY REFERENCES meal_plans(id) ON DELETE CASCADE,
+    restocked_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_recipes_title ON recipes(title);
 CREATE INDEX IF NOT EXISTS idx_ri_ingredient ON recipe_ingredients(ingredient_id);
 "#;
@@ -559,6 +565,26 @@ impl Store {
                 params![ingredient_id, quantity_canonical],
             )?;
         }
+        Ok(())
+    }
+
+    /// Whether `pantry restock` has already been applied for this plan.
+    pub fn is_plan_restocked(&self, plan_id: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM plan_restocks WHERE plan_id = ?1",
+            params![plan_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Record that a plan's buy+cook restock was applied (idempotency guard).
+    pub fn mark_plan_restocked(&self, plan_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO plan_restocks (plan_id) VALUES (?1)
+             ON CONFLICT(plan_id) DO NOTHING",
+            params![plan_id],
+        )?;
         Ok(())
     }
 }

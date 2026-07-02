@@ -94,7 +94,9 @@ smarter-recipes plan --days 3 --pool <id1>,<id2>,<id3>
 # (amounts already in the pantry are subtracted / omitted)
 smarter-recipes shop <plan-id-or-prefix>
 
-# After buying, mark the plan's package totals as purchased (add to pantry)
+# After buying *and cooking* a plan: add purchased packages, then deduct what
+# the recipes consumed. Net pantry change is packaging leftover only.
+# Each plan can be restocked once (idempotent guard).
 smarter-recipes pantry restock <plan-id-or-prefix>
 
 # Show how plan ordering introduces ingredients (trip analysis)
@@ -156,7 +158,7 @@ src/
 4. **New ingest source** — Implement `RecipeSourceIngest` in `ingest/`, wire it in `ingest_from`.
 5. **Density table** — Volume-measured dry goods (flour, sugar, salt, …) convert to mass for realistic packages (`src/pricing/density.rs`).
 6. **Store sources** — `ProductSource` trait with Open Food Facts + fixture backends (`--fetch-prices`). Graceful fallback to the offline catalog.
-7. **Pantry** — On-hand stock is optional input to planning (keys already covered) and shopping (quantities subtracted). `pantry restock <plan>` adds the shopping list’s *purchased* package totals after a trip.
+7. **Pantry** — On-hand stock feeds planning (keys already covered; presence-only, not quantity) and shopping (quantities subtracted, with mass↔volume density bridging). `pantry restock <plan>` models **buy then cook**: add purchased packages, then deduct the plan’s full requirements, leaving packaging leftovers. Each plan may be restocked once.
 
 ### Planning algorithm (summary)
 

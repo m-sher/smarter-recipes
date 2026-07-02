@@ -30,35 +30,145 @@ mod optimize;
 
 pub use optimize::{optimize_purchase, optimize_shopping_list, OptimizeOptions};
 
-use crate::domain::{IngredientKey, MealPlan, PantryItem, ShoppingList};
-use crate::pricing::PackageCatalog;
+use crate::domain::{IngredientKey, MealPlan, PantryItem, ShoppingItem, ShoppingList, UnitKind};
+use crate::pricing::{mass_g_to_volume_ml, volume_ml_to_mass_g, PackageCatalog};
 use crate::storage::Store;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+/// On-hand amount for `key`, preferring an exact identity match.
+///
+/// If none exists, bridges mass↔volume via the density table for the same
+/// ingredient name (so `pantry add "500g flour"` covers volume-measured flour
+/// in recipes). Exact and converted stock are never double-counted.
+pub fn pantry_quantity_for(key: &IngredientKey, pantry: &[PantryItem]) -> f64 {
+    if let Some(p) = pantry.iter().find(|p| p.key == *key) {
+        return p.quantity_canonical;
+    }
+    match key.kind {
+        UnitKind::Volume => pantry
+            .iter()
+            .find(|p| p.key.name == key.name && p.key.kind == UnitKind::Mass)
+            .and_then(|p| mass_g_to_volume_ml(&p.key.name, p.quantity_canonical))
+            .unwrap_or(0.0),
+        UnitKind::Mass => pantry
+            .iter()
+            .find(|p| p.key.name == key.name && p.key.kind == UnitKind::Volume)
+            .and_then(|p| volume_ml_to_mass_g(&p.key.name, p.quantity_canonical))
+            .unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
 
 /// Subtract on-hand pantry quantities from plan requirements.
 ///
-/// For each required ingredient, reduces the needed amount by the matching
-/// pantry stock (same [`IngredientKey`]). Items fully covered by the pantry are
-/// omitted. Requirements with no matching pantry entry pass through unchanged.
+/// For each required ingredient, reduces the needed amount by matching pantry
+/// stock (exact [`IngredientKey`], or mass↔volume density bridge). Items fully
+/// covered by the pantry are omitted.
 pub fn apply_pantry_to_requirements(
     requirements: &[(IngredientKey, f64)],
     pantry: &[PantryItem],
 ) -> Vec<(IngredientKey, f64)> {
-    let stock: HashMap<&IngredientKey, f64> = pantry
-        .iter()
-        .map(|p| (&p.key, p.quantity_canonical))
-        .collect();
     let mut out = Vec::with_capacity(requirements.len());
     for (key, need) in requirements {
-        let have = stock.get(key).copied().unwrap_or(0.0);
+        let have = pantry_quantity_for(key, pantry);
         let remaining = need - have;
         if remaining > 1e-9 {
             out.push((key.clone(), remaining));
         }
     }
     out
+}
+
+/// Expand pantry identities for planner coverage: mass stock of a density-known
+/// dry good also covers the volume key (and vice versa).
+pub fn pantry_keys_for_planning(pantry: &[PantryItem]) -> HashSet<IngredientKey> {
+    let mut keys = HashSet::new();
+    for item in pantry {
+        keys.insert(item.key.clone());
+        match item.key.kind {
+            UnitKind::Mass if volume_ml_to_mass_g(&item.key.name, 1.0).is_some() => {
+                keys.insert(IngredientKey::new(&item.key.name, UnitKind::Volume));
+            }
+            UnitKind::Volume if volume_ml_to_mass_g(&item.key.name, 1.0).is_some() => {
+                keys.insert(IngredientKey::new(&item.key.name, UnitKind::Mass));
+            }
+            _ => {}
+        }
+    }
+    keys
+}
+
+/// Purchases to add and cooked amounts to deduct when completing a plan trip.
+///
+/// Apply **additions first**, then **deductions**. With an empty pantry the net
+/// for each bought ingredient is package leftover (`purchased − required`).
+/// Ingredients fully covered by existing stock only appear in `deductions`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestockDelta {
+    pub additions: Vec<(IngredientKey, f64)>,
+    pub deductions: Vec<(IngredientKey, f64)>,
+}
+
+/// Compute restock delta from gross plan requirements and the (already
+/// pantry-netted) shopping list for that plan.
+pub fn compute_restock_delta(
+    gross_requirements: &[(IngredientKey, f64)],
+    shopping_list: &ShoppingList,
+    catalog: &PackageCatalog,
+) -> RestockDelta {
+    let additions: Vec<_> = shopping_list
+        .items
+        .iter()
+        .filter_map(|item: &ShoppingItem| {
+            let qty = catalog.purchased_to_key_units(&item.ingredient, item.purchased_canonical);
+            if qty > 1e-9 {
+                Some((item.ingredient.clone(), qty))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let deductions: Vec<_> = gross_requirements
+        .iter()
+        .filter(|(_, need)| *need > 1e-9)
+        .map(|(k, need)| (k.clone(), *need))
+        .collect();
+    RestockDelta {
+        additions,
+        deductions,
+    }
+}
+
+/// Buy packages (add to pantry) then cook the plan (deduct full requirements).
+///
+/// Idempotent per plan: a second call for the same plan id errors without
+/// mutating stock. Net empty-pantry end state is packaging leftover only.
+pub fn restock_plan_from_shop(
+    store: &Store,
+    plan: &MealPlan,
+    catalog: &PackageCatalog,
+) -> Result<RestockDelta> {
+    if store.is_plan_restocked(&plan.id)? {
+        bail!(
+            "plan {} was already restocked; refusing to double-apply purchases/consumption",
+            &plan.id[..plan.id.len().min(8)]
+        );
+    }
+    let ids: Vec<_> = plan.meals.iter().map(|m| m.recipe_id.clone()).collect();
+    let gross = store.aggregate_ingredients(&ids)?;
+    let list = shopping_list_for_plan(store, plan, catalog)?;
+    let delta = compute_restock_delta(&gross, &list, catalog);
+
+    for (key, qty) in &delta.additions {
+        store.pantry_add(key, *qty)?;
+    }
+    for (key, qty) in &delta.deductions {
+        store.pantry_add(key, -*qty)?;
+    }
+    store.mark_plan_restocked(&plan.id)?;
+    Ok(delta)
 }
 
 /// Build an optimized shopping list for a stored plan, net of pantry stock.
@@ -215,6 +325,22 @@ mod tests {
     }
 
     #[test]
+    fn apply_pantry_bridges_mass_stock_to_volume_requirement() {
+        // User stocks "500g flour" (Mass); recipe needs flour by volume.
+        let flour_vol = IngredientKey::new("flour", UnitKind::Volume);
+        let req = vec![(flour_vol.clone(), 100.0)]; // 100 ml
+        let pantry = vec![PantryItem {
+            key: IngredientKey::new("flour", UnitKind::Mass),
+            quantity_canonical: 53.0, // ≈ 100 ml at 0.53 g/ml
+        }];
+        let net = apply_pantry_to_requirements(&req, &pantry);
+        assert!(
+            net.is_empty(),
+            "mass flour stock should cover volume need via density: {net:?}"
+        );
+    }
+
+    #[test]
     fn shopping_list_omits_pantry_covered_ingredients() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("t.db")).unwrap();
@@ -243,6 +369,96 @@ mod tests {
             list.items
         );
         assert!(list.items.iter().any(|i| i.ingredient.name == "eggs"));
+    }
+
+    #[test]
+    fn restock_leaves_only_package_leftover_then_blocks_repeat() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let a = rec("Shake", &["2 cups milk"]);
+        store.save_recipe(&a).unwrap();
+        let plan = MealPlan {
+            id: "plan-restock-1".into(),
+            days: 1,
+            meals_per_day: 1,
+            meals: vec![crate::domain::PlannedMeal {
+                day: 0,
+                meal: 0,
+                recipe_id: a.id.clone(),
+                recipe_title: a.title.clone(),
+            }],
+            rationale: "test".into(),
+        };
+        store.save_plan(&plan).unwrap();
+        let cat = PackageCatalog::with_defaults();
+
+        let list_before = shopping_list_for_plan(&store, &plan, &cat).unwrap();
+        let milk_item = list_before
+            .items
+            .iter()
+            .find(|i| i.ingredient.name == "milk")
+            .expect("milk on list");
+        let purchased_key_units =
+            cat.purchased_to_key_units(&milk_item.ingredient, milk_item.purchased_canonical);
+        let required = milk_item.required_canonical;
+        // required is in display units for density-converted; milk volume stays ml.
+        assert!(purchased_key_units + 1e-6 >= required);
+
+        restock_plan_from_shop(&store, &plan, &cat).unwrap();
+
+        let pantry = store.list_pantry().unwrap();
+        let milk_key = IngredientKey::new("milk", UnitKind::Volume);
+        let have = pantry_quantity_for(&milk_key, &pantry);
+        let expected_leftover = purchased_key_units - {
+            // gross requirement in key units (2 cups)
+            let line = normalize_line("2 cups milk");
+            line.canonical_quantity().unwrap().0
+        };
+        assert!(
+            (have - expected_leftover).abs() < 1.0,
+            "after restock expect leftover ~{expected_leftover}, got {have}"
+        );
+
+        // Re-shop same plan must buy the cooked amount again (only leftover remains).
+        let list_after = shopping_list_for_plan(&store, &plan, &cat).unwrap();
+        let milk_after = list_after
+            .items
+            .iter()
+            .find(|i| i.ingredient.name == "milk");
+        assert!(
+            milk_after.is_some(),
+            "must need to buy milk again after cooking; list={:?}",
+            list_after.items
+        );
+
+        // Second restock is rejected (idempotent guard).
+        assert!(restock_plan_from_shop(&store, &plan, &cat).is_err());
+    }
+
+    #[test]
+    fn compute_restock_delta_adds_purchases_deducts_gross() {
+        // Count ingredients are not density-converted; quantities pass through.
+        let eggs = IngredientKey::new("eggs", UnitKind::Count);
+        let gross = vec![(eggs.clone(), 6.0)];
+        let list = ShoppingList {
+            plan_id: "p".into(),
+            items: vec![crate::domain::ShoppingItem {
+                ingredient: eggs.clone(),
+                required_canonical: 6.0,
+                required_unit_label: "ea".into(),
+                packages: vec![],
+                purchased_canonical: 12.0,
+                leftover_canonical: 6.0,
+                total_cost_cents: None,
+                leftover_flagged: true,
+            }],
+            total_cost_cents: None,
+        };
+        let delta = compute_restock_delta(&gross, &list, &PackageCatalog::with_defaults());
+        assert_eq!(delta.additions.len(), 1);
+        assert!((delta.additions[0].1 - 12.0).abs() < 1e-6);
+        assert_eq!(delta.deductions.len(), 1);
+        assert!((delta.deductions[0].1 - 6.0).abs() < 1e-6);
     }
 
     #[test]

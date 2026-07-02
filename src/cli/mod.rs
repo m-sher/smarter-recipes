@@ -10,7 +10,10 @@ use crate::planning::{plan_meals, PlanOptions};
 use crate::pricing::{
     enrich_catalog_from_source, FixtureStoreSource, OpenFoodFactsSource, PackageCatalog,
 };
-use crate::shopping::{shopping_list_for_plan, trip_breakdown_for_plan};
+use crate::shopping::{
+    pantry_keys_for_planning, restock_plan_from_shop, shopping_list_for_plan,
+    trip_breakdown_for_plan,
+};
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -178,7 +181,8 @@ pub enum PantryCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Mark a plan's shopping list as purchased (add bought amounts to pantry)
+    /// Complete a shopping trip for a plan: add purchased packages, then deduct
+    /// cooked recipe amounts (net = packaging leftovers). Once per plan.
     Restock {
         /// Plan id (prefix match allowed if unique)
         plan: String,
@@ -349,7 +353,8 @@ pub fn run(cli: Cli) -> Result<()> {
             if recipes.is_empty() {
                 bail!("recipe pool is empty; import recipes first");
             }
-            let pantry = store.pantry_keys()?;
+            let pantry_items = store.list_pantry()?;
+            let pantry = pantry_keys_for_planning(&pantry_items);
             let opts = PlanOptions {
                 days,
                 meals_per_day: per_day,
@@ -514,7 +519,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 let (key, qty) = parse_pantry_line(&line)?;
                 store.pantry_add(&key, qty)?;
                 let unit = ShoppingList::kind_label(key.kind);
-                println!("Added {:.1} {} of {} to pantry.", qty, unit, key.name);
+                println!("Added {qty:.1} {unit} of {} to pantry.", key.name);
+                warn_kind_mismatch(&store, &key)?;
             }
             PantryCmd::Set { line } => {
                 let (key, qty) = parse_pantry_line(&line)?;
@@ -523,7 +529,8 @@ pub fn run(cli: Cli) -> Result<()> {
                     println!("Removed {} from pantry (quantity set to 0).", key.name);
                 } else {
                     let unit = ShoppingList::kind_label(key.kind);
-                    println!("Set {} to {:.1} {} in pantry.", key.name, qty, unit);
+                    println!("Set {} to {qty:.1} {unit} in pantry.", key.name);
+                    warn_kind_mismatch(&store, &key)?;
                 }
             }
             PantryCmd::Remove { name, kind } => {
@@ -548,24 +555,16 @@ pub fn run(cli: Cli) -> Result<()> {
                     cat.load_json_overlay(&path)
                         .with_context(|| format!("loading catalog {}", path.display()))?;
                 }
-                let list = shopping_list_for_plan(&store, &plan, &cat)?;
-                if list.items.is_empty() {
-                    println!("Shopping list is empty (nothing to restock).");
-                } else {
-                    let mut n = 0;
-                    for item in &list.items {
-                        // Stock in the ingredient key's units (ml/g/ea), not
-                        // density-display grams when the key is still volume.
-                        let qty =
-                            cat.purchased_to_key_units(&item.ingredient, item.purchased_canonical);
-                        store.pantry_add(&item.ingredient, qty)?;
-                        n += 1;
-                    }
-                    println!(
-                        "Marked {n} ingredient(s) purchased for plan {} — added package totals to pantry.",
-                        short_id(&plan.id)
-                    );
-                }
+                // Buy packages then cook the plan: net empty-pantry state is
+                // packaging leftover only. Refuses a second restock of the same plan.
+                let delta = restock_plan_from_shop(&store, &plan, &cat)?;
+                println!(
+                    "Restocked plan {}: added {} purchase line(s), deducted {} cooked ingredient(s) \
+                     (leftovers remain in pantry).",
+                    short_id(&plan.id),
+                    delta.additions.len(),
+                    delta.deductions.len()
+                );
             }
         },
         Commands::Reparse { id, all } => match (all, id) {
@@ -639,6 +638,36 @@ fn resolve_pantry_name(store: &Store, name: &str, kind: Option<UnitKind>) -> Res
             )
         }
     }
+}
+
+/// Warn when a pantry key's unit kind differs from how recipes store the same name.
+/// Shopping still bridges mass↔volume via density; this makes the trap visible.
+fn warn_kind_mismatch(store: &Store, key: &IngredientKey) -> Result<()> {
+    let recipes = store.list_recipes(None)?;
+    let mut recipe_kinds = HashSet::new();
+    for r in &recipes {
+        for line in &r.ingredients {
+            let k = IngredientKey::from_line(line);
+            if k.name == key.name {
+                recipe_kinds.insert(k.kind);
+            }
+        }
+    }
+    if recipe_kinds.is_empty() {
+        return Ok(());
+    }
+    if !recipe_kinds.contains(&key.kind) {
+        let kinds: Vec<_> = recipe_kinds.iter().map(|k| format!("{k:?}")).collect();
+        eprintln!(
+            "note: recipes use {} as {} — pantry stored as {:?}. \
+             Shopping bridges mass↔volume via density when possible; \
+             prefer matching the recipe unit (e.g. cups/ml for flour) when unsure.",
+            key.name,
+            kinds.join("/"),
+            key.kind
+        );
+    }
+    Ok(())
 }
 
 fn short_id(id: &str) -> String {
