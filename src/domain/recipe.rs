@@ -91,3 +91,33 @@ impl Recipe {
         }
     }
 }
+
+/// Normalize a recipe title for identity / dedup comparison.
+///
+/// Trims, lowercases, maps curly/modifier apostrophes to `'`, and collapses
+/// internal whitespace to single spaces.
+pub fn normalize_title_key(title: &str) -> String {
+    let mut s = title.trim().to_lowercase();
+    for ch in ['\u{2018}', '\u{2019}', '\u{02BC}'] {
+        s = s.replace(ch, "'");
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_title_key;
+
+    #[test]
+    fn title_key_normalizes_case_space_apostrophe() {
+        assert_eq!(
+            normalize_title_key("  Grilled S'mores  "),
+            normalize_title_key("grilled s'mores")
+        );
+        assert_eq!(
+            normalize_title_key("Grilled S\u{2019}mores"), // right single quotation mark
+            normalize_title_key("Grilled S'mores")
+        );
+        assert_eq!(normalize_title_key("A   B"), "a b");
+    }
+}

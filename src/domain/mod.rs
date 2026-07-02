@@ -7,5 +7,5 @@ mod units;
 
 pub use ingredient::{is_all_descriptors, IngredientKey, IngredientLine, ParsedIngredient};
 pub use plan::{MealPlan, PackagePick, PlannedMeal, ShoppingItem, ShoppingList};
-pub use recipe::{Recipe, RecipeId, RecipeMeta, RecipeSource};
+pub use recipe::{normalize_title_key, Recipe, RecipeId, RecipeMeta, RecipeSource};
 pub use units::{Unit, UnitKind};
