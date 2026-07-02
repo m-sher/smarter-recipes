@@ -1,10 +1,10 @@
-//! SQLite persistence for recipes, ingredients, and meal plans.
+//! SQLite persistence for recipes, ingredients, meal plans, and pantry stock.
 //!
 //! Ingredients are deduplicated by `(normalized_name, unit_kind)` so quantities
-//! can be aggregated across recipes and plans.
+//! can be aggregated across recipes, plans, and the pantry.
 
 use crate::domain::{
-    IngredientKey, IngredientLine, MealPlan, PlannedMeal, Recipe, RecipeId, RecipeMeta,
+    IngredientKey, IngredientLine, MealPlan, PantryItem, PlannedMeal, Recipe, RecipeId, RecipeMeta,
     RecipeSource, Unit, UnitKind,
 };
 use anyhow::{Context, Result};
@@ -63,6 +63,12 @@ CREATE TABLE IF NOT EXISTS scrape_failures (
     url TEXT PRIMARY KEY,
     reason TEXT NOT NULL,
     failed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- On-hand stock: one row per ingredient identity, quantity in canonical units.
+CREATE TABLE IF NOT EXISTS pantry (
+    ingredient_id INTEGER PRIMARY KEY REFERENCES ingredients(id) ON DELETE CASCADE,
+    quantity_canonical REAL NOT NULL CHECK (quantity_canonical > 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_recipes_title ON recipes(title);
@@ -475,6 +481,86 @@ impl Store {
             .execute("DELETE FROM scrape_failures WHERE url = ?1", params![url])?;
         Ok(())
     }
+
+    /// List all pantry items, sorted by ingredient name.
+    pub fn list_pantry(&self) -> Result<Vec<PantryItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.name, i.kind, p.quantity_canonical
+             FROM pantry p
+             JOIN ingredients i ON i.id = p.ingredient_id
+             ORDER BY i.name COLLATE NOCASE, i.kind",
+        )?;
+        let items = stmt
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let kind_s: String = row.get(1)?;
+                let qty: f64 = row.get(2)?;
+                Ok(PantryItem {
+                    key: IngredientKey::new(&name, Self::parse_kind(&kind_s)),
+                    quantity_canonical: qty,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
+    /// Ingredient keys currently stocked (any positive quantity).
+    pub fn pantry_keys(&self) -> Result<std::collections::HashSet<IngredientKey>> {
+        Ok(self.list_pantry()?.into_iter().map(|p| p.key).collect())
+    }
+
+    /// Add `delta` (canonical units) to an existing pantry row, or insert it.
+    /// Non-positive resulting quantity removes the item.
+    pub fn pantry_add(&self, key: &IngredientKey, delta: f64) -> Result<()> {
+        let id = self.upsert_ingredient(key)?;
+        let current: Option<f64> = self
+            .conn
+            .query_row(
+                "SELECT quantity_canonical FROM pantry WHERE ingredient_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let next = current.unwrap_or(0.0) + delta;
+        self.pantry_write(id, next)
+    }
+
+    /// Set absolute on-hand quantity (canonical units). Zero or negative removes.
+    pub fn pantry_set(&self, key: &IngredientKey, quantity_canonical: f64) -> Result<()> {
+        let id = self.upsert_ingredient(key)?;
+        self.pantry_write(id, quantity_canonical)
+    }
+
+    /// Remove a pantry item entirely. Returns true if a row was deleted.
+    pub fn pantry_remove(&self, key: &IngredientKey) -> Result<bool> {
+        let id = self.upsert_ingredient(key)?;
+        let n = self
+            .conn
+            .execute("DELETE FROM pantry WHERE ingredient_id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// Remove every pantry item.
+    pub fn pantry_clear(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM pantry", [])?;
+        Ok(())
+    }
+
+    fn pantry_write(&self, ingredient_id: i64, quantity_canonical: f64) -> Result<()> {
+        if quantity_canonical <= 0.0 {
+            self.conn.execute(
+                "DELETE FROM pantry WHERE ingredient_id = ?1",
+                params![ingredient_id],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO pantry (ingredient_id, quantity_canonical) VALUES (?1, ?2)
+                 ON CONFLICT(ingredient_id) DO UPDATE SET quantity_canonical = excluded.quantity_canonical",
+                params![ingredient_id, quantity_canonical],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -556,5 +642,92 @@ mod tests {
         let failed = store.failed_scrape_urls().unwrap();
         assert!(!failed.contains("https://x.com/a"));
         assert_eq!(failed.len(), 1);
+    }
+
+    #[test]
+    fn pantry_add_and_list_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let key = IngredientKey::new("milk", UnitKind::Volume);
+        store.pantry_add(&key, 500.0).unwrap();
+        let items = store.list_pantry().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key.name, "milk");
+        assert_eq!(items[0].key.kind, UnitKind::Volume);
+        assert!((items[0].quantity_canonical - 500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pantry_add_accumulates_same_key() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let key = IngredientKey::new("eggs", UnitKind::Count);
+        store.pantry_add(&key, 6.0).unwrap();
+        store.pantry_add(&key, 6.0).unwrap();
+        let items = store.list_pantry().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!((items[0].quantity_canonical - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pantry_set_overwrites_quantity() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let key = IngredientKey::new("flour", UnitKind::Mass);
+        store.pantry_add(&key, 1000.0).unwrap();
+        store.pantry_set(&key, 250.0).unwrap();
+        let items = store.list_pantry().unwrap();
+        assert!((items[0].quantity_canonical - 250.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pantry_remove_drops_item() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let milk = IngredientKey::new("milk", UnitKind::Volume);
+        let eggs = IngredientKey::new("eggs", UnitKind::Count);
+        store.pantry_add(&milk, 500.0).unwrap();
+        store.pantry_add(&eggs, 12.0).unwrap();
+        assert!(store.pantry_remove(&milk).unwrap());
+        let items = store.list_pantry().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].key.name, "eggs");
+        assert!(!store.pantry_remove(&milk).unwrap());
+    }
+
+    #[test]
+    fn pantry_clear_empties_all() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        store
+            .pantry_add(&IngredientKey::new("a", UnitKind::Count), 1.0)
+            .unwrap();
+        store
+            .pantry_add(&IngredientKey::new("b", UnitKind::Mass), 2.0)
+            .unwrap();
+        store.pantry_clear().unwrap();
+        assert!(store.list_pantry().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pantry_set_zero_removes_item() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let key = IngredientKey::new("salt", UnitKind::Mass);
+        store.pantry_set(&key, 100.0).unwrap();
+        store.pantry_set(&key, 0.0).unwrap();
+        assert!(store.list_pantry().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pantry_keys_returns_on_hand_identities() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        store
+            .pantry_add(&IngredientKey::new("butter", UnitKind::Mass), 100.0)
+            .unwrap();
+        let keys = store.pantry_keys().unwrap();
+        assert!(keys.contains(&IngredientKey::new("butter", UnitKind::Mass)));
+        assert_eq!(keys.len(), 1);
     }
 }
