@@ -3,9 +3,9 @@
 //! # Objective
 //!
 //! Fill up to `days * meals_per_day` slots from a candidate pool **without
-//! repeating any recipe** (by [`RecipeId`]), choosing a set whose combined
-//! ingredient vocabulary is as small as possible. Fewer distinct ingredients →
-//! shorter shopping lists and better package utilization.
+//! repeating any recipe** (by [`RecipeId`] **or** normalized title), choosing a
+//! set whose combined ingredient vocabulary is as small as possible. Fewer
+//! distinct ingredients → shorter shopping lists and better package utilization.
 //!
 //! Ingredient identity uses [`IngredientKey`] (normalized name + unit kind),
 //! matching aggregation and shopping.
@@ -16,10 +16,11 @@
 //! pools we use a **multi-start greedy** construction:
 //!
 //! 1. **Normalize the pool** — keep the first occurrence of each `recipe_id`
-//!    (duplicate entries cannot be scheduled twice). Recipes with **no**
-//!    ingredient keys are dropped when any non-empty recipe exists, so failed
-//!    or stub ingests do not crowd out real meals; if every recipe is empty,
-//!    they are kept so the planner can still fill slots.
+//!    **and** of each non-empty normalized title key (duplicate titles cannot be
+//!    scheduled twice even with different ids). Recipes with **no** ingredient
+//!    keys are dropped when any non-empty recipe exists, so failed or stub
+//!    ingests do not crowd out real meals; if every recipe is empty, they are
+//!    kept so the planner can still fill slots.
 //!
 //! 2. **Target size** — `S = min(slots, unique_pool.len())`. If the pool is
 //!    smaller than the number of slots, the plan is partial (never reuse a
@@ -46,7 +47,9 @@
 //! Complexity: O(P² · S · K) where P = pool size, S = slots, K = avg keys/recipe
 //! — fine for tens to low hundreds of recipes.
 
-use crate::domain::{IngredientKey, MealPlan, PlannedMeal, Recipe, RecipeId};
+use crate::domain::{
+    normalize_title_key, IngredientKey, MealPlan, PlannedMeal, Recipe, RecipeId,
+};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -72,15 +75,21 @@ fn recipe_keys(recipe: &Recipe) -> HashSet<IngredientKey> {
         .collect()
 }
 
-/// Deduplicate by `recipe_id` (first wins) and drop empty-ingredient recipes when
-/// any non-empty recipe exists. Returns recipes paired with precomputed key sets
-/// so `recipe_keys` runs once per unique recipe.
+/// Deduplicate by `recipe_id` and normalized title key (first wins each) and
+/// drop empty-ingredient recipes when any non-empty recipe exists. Returns
+/// recipes paired with precomputed key sets so `recipe_keys` runs once per
+/// unique recipe.
 fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>) {
     let mut seen_ids = HashSet::new();
+    let mut seen_titles = HashSet::new();
     let mut recipes: Vec<&Recipe> = Vec::new();
     let mut keys: Vec<HashSet<IngredientKey>> = Vec::new();
     for r in pool {
         if !seen_ids.insert(r.id.as_str()) {
+            continue;
+        }
+        let title_key = normalize_title_key(&r.title);
+        if !title_key.is_empty() && !seen_titles.insert(title_key) {
             continue;
         }
         recipes.push(r);
@@ -178,7 +187,8 @@ fn order_full_pool(pool: &[&Recipe], keys: &[HashSet<IngredientKey>]) -> Vec<usi
     greedy_from_seed(pool, keys, seed, pool.len())
 }
 
-/// Build a meal plan from a candidate pool (no recipe repeats by id).
+/// Build a meal plan from a candidate pool (no recipe repeats by id or
+/// normalized title).
 pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let slots = opts
         .days
@@ -380,6 +390,21 @@ mod tests {
         assert_eq!(plan.meals.len(), 1);
         assert_eq!(unique_recipe_ids(&plan), 1);
         assert_eq!(plan.meals[0].recipe_id.as_str(), "id-a");
+    }
+
+    #[test]
+    fn duplicate_titles_different_ids_collapse() {
+        let a = rec_with_id("id-a", "Grilled S'mores", &["1 bread"]);
+        let b = rec_with_id("id-b", "grilled s'mores", &["1 bread", "1 chocolate"]);
+        let plan = plan_meals(
+            &[a, b],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+            },
+        );
+        assert_eq!(plan.meals.len(), 1);
+        assert_eq!(plan.meals[0].recipe_id.as_str(), "id-a"); // first wins
     }
 
     #[test]
