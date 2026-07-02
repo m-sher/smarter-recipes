@@ -554,8 +554,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 } else {
                     let mut n = 0;
                     for item in &list.items {
-                        // Stock the purchased package total (what you actually bring home).
-                        store.pantry_add(&item.ingredient, item.purchased_canonical)?;
+                        // Stock in the ingredient key's units (ml/g/ea), not
+                        // density-display grams when the key is still volume.
+                        let qty =
+                            cat.purchased_to_key_units(&item.ingredient, item.purchased_canonical);
+                        store.pantry_add(&item.ingredient, qty)?;
                         n += 1;
                     }
                     println!(

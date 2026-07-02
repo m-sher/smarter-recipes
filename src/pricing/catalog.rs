@@ -436,6 +436,21 @@ impl PackageCatalog {
         (required_recipe, purchased_package_space, label.to_string())
     }
 
+    /// Convert a shopping-list purchased amount (display / package units) into
+    /// the requirement key's canonical units for pantry storage.
+    ///
+    /// Density-converted dry goods are optimized and displayed in grams but the
+    /// recipe key remains volume (ml); this maps grams back to ml so stock
+    /// subtracts correctly from future requirements.
+    pub fn purchased_to_key_units(&self, key: &IngredientKey, purchased_display: f64) -> f64 {
+        if self.uses_mass_via_density(key) {
+            crate::pricing::density::mass_g_to_volume_ml(&key.name, purchased_display)
+                .unwrap_or(purchased_display)
+        } else {
+            purchased_display
+        }
+    }
+
     /// Load additional entries from a JSON file: `{ "ingredient": [Package, ...] }`
     pub fn load_json_overlay(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         let text = std::fs::read_to_string(path)?;

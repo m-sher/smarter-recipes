@@ -290,9 +290,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     };
 
     let pantry_note = if pantry.is_empty() {
-        format!(
-            "Plan uses {total_unique} distinct ingredient key(s)."
-        )
+        format!("Plan uses {total_unique} distinct ingredient key(s).")
     } else {
         format!(
             "Plan uses {total_unique} distinct ingredient key(s) \
@@ -389,8 +387,8 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 1,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(plan.meals.len(), 2);
         let t = titles(&plan);
@@ -410,8 +408,8 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 2, // 4 slots, only 2 recipes,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(plan.meals.len(), 2);
         assert_eq!(unique_recipe_ids(&plan), 2);
@@ -427,8 +425,8 @@ mod tests {
             &PlanOptions {
                 days: 3,
                 meals_per_day: 1,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(plan.meals.len(), 1);
         assert_eq!(unique_recipe_ids(&plan), 1);
@@ -449,8 +447,8 @@ mod tests {
             &PlanOptions {
                 days: 0,
                 meals_per_day: 1,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert!(plan.meals.is_empty());
     }
@@ -463,8 +461,8 @@ mod tests {
             &PlanOptions {
                 days: u32::MAX,
                 meals_per_day: 2,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert!(plan.meals.is_empty());
     }
@@ -514,8 +512,8 @@ mod tests {
             &PlanOptions {
                 days: 3,
                 meals_per_day: 1,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(plan.meals.len(), 3);
         assert_eq!(unique_recipe_ids(&plan), 3);
@@ -537,8 +535,8 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 1,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(plan.meals.len(), 2);
         let t = titles(&plan);
@@ -559,8 +557,8 @@ mod tests {
             &PlanOptions {
                 days: 5,
                 meals_per_day: 1,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(plan.meals.len(), 5);
         assert_eq!(unique_recipe_ids(&plan), 5);
@@ -576,8 +574,8 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 2,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(plan.meals.len(), 4);
         let pairs: Vec<_> = plan.meals.iter().map(|m| (m.day, m.meal)).collect();
@@ -593,8 +591,8 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 1,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(plan.meals.len(), 1);
         assert_eq!(plan.meals[0].recipe_title, "Soup");
@@ -609,8 +607,8 @@ mod tests {
             &PlanOptions {
                 days: 2,
                 meals_per_day: 1,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(plan.meals.len(), 2);
         assert_eq!(unique_recipe_ids(&plan), 2);
