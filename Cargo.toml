@@ -2,7 +2,7 @@
 name = "smarter_recipes"
 version = "0.1.0"
 edition = "2021"
-description = "CLI for ingesting recipes, planning meals with ingredient overlap, and optimizing shopping lists"
+description = "CLI for ingesting recipes, planning meals with minimal distinct ingredients, and optimizing shopping lists"
 license = "MIT"
 readme = "README.md"
 keywords = ["recipes", "meal-planning", "cli", "shopping"]
