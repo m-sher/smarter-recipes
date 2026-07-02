@@ -81,7 +81,7 @@ pub struct TripBreakdown {
 ///
 /// Walks meals in schedule order and records which ingredient keys appear for the
 /// first time at each meal. Later meals that reuse those keys contribute 0 new keys
-/// — so an overlap-maximizing order shows large `new_count` early and smaller
+/// — so a min-union construction order shows large `new_count` early and smaller
 /// increments later when ingredients are reused.
 pub fn trip_breakdown_for_plan(store: &Store, plan: &MealPlan) -> Result<TripBreakdown> {
     let mut steps = Vec::new();
@@ -125,7 +125,7 @@ pub fn trip_breakdown_for_plan(store: &Store, plan: &MealPlan) -> Result<TripBre
             "Walked {} meal(s) in plan order; {} distinct ingredient key(s) in total. \
              New keys introduced per day (trip proxy): {:?}. \
              First half of meals introduced {} new key(s); second half introduced {} \
-             (a well-ordered overlap plan typically shows more new keys early, then reuse). \
+             (a well-ordered min-union plan typically shows more new keys early, then reuse). \
              Each step lists exactly which keys are first required at that meal — later meals \
              that only reuse earlier ingredients show new_count = 0.",
             steps.len(),
