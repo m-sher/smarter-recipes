@@ -61,7 +61,7 @@ impl ProductSource for OpenFoodFactsSource {
             let url = format!(
                 "{}/cgi/search.pl?search_terms={}&search_simple=1&action=process&json=1&page_size=10",
                 self.base_url.trim_end_matches('/'),
-                urlencoding_minimal(query)
+                crate::net::encode_query(query)
             );
             let client = reqwest::blocking::Client::builder()
                 .timeout(self.timeout)
@@ -99,16 +99,6 @@ impl ProductSource for OpenFoodFactsSource {
         }
         Ok(out)
     }
-}
-
-fn urlencoding_minimal(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            ' ' => "+".to_string(),
-            c if c.is_ascii_alphanumeric() || c == '-' || c == '_' => c.to_string(),
-            c => format!("%{:02X}", c as u8),
-        })
-        .collect()
 }
 
 fn off_to_package(

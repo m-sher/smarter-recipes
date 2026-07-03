@@ -703,6 +703,12 @@ impl Store {
         Ok(rows)
     }
 
+    /// Delete all cached nutrition lookups; returns the number of rows removed.
+    pub fn nutrition_cache_clear(&self) -> Result<usize> {
+        let n = self.conn.execute("DELETE FROM nutrition_cache", [])?;
+        Ok(n)
+    }
+
     /// Insert or update one cache row; `None` records a negative result.
     pub fn nutrition_cache_put(
         &self,
@@ -969,5 +975,8 @@ mod tests {
         store.nutrition_cache_put("tahini", Some(&m2)).unwrap();
         let all = store.nutrition_cache_all().unwrap();
         assert_eq!(all.get("tahini").unwrap().unwrap().kcal, 200.0);
+        // clear removes every row
+        assert_eq!(store.nutrition_cache_clear().unwrap(), 2);
+        assert!(store.nutrition_cache_all().unwrap().is_empty());
     }
 }

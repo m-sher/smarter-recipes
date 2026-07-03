@@ -170,6 +170,9 @@ pub enum NutritionCmd {
         #[arg(long, default_value_t = 25)]
         limit: usize,
     },
+    /// Clear the cached nutrition lookups (positive and negative), forcing a
+    /// re-fetch on the next `nutrition fetch`
+    ClearCache,
 }
 
 #[derive(Subcommand, Debug)]
@@ -400,8 +403,9 @@ pub fn run(cli: Cli) -> Result<()> {
             } else {
                 print_plan(&plan);
                 let extra = nutrition_extra(&store)?;
-                if let Ok(pn) = crate::nutrition::plan_nutrition(&store, &plan, &extra) {
-                    print_plan_nutrition(&pn);
+                match crate::nutrition::plan_nutrition(&store, &plan, &extra) {
+                    Ok(pn) => print_plan_nutrition(&pn),
+                    Err(e) => eprintln!("note: nutrition estimate unavailable: {e:#}"),
                 }
             }
             if !dry_run {
@@ -633,8 +637,7 @@ pub fn run(cli: Cli) -> Result<()> {
             NutritionCmd::Fetch { fixture, limit } => {
                 let extra = nutrition_extra(&store)?;
                 let cache = store.nutrition_cache_all()?;
-                // Distinct ingredient names lacking a macro profile; without a
-                // fixture, previously-cached misses are not retried.
+                // Distinct ingredient names with no macro profile yet.
                 let mut names: Vec<String> = std::collections::BTreeSet::from_iter(
                     store
                         .list_recipes(None)?
@@ -646,11 +649,15 @@ pub fn run(cli: Cli) -> Result<()> {
                 .into_iter()
                 .filter(|n| crate::nutrition::resolve_profile(n, &extra).is_none())
                 .collect();
-                if fixture.is_none() {
+                // Network runs skip names already tried (positive or negative
+                // cache). A fixture is a local overlay, so it re-checks every
+                // name and its misses are never written to the cache.
+                let from_network = fixture.is_none();
+                if from_network {
                     names.retain(|n| !cache.contains_key(n));
                 }
                 if names.is_empty() {
-                    println!("All ingredient names already have profiles (or cached misses).");
+                    println!("All uncovered ingredient names have been looked up already.");
                     return Ok(());
                 }
                 let source: Box<dyn crate::nutrition::NutritionSource> = match &fixture {
@@ -667,6 +674,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 );
                 let mut found = 0usize;
                 let mut missed = 0usize;
+                let mut errored = 0usize;
                 for name in names.iter().take(limit) {
                     match source.lookup(name) {
                         Ok(Some(profile)) => {
@@ -675,19 +683,29 @@ pub fn run(cli: Cli) -> Result<()> {
                             found += 1;
                         }
                         Ok(None) => {
-                            store.nutrition_cache_put(name, None)?;
+                            if from_network {
+                                store.nutrition_cache_put(name, None)?;
+                            }
                             eprintln!("  - {name}  (no match)");
                             missed += 1;
                         }
                         Err(e) => {
-                            eprintln!("  ! {name}  ({e})");
+                            eprintln!("  ! {name}  ({e:#})");
+                            errored += 1;
                         }
                     }
                 }
+                // Remaining = names never resolved: those past the limit plus
+                // any that errored (errors are not recorded, so they retry).
+                let remaining = names.len() - found - missed;
                 println!(
-                    "Cached {found} profile(s), {missed} miss(es); {} name(s) remaining.",
-                    names.len().saturating_sub(limit)
+                    "Cached {found} profile(s), {missed} miss(es), {errored} error(s); \
+                     {remaining} name(s) remaining."
                 );
+            }
+            NutritionCmd::ClearCache => {
+                let n = store.nutrition_cache_clear()?;
+                println!("Cleared {n} cached nutrition entr(ies).");
             }
         },
     }
@@ -706,39 +724,42 @@ fn nutrition_extra(
 }
 
 fn print_plan_nutrition(pn: &crate::nutrition::PlanNutrition) {
+    // covered and uncovered are disjoint, so their sum is the distinct count.
     let counted = pn.covered.len() + pn.uncovered.len();
     if counted == 0 {
         return;
     }
     if !pn.covered.is_empty() {
         println!("\nEstimated nutrition (whole recipes, per day):");
-        for (i, day) in pn.per_day.iter().enumerate() {
-            if day.kcal == 0.0 && day.protein_g == 0.0 && day.fat_g == 0.0 && day.carbs_g == 0.0 {
-                continue;
-            }
+        for (day, m) in &pn.per_day {
             println!(
                 "  Day {}: {:.0} kcal | protein {:.0} g | fat {:.0} g | carbs {:.0} g",
-                i + 1,
-                day.kcal,
-                day.protein_g,
-                day.fat_g,
-                day.carbs_g
+                day + 1,
+                m.kcal,
+                m.protein_g,
+                m.fat_g,
+                m.carbs_g
             );
         }
     }
     let mut line = format!("  Coverage: {}/{} ingredients", pn.covered.len(), counted);
     if !pn.uncovered.is_empty() {
-        let names: Vec<&str> = pn.uncovered.iter().map(String::as_str).take(4).collect();
+        let sample: Vec<&str> = pn.uncovered.iter().map(String::as_str).take(4).collect();
+        let more = pn.uncovered.len().saturating_sub(sample.len());
         line.push_str(&format!(
             " (uncovered: {}{})",
-            names.join(", "),
-            if pn.uncovered.len() > 4 {
-                format!(", +{} more", pn.uncovered.len() - 4)
+            sample.join(", "),
+            if more > 0 {
+                format!(", +{more} more")
             } else {
                 String::new()
             }
         ));
-        line.push_str("; run `nutrition fetch` to resolve");
+        // Only suggest fetching for names a fetch could actually resolve
+        // (missing profile) — not those uncovered for lack of a gram conversion.
+        if !pn.fetchable.is_empty() {
+            line.push_str("; run `nutrition fetch` to resolve missing profiles");
+        }
     }
     println!("{line}");
 }

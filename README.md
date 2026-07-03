@@ -125,9 +125,11 @@ smarter-recipes reparse --all
 # site published it. Estimates use a built-in USDA-style per-100 g table;
 # resolve uncovered ingredient names into a local cache via USDA FoodData
 # Central (set SMARTER_RECIPES_FDC_KEY for a personal key; DEMO_KEY default)
-# or an offline JSON fixture. Misses are cached and not retried.
+# or an offline JSON fixture. Network misses are negative-cached and not
+# retried; a fixture run re-checks every name and never writes the cache.
 smarter-recipes nutrition fetch
 smarter-recipes nutrition fetch --fixture my_profiles.json --limit 50
+smarter-recipes nutrition clear-cache   # drop cached lookups to force a re-fetch
 ```
 
 ### Package catalog JSON overlay

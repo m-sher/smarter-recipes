@@ -9,7 +9,7 @@
 
 mod table;
 
-pub use table::{grams_per_each, per_100g};
+pub use table::{grams_per_each, per_100g, per_100g_exact};
 
 use crate::domain::{name_candidates, IngredientKey, Macros, MealPlan, Recipe};
 use crate::pricing::volume_ml_to_mass_g;
@@ -60,10 +60,10 @@ impl NutritionSource for FdcSource {
             b.clone()
         } else {
             let url = format!(
-                "{}/fdc/v1/foods/search?api_key={}&query={}&dataType=Foundation,SR%20Legacy&pageSize=10",
+                "{}/fdc/v1/foods/search?api_key={}&query={}&dataType=Foundation,SR%20Legacy&pageSize=25",
                 self.base_url.trim_end_matches('/'),
                 self.api_key,
-                urlencode(ingredient)
+                crate::net::encode_query(ingredient)
             );
             let resp = self
                 .client
@@ -75,92 +75,126 @@ impl NutritionSource for FdcSource {
             }
             resp.text()?
         };
-        Ok(parse_fdc_search(&body))
+        // A 2xx body that is not FDC JSON (captive portal, gateway HTML) is an
+        // error, not a definitive "no match" — otherwise the caller would
+        // negative-cache a transient failure.
+        let v: serde_json::Value =
+            serde_json::from_str(&body).context("FoodData Central response was not JSON")?;
+        Ok(parse_fdc_search(&v))
     }
 }
 
-fn urlencode(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            ' ' => "+".to_string(),
-            c if c.is_ascii_alphanumeric() || c == '-' || c == '_' => c.to_string(),
-            c => {
-                let mut buf = [0u8; 4];
-                c.encode_utf8(&mut buf)
-                    .bytes()
-                    .map(|b| format!("%{b:02X}"))
-                    .collect()
-            }
-        })
-        .collect()
-}
-
-/// Extract per-100 g macros from an FDC search response. Takes the first food
-/// with a usable Energy (kcal) value; nutrients matched by number or name.
-fn parse_fdc_search(body: &str) -> Option<Macros> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let foods = v.get("foods")?.as_array()?;
+/// Extract per-100 g macros from an FDC search response, preferring the food
+/// whose description best matches how recipes measure ingredients: raw for
+/// produce/meat, dry for grains/pasta/legumes. Without this, FDC's relevance
+/// order often returns a cooked/canned entry (e.g. cooked quinoa at ~120
+/// kcal/100 g vs ~368 dry), understating totals several-fold.
+fn parse_fdc_search(v: &serde_json::Value) -> Option<Macros> {
+    let foods = v.get("foods").and_then(|f| f.as_array())?;
+    let mut best: Option<(i32, Macros)> = None;
     for food in foods {
-        let Some(nutrients) = food.get("foodNutrients").and_then(|n| n.as_array()) else {
+        let Some(macros) = macros_from_food(food) else {
             continue;
         };
-        let mut kcal = None;
-        let mut protein = None;
-        let mut fat = None;
-        let mut carbs = None;
-        for n in nutrients {
-            let value = n.get("value").and_then(|x| x.as_f64());
-            let Some(value) = value else { continue };
-            let number = n
-                .get("nutrientNumber")
-                .map(|x| {
-                    x.as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| x.to_string())
-                })
-                .unwrap_or_default();
-            let name = n
-                .get("nutrientName")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_lowercase();
-            let unit = n
-                .get("unitName")
-                .and_then(|x| x.as_str())
-                .unwrap_or_default()
-                .to_uppercase();
-            match number.as_str() {
-                "208" => {
-                    if unit == "KCAL" {
-                        kcal = Some(value);
-                    }
+        let desc = food
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        let dtype = food
+            .get("dataType")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        let score = fdc_food_score(&desc, &dtype);
+        if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+            best = Some((score, macros));
+        }
+    }
+    best.map(|(_, m)| m)
+}
+
+/// Rank an FDC food by how well its preparation state matches recipe usage.
+/// Prep state dominates; data source is a light tiebreaker.
+fn fdc_food_score(desc: &str, dtype: &str) -> i32 {
+    let mut score = 0;
+    const PREPARED: &[&str] = &[
+        "cooked", "boiled", "roasted", "baked", "fried", "braised", "grilled", "steamed",
+        "prepared", "canned", "drained", "frozen", "moist", "reheated",
+    ];
+    const UNPREPARED: &[&str] = &["raw", "uncooked", "dry", "dried"];
+    if PREPARED.iter().any(|w| desc.contains(w)) {
+        score -= 10;
+    }
+    if UNPREPARED.iter().any(|w| desc.contains(w)) {
+        score += 5;
+    }
+    // Prefer curated reference data over branded/survey rows.
+    score += match dtype {
+        "foundation" => 2,
+        "sr legacy" => 1,
+        _ => 0,
+    };
+    score
+}
+
+/// Per-100 g macros from one FDC food, or `None` if it has no kcal value.
+fn macros_from_food(food: &serde_json::Value) -> Option<Macros> {
+    let nutrients = food.get("foodNutrients").and_then(|n| n.as_array())?;
+    let mut kcal = None;
+    let mut protein = None;
+    let mut fat = None;
+    let mut carbs = None;
+    for n in nutrients {
+        let Some(value) = n.get("value").and_then(|x| x.as_f64()) else {
+            continue;
+        };
+        let number = n
+            .get("nutrientNumber")
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| x.to_string())
+            })
+            .unwrap_or_default();
+        let name = n
+            .get("nutrientName")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        let unit = n
+            .get("unitName")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_uppercase();
+        match number.as_str() {
+            "208" => {
+                if unit == "KCAL" {
+                    kcal = Some(value);
                 }
-                "203" => protein = Some(value),
-                "204" => fat = Some(value),
-                "205" => carbs = Some(value),
-                _ => {
-                    if kcal.is_none() && name.starts_with("energy") && unit == "KCAL" {
-                        kcal = Some(value);
-                    } else if protein.is_none() && name == "protein" {
-                        protein = Some(value);
-                    } else if fat.is_none() && name.starts_with("total lipid") {
-                        fat = Some(value);
-                    } else if carbs.is_none() && name.starts_with("carbohydrate") {
-                        carbs = Some(value);
-                    }
+            }
+            "203" => protein = Some(value),
+            "204" => fat = Some(value),
+            "205" => carbs = Some(value),
+            _ => {
+                if kcal.is_none() && name.starts_with("energy") && unit == "KCAL" {
+                    kcal = Some(value);
+                } else if protein.is_none() && name == "protein" {
+                    protein = Some(value);
+                } else if fat.is_none() && name.starts_with("total lipid") {
+                    fat = Some(value);
+                } else if carbs.is_none() && name.starts_with("carbohydrate") {
+                    carbs = Some(value);
                 }
             }
         }
-        if let Some(kcal) = kcal {
-            return Some(Macros {
-                kcal,
-                protein_g: protein.unwrap_or(0.0),
-                fat_g: fat.unwrap_or(0.0),
-                carbs_g: carbs.unwrap_or(0.0),
-            });
-        }
     }
-    None
+    kcal.map(|kcal| Macros {
+        kcal,
+        protein_g: protein.unwrap_or(0.0),
+        fat_g: fat.unwrap_or(0.0),
+        carbs_g: carbs.unwrap_or(0.0),
+    })
 }
 
 /// Offline source backed by a JSON map: `{ "name": {"kcal":..,"protein_g":..,
@@ -199,15 +233,73 @@ impl NutritionSource for FixtureNutritionSource {
     }
 }
 
-/// Per-100 g profile for `name`: cache/overlay entries first, then the
-/// embedded table.
+/// Per-100 g profile for `name`, most-specific candidate first. For each
+/// candidate the cache/overlay is consulted before the embedded table, so a
+/// specific full-name table entry is never shadowed by a cached generic token.
 pub fn resolve_profile(name: &str, extra: &HashMap<String, Macros>) -> Option<Macros> {
     for cand in name_candidates(name) {
         if let Some(m) = extra.get(&cand) {
             return Some(*m);
         }
+        if let Some(m) = per_100g_exact(&cand) {
+            return Some(m);
+        }
     }
-    per_100g(name)
+    None
+}
+
+/// Words that mark a Count as a container or whole unit of unknown size
+/// ("2 cans tomatoes", "1 head garlic"), where multiplying a per-item weight
+/// would be meaningless. Excludes portion words the per-item table is keyed on
+/// (clove, stalk), so those still convert.
+const CONTAINER_WORDS: &[&str] = &[
+    "can",
+    "cans",
+    "jar",
+    "jars",
+    "carton",
+    "cartons",
+    "bottle",
+    "bottles",
+    "package",
+    "packages",
+    "packet",
+    "packets",
+    "bag",
+    "bags",
+    "box",
+    "boxes",
+    "tin",
+    "tins",
+    "container",
+    "containers",
+    "pack",
+    "packs",
+    "head",
+    "heads",
+    "bunch",
+    "bunches",
+    "loaf",
+    "loaves",
+];
+
+/// Keywords marking an ingredient as a liquid, for which a density-unknown
+/// volume can be estimated at ≈1 g/ml. Solids are intentionally excluded so
+/// they are reported uncovered rather than silently mis-weighed.
+const LIQUID_KEYWORDS: &[&str] = &[
+    "water", "milk", "cream", "broth", "stock", "juice", "wine", "beer", "vinegar", "sauce", "oil",
+    "syrup", "extract", "soda", "tea", "coffee", "liqueur", "brandy", "rum", "sherry", "mirin",
+];
+
+fn is_liquid_name(name: &str) -> bool {
+    LIQUID_KEYWORDS.iter().any(|w| name.contains(w))
+}
+
+fn mentions_container(original: &str) -> bool {
+    original
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|w| CONTAINER_WORDS.contains(&w))
 }
 
 /// Grams represented by one ingredient line, when convertible.
@@ -218,9 +310,12 @@ fn line_grams(line: &crate::domain::IngredientLine) -> Option<f64> {
     match kind {
         UnitKind::Mass => Some(qty),
         UnitKind::Volume => volume_ml_to_mass_g(&key.name, qty)
-            // Density-unknown liquids (sauces, broths) are ≈1 g/ml; only used
-            // when a macro profile exists, and always labeled an estimate.
-            .or(Some(qty)),
+            // Density-unknown liquids (sauces, broths) are ≈1 g/ml; solids
+            // without a density are left unconvertible (reported uncovered).
+            .or_else(|| is_liquid_name(&key.name).then_some(qty)),
+        // A bare count of whole items converts via per-item weight, but a count
+        // of containers ("2 cans") has unknown size and is left unconvertible.
+        UnitKind::Count if mentions_container(&line.original) => None,
         UnitKind::Count => grams_per_each(&key.name).map(|g| g * qty),
         UnitKind::Other => None,
     }
@@ -262,11 +357,19 @@ pub fn recipe_nutrition(recipe: &Recipe, extra: &HashMap<String, Macros>) -> Rec
 /// Per-day and total macro estimates for a plan, with coverage.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlanNutrition {
-    /// Indexed by plan day; days without meals stay zero.
-    pub per_day: Vec<Macros>,
+    /// `(day index, macros)` for each day that has at least one meal, in day
+    /// order. Sized by the meals present, not by the requested day count.
+    pub per_day: Vec<(usize, Macros)>,
     pub total: Macros,
+    /// Distinct ingredient names that contributed to the totals.
     pub covered: BTreeSet<String>,
+    /// Distinct names never estimated in any recipe (excludes names covered
+    /// elsewhere), so `covered` and `uncovered` are disjoint.
     pub uncovered: BTreeSet<String>,
+    /// Subset of `uncovered` that `nutrition fetch` could resolve: no macro
+    /// profile exists yet (as opposed to a profile that cannot be converted to
+    /// grams, which fetching cannot fix).
+    pub fetchable: BTreeSet<String>,
 }
 
 /// Estimate nutrition for every meal in a plan (whole recipes per day).
@@ -275,26 +378,36 @@ pub fn plan_nutrition(
     plan: &MealPlan,
     extra: &HashMap<String, Macros>,
 ) -> Result<PlanNutrition> {
-    let mut out = PlanNutrition {
-        per_day: vec![Macros::default(); plan.days.max(1) as usize],
-        ..Default::default()
-    };
+    use std::collections::BTreeMap;
+    let mut by_day: BTreeMap<usize, Macros> = BTreeMap::new();
+    let mut total = Macros::default();
+    let mut covered = BTreeSet::new();
+    let mut uncovered_raw = BTreeSet::new();
     for meal in &plan.meals {
         let recipe = store
             .get_recipe(meal.recipe_id.as_str())?
             .with_context(|| format!("recipe {} missing", meal.recipe_id))?;
         let rn = recipe_nutrition(&recipe, extra);
-        if let Some(day) = out.per_day.get_mut(meal.day as usize) {
-            day.add(&rn.macros);
-        }
-        out.total.add(&rn.macros);
-        out.covered.extend(rn.covered);
-        out.uncovered.extend(rn.uncovered);
+        by_day.entry(meal.day as usize).or_default().add(&rn.macros);
+        total.add(&rn.macros);
+        covered.extend(rn.covered);
+        uncovered_raw.extend(rn.uncovered);
     }
-    // A name covered in one recipe but uncovered in another (different unit
-    // kind) counts as partially covered; keep it in both sets out of honesty —
-    // coverage is reported as covered/(covered+uncovered).
-    Ok(out)
+    // A name covered in any recipe counts as covered overall, so the two sets
+    // are disjoint and the coverage denominator does not double-count.
+    let uncovered: BTreeSet<String> = uncovered_raw.difference(&covered).cloned().collect();
+    let fetchable = uncovered
+        .iter()
+        .filter(|n| resolve_profile(n, extra).is_none())
+        .cloned()
+        .collect();
+    Ok(PlanNutrition {
+        per_day: by_day.into_iter().collect(),
+        total,
+        covered,
+        uncovered,
+        fetchable,
+    })
 }
 
 #[cfg(test)]
@@ -372,6 +485,55 @@ mod tests {
     }
 
     #[test]
+    fn volume_solid_without_density_is_uncovered_not_1g_per_ml() {
+        // Broccoli has a macro profile but no density entry; a volume measure
+        // must not be silently treated as 1 g/ml (which would inflate it).
+        let r = rec("T", &["2 cups broccoli"]);
+        let n = recipe_nutrition(&r, &HashMap::new());
+        assert!(
+            n.uncovered.contains("broccoli"),
+            "solid should be uncovered, got covered={:?}",
+            n.covered
+        );
+        assert_eq!(n.macros, Macros::default());
+    }
+
+    #[test]
+    fn count_of_containers_is_uncovered() {
+        // "2 cans tomatoes" must not be 2 × one-tomato weight.
+        let r = rec("T", &["2 cans tomatoes"]);
+        let n = recipe_nutrition(&r, &HashMap::new());
+        assert!(n.uncovered.contains("tomatoes"));
+        // A bare count of the same item still converts.
+        let r2 = rec("T", &["2 tomatoes"]);
+        let n2 = recipe_nutrition(&r2, &HashMap::new());
+        assert!(n2.covered.contains("tomatoes"));
+    }
+
+    #[test]
+    fn cached_generic_does_not_shadow_specific_builtin() {
+        // A cached generic "oil" must not override the built-in "olive oil".
+        let mut extra = HashMap::new();
+        extra.insert(
+            "oil".to_string(),
+            Macros {
+                kcal: 1.0,
+                protein_g: 0.0,
+                fat_g: 0.0,
+                carbs_g: 0.0,
+            },
+        );
+        let m = resolve_profile("olive oil", &extra).unwrap();
+        assert!((m.kcal - 884.0).abs() < 1.0, "kcal = {}", m.kcal);
+        // But the generic still applies to a name with no specific entry.
+        assert_eq!(resolve_profile("truffle oil", &extra).unwrap().kcal, 1.0);
+    }
+
+    fn fdc(body: &str) -> Option<Macros> {
+        parse_fdc_search(&serde_json::from_str(body).unwrap())
+    }
+
+    #[test]
     fn fdc_parse_by_number_and_name() {
         let body = r#"{"foods":[{"dataType":"SR Legacy","foodNutrients":[
             {"nutrientNumber":"208","nutrientName":"Energy","unitName":"KCAL","value":364.0},
@@ -379,7 +541,7 @@ mod tests {
             {"nutrientNumber":"204","nutrientName":"Total lipid (fat)","unitName":"G","value":1.0},
             {"nutrientNumber":"205","nutrientName":"Carbohydrate, by difference","unitName":"G","value":76.3}
         ]}]}"#;
-        let m = parse_fdc_search(body).unwrap();
+        let m = fdc(body).unwrap();
         assert!((m.kcal - 364.0).abs() < 1e-9);
         assert!((m.carbs_g - 76.3).abs() < 1e-9);
 
@@ -391,8 +553,134 @@ mod tests {
                 {"nutrientName":"Protein","unitName":"G","value":0.3}
             ]}
         ]}"#;
-        let m2 = parse_fdc_search(body2).unwrap();
+        let m2 = fdc(body2).unwrap();
         assert!((m2.kcal - 52.0).abs() < 1e-9);
-        assert!(parse_fdc_search(r#"{"foods":[]}"#).is_none());
+        assert!(fdc(r#"{"foods":[]}"#).is_none());
+    }
+
+    #[test]
+    fn fdc_prefers_raw_dry_over_cooked() {
+        // FDC relevance order puts the cooked entry first; we must pick dry.
+        let body = r#"{"foods":[
+            {"description":"Quinoa, cooked","dataType":"Survey (FNDDS)","foodNutrients":[
+                {"nutrientNumber":"208","unitName":"KCAL","value":120.0}]},
+            {"description":"Quinoa, uncooked","dataType":"SR Legacy","foodNutrients":[
+                {"nutrientNumber":"208","unitName":"KCAL","value":368.0}]}
+        ]}"#;
+        assert!((fdc(body).unwrap().kcal - 368.0).abs() < 1e-9);
+
+        // Raw beats canned/drained for produce, too.
+        let body2 = r#"{"foods":[
+            {"description":"Beans, canned, drained","dataType":"SR Legacy","foodNutrients":[
+                {"nutrientNumber":"208","unitName":"KCAL","value":91.0}]},
+            {"description":"Beans, raw","dataType":"SR Legacy","foodNutrients":[
+                {"nutrientNumber":"208","unitName":"KCAL","value":333.0}]}
+        ]}"#;
+        assert!((fdc(body2).unwrap().kcal - 333.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fdc_non_json_body_is_error_not_miss() {
+        let src = FdcSource {
+            offline_body: Some("<html>maintenance</html>".into()),
+            ..Default::default()
+        };
+        // Must be Err (so the caller does not negative-cache), not Ok(None).
+        assert!(src.lookup("flour").is_err());
+    }
+
+    #[test]
+    fn fdc_valid_json_no_match_is_ok_none() {
+        let src = FdcSource {
+            offline_body: Some(r#"{"foods":[]}"#.into()),
+            ..Default::default()
+        };
+        assert!(src.lookup("flour").unwrap().is_none());
+    }
+
+    #[test]
+    fn plan_nutrition_per_day_coverage_and_fetchable() {
+        use crate::domain::{MealPlan, PlannedMeal, RecipeId};
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+
+        let mut day0 = rec("Day0", &["100 g flour"]); // covered
+        day0.id = RecipeId::from("r0");
+        let mut day2 = rec("Day2", &["3 dragonfruit"]); // uncovered, no profile
+        day2.id = RecipeId::from("r2");
+        store.save_recipe(&day0).unwrap();
+        store.save_recipe(&day2).unwrap();
+
+        // Meals on day 0 and day 2 (day 1 empty) — must not allocate by days.
+        let plan = MealPlan {
+            id: "p".into(),
+            days: 3,
+            meals_per_day: 1,
+            rationale: String::new(),
+            meals: vec![
+                PlannedMeal {
+                    day: 0,
+                    meal: 0,
+                    recipe_id: RecipeId::from("r0"),
+                    recipe_title: "Day0".into(),
+                },
+                PlannedMeal {
+                    day: 2,
+                    meal: 0,
+                    recipe_id: RecipeId::from("r2"),
+                    recipe_title: "Day2".into(),
+                },
+            ],
+        };
+        let pn = plan_nutrition(&store, &plan, &HashMap::new()).unwrap();
+        // Only days with meals appear, keyed by real day index.
+        assert_eq!(pn.per_day.len(), 2);
+        assert_eq!(pn.per_day[0].0, 0);
+        assert_eq!(pn.per_day[1].0, 2);
+        assert!((pn.per_day[0].1.kcal - 364.0).abs() < 1.0);
+        assert!(pn.covered.contains("flour"));
+        assert!(pn.uncovered.contains("dragonfruit"));
+        // No profile for dragonfruit -> fetchable.
+        assert!(pn.fetchable.contains("dragonfruit"));
+    }
+
+    #[test]
+    fn plan_coverage_sets_are_disjoint() {
+        use crate::domain::{MealPlan, PlannedMeal, RecipeId};
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        // Same name covered in one recipe (mass) and uncovered in another
+        // (volume solid) must count once, as covered.
+        let mut a = rec("A", &["100 g broccoli"]);
+        a.id = RecipeId::from("a");
+        let mut b = rec("B", &["2 cups broccoli"]);
+        b.id = RecipeId::from("b");
+        store.save_recipe(&a).unwrap();
+        store.save_recipe(&b).unwrap();
+        let plan = MealPlan {
+            id: "p".into(),
+            days: 2,
+            meals_per_day: 1,
+            rationale: String::new(),
+            meals: vec![
+                PlannedMeal {
+                    day: 0,
+                    meal: 0,
+                    recipe_id: RecipeId::from("a"),
+                    recipe_title: "A".into(),
+                },
+                PlannedMeal {
+                    day: 1,
+                    meal: 0,
+                    recipe_id: RecipeId::from("b"),
+                    recipe_title: "B".into(),
+                },
+            ],
+        };
+        let pn = plan_nutrition(&store, &plan, &HashMap::new()).unwrap();
+        assert!(pn.covered.contains("broccoli"));
+        assert!(!pn.uncovered.contains("broccoli"));
+        // Not fetchable: a profile exists, it just wasn't convertible in B.
+        assert!(!pn.fetchable.contains("broccoli"));
     }
 }

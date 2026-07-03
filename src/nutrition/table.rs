@@ -228,19 +228,20 @@ const PER_EACH_G: &[(&str, f64)] = &[
 /// Per-100 g macros for an ingredient name (candidate matching: full name,
 /// then last token, then last hyphen segment).
 pub fn per_100g(name: &str) -> Option<Macros> {
-    for cand in name_candidates(name) {
-        if let Some(&(_, kcal, protein_g, fat_g, carbs_g)) =
-            PER_100G.iter().find(|(n, ..)| *n == cand)
-        {
-            return Some(Macros {
-                kcal,
-                protein_g,
-                fat_g,
-                carbs_g,
-            });
-        }
-    }
-    None
+    name_candidates(name).iter().find_map(|c| per_100g_exact(c))
+}
+
+/// Per-100 g macros for an exact table key (no candidate expansion).
+pub fn per_100g_exact(name: &str) -> Option<Macros> {
+    PER_100G
+        .iter()
+        .find(|(n, ..)| *n == name)
+        .map(|&(_, kcal, protein_g, fat_g, carbs_g)| Macros {
+            kcal,
+            protein_g,
+            fat_g,
+            carbs_g,
+        })
 }
 
 /// Grams for one item of a count-kind ingredient.

@@ -164,35 +164,94 @@ fn parse_servings(v: &Value) -> Option<f64> {
     }
 }
 
-/// First numeric value in a nutrition string, e.g. `"344 kcal"`, `"12.5 g"`,
-/// `"1,234 kcal"` (thousands separators stripped).
+/// Parse the leading numeric value from a nutrition string, handling US
+/// (`"1,234.5"`) and European (`"1.234,5"`, `"12,5"`) grouping/decimal marks.
+/// A lone comma is a decimal point unless it groups exactly three trailing
+/// digits (`"1,234"` → 1234, `"12,5"` → 12.5).
 fn leading_number(s: &str) -> Option<f64> {
-    let cleaned = s.replace(',', "");
-    let start = cleaned.find(|c: char| c.is_ascii_digit())?;
-    let tail = &cleaned[start..];
-    let end = tail
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(tail.len());
-    tail[..end].parse().ok()
+    let start = s.find(|c: char| c.is_ascii_digit())?;
+    let run: String = s[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+        .collect();
+    let run = run.trim_end_matches([',', '.']);
+    if run.is_empty() {
+        return None;
+    }
+    parse_grouped_number(run)
 }
 
+/// Interpret a digit/`,`/`.` run into an `f64`, resolving which mark is the
+/// decimal separator.
+fn parse_grouped_number(run: &str) -> Option<f64> {
+    let has_dot = run.contains('.');
+    let has_comma = run.contains(',');
+    let normalized = match (has_dot, has_comma) {
+        // Both present: the last-occurring mark is the decimal separator.
+        (true, true) => {
+            let dec = if run.rfind(',') > run.rfind('.') {
+                ','
+            } else {
+                '.'
+            };
+            let group = if dec == ',' { '.' } else { ',' };
+            run.replace(group, "").replace(dec, ".")
+        }
+        // Only commas: grouping if every group after the first is 3 digits.
+        (false, true) => {
+            let parts: Vec<&str> = run.split(',').collect();
+            let grouping = parts.len() > 1 && parts[1..].iter().all(|p| p.len() == 3);
+            if grouping {
+                parts.concat()
+            } else {
+                format!("{}.{}", parts[0], parts[1..].concat())
+            }
+        }
+        _ => run.to_string(),
+    };
+    normalized.parse().ok()
+}
+
+/// Numeric value of a nutrition field: bare number, string, or a schema.org
+/// `QuantitativeValue`-style object with a `value` field.
 fn nutrition_number(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => leading_number(s),
+        Value::Object(o) => o.get("value").and_then(nutrition_number),
         _ => None,
+    }
+}
+
+/// Energy in kcal. Recipe sources sometimes publish kilojoules (common on
+/// AU/EU sites); convert when the value is explicitly labeled kJ and not kcal.
+fn nutrition_energy_kcal(v: &Value) -> Option<f64> {
+    let value = nutrition_number(v)?;
+    let unit_text = match v {
+        Value::String(s) => s.to_lowercase(),
+        Value::Object(o) => o
+            .get("unitText")
+            .or_else(|| o.get("unitCode"))
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_lowercase(),
+        _ => String::new(),
+    };
+    if unit_text.contains("kj") && !unit_text.contains("kcal") {
+        Some(value / 4.184)
+    } else {
+        Some(value)
     }
 }
 
 /// Parse a schema.org `NutritionInformation` object (per serving).
 fn nutrition_from_json_ld(v: &Value) -> Option<crate::domain::Nutrition> {
     let obj = v.as_object()?;
-    let get = |k: &str| obj.get(k).and_then(nutrition_number);
     let n = crate::domain::Nutrition {
-        kcal: get("calories"),
-        protein_g: get("proteinContent"),
-        fat_g: get("fatContent"),
-        carbs_g: get("carbohydrateContent"),
+        kcal: obj.get("calories").and_then(nutrition_energy_kcal),
+        protein_g: obj.get("proteinContent").and_then(nutrition_number),
+        fat_g: obj.get("fatContent").and_then(nutrition_number),
+        carbs_g: obj.get("carbohydrateContent").and_then(nutrition_number),
     };
     (!n.is_empty()).then_some(n)
 }
@@ -571,8 +630,60 @@ mod tests {
         };
         let r = src.ingest("https://example.com/m").unwrap();
         assert!(r.meta.nutrition.is_none());
+    }
+
+    #[test]
+    fn leading_number_us_and_eu_separators() {
+        // US thousands grouping and decimals.
         assert_eq!(leading_number("1,234 kcal"), Some(1234.0));
+        assert_eq!(leading_number("1,234.5 kcal"), Some(1234.5));
+        assert_eq!(leading_number("12.5 g"), Some(12.5));
+        // European decimal comma must NOT inflate.
+        assert_eq!(leading_number("12,5 g"), Some(12.5));
+        assert_eq!(leading_number("8,44g"), Some(8.44));
+        assert_eq!(leading_number("0,5 g"), Some(0.5));
+        assert_eq!(leading_number("1.234,5 kcal"), Some(1234.5));
+        // Misc.
         assert_eq!(leading_number("about 20g"), Some(20.0));
         assert_eq!(leading_number("n/a"), None);
+    }
+
+    #[test]
+    fn kilojoule_energy_converted_to_kcal() {
+        let html = r#"<script type="application/ld+json">
+          {"@context":"https://schema.org","@type":"Recipe","name":"KJ",
+           "recipeIngredient":["1 cup flour"],
+           "nutrition":{"@type":"NutritionInformation","calories":"1441 kJ"}}
+        </script>"#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let r = src.ingest("https://example.com/kj").unwrap();
+        let kcal = r.meta.nutrition.unwrap().kcal.unwrap();
+        assert!((kcal - 344.4).abs() < 1.0, "kcal = {kcal}");
+    }
+
+    #[test]
+    fn quantitative_value_object_and_decimal_comma_protein() {
+        let html = r#"<script type="application/ld+json">
+          {"@context":"https://schema.org","@type":"Recipe","name":"QV",
+           "recipeIngredient":["1 cup flour"],
+           "nutrition":{"@type":"NutritionInformation",
+             "calories":{"@type":"QuantitativeValue","value":"344","unitText":"kcal"},
+             "proteinContent":"12,5 g"}}
+        </script>"#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let n = src
+            .ingest("https://example.com/qv")
+            .unwrap()
+            .meta
+            .nutrition
+            .unwrap();
+        assert_eq!(n.kcal, Some(344.0));
+        assert_eq!(n.protein_g, Some(12.5));
     }
 }
