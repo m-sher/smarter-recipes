@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS recipes (
     steps_json TEXT NOT NULL,
     meta_json TEXT NOT NULL,
     source_json TEXT NOT NULL,
+    -- Captured per-serving nutrition, stored apart from meta_json so an older
+    -- binary that rewrites meta_json cannot silently drop it.
+    nutrition_json TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -78,6 +81,15 @@ CREATE TABLE IF NOT EXISTS plan_restocks (
     restocked_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS nutrition_cache (
+    name TEXT PRIMARY KEY,
+    kcal REAL,
+    protein_g REAL,
+    fat_g REAL,
+    carbs_g REAL,
+    found INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_recipes_title ON recipes(title);
 CREATE INDEX IF NOT EXISTS idx_ri_ingredient ON recipe_ingredients(ingredient_id);
 "#;
@@ -98,6 +110,9 @@ impl Store {
             .with_context(|| format!("opening database at {}", path.display()))?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        // Migrate pre-existing databases created before the nutrition column.
+        // Fails harmlessly (duplicate column) once the column is present.
+        let _ = conn.execute("ALTER TABLE recipes ADD COLUMN nutrition_json TEXT", []);
         Ok(Self { conn, path })
     }
 
@@ -151,23 +166,28 @@ impl Store {
         let steps_json = serde_json::to_string(&recipe.steps)?;
         let meta_json = serde_json::to_string(&recipe.meta)?;
         let source_json = serde_json::to_string(&recipe.source)?;
+        // Authoritative copy of nutrition ("null" when absent), kept out of
+        // meta_json so a downgrade write cannot clobber it.
+        let nutrition_json = serde_json::to_string(&recipe.meta.nutrition)?;
 
         self.conn.execute(
-            "INSERT INTO recipes (id, title, servings, steps_json, meta_json, source_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO recipes (id, title, servings, steps_json, meta_json, source_json, nutrition_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                title=excluded.title,
                servings=excluded.servings,
                steps_json=excluded.steps_json,
                meta_json=excluded.meta_json,
-               source_json=excluded.source_json",
+               source_json=excluded.source_json,
+               nutrition_json=excluded.nutrition_json",
             params![
                 recipe.id.as_str(),
                 recipe.title,
                 recipe.servings,
                 steps_json,
                 meta_json,
-                source_json
+                source_json,
+                nutrition_json
             ],
         )?;
 
@@ -203,6 +223,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_recipe_row(
         &self,
         id: &str,
@@ -211,10 +232,16 @@ impl Store {
         steps_json: String,
         meta_json: String,
         source_json: String,
+        nutrition_json: Option<String>,
     ) -> Result<Recipe> {
         let steps: Vec<String> = serde_json::from_str(&steps_json)?;
-        let meta: RecipeMeta = serde_json::from_str(&meta_json)?;
+        let mut meta: RecipeMeta = serde_json::from_str(&meta_json)?;
         let source: RecipeSource = serde_json::from_str(&source_json)?;
+        // The dedicated column is authoritative when present; a NULL means a
+        // pre-migration row, so fall back to whatever meta_json carried.
+        if let Some(nj) = nutrition_json {
+            meta.nutrition = serde_json::from_str::<Option<crate::domain::Nutrition>>(&nj)?;
+        }
 
         let mut stmt = self.conn.prepare(
             "SELECT ri.original, ri.quantity, ri.unit_name, ri.unit_to_base, ri.note, ri.parse_uncertain,
@@ -266,7 +293,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, title, servings, steps_json, meta_json, source_json FROM recipes WHERE id = ?1",
+                "SELECT id, title, servings, steps_json, meta_json, source_json, nutrition_json FROM recipes WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
@@ -276,14 +303,15 @@ impl Store {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
 
         match row {
-            Some((id, title, servings, steps, meta, source)) => Ok(Some(
-                self.load_recipe_row(&id, title, servings, steps, meta, source)?,
+            Some((id, title, servings, steps, meta, source, nutrition)) => Ok(Some(
+                self.load_recipe_row(&id, title, servings, steps, meta, source, nutrition)?,
             )),
             None => Ok(None),
         }
@@ -292,7 +320,7 @@ impl Store {
     /// List recipes; optional substring filter on title (case-insensitive).
     pub fn list_recipes(&self, filter: Option<&str>) -> Result<Vec<Recipe>> {
         let mut sql = String::from(
-            "SELECT id, title, servings, steps_json, meta_json, source_json FROM recipes",
+            "SELECT id, title, servings, steps_json, meta_json, source_json, nutrition_json FROM recipes",
         );
         if filter.is_some() {
             sql.push_str(" WHERE lower(title) LIKE ?1");
@@ -310,6 +338,7 @@ impl Store {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
@@ -322,14 +351,15 @@ impl Store {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, title, servings, steps, meta, source) in rows {
-            out.push(self.load_recipe_row(&id, title, servings, steps, meta, source)?);
+        for (id, title, servings, steps, meta, source, nutrition) in rows {
+            out.push(self.load_recipe_row(&id, title, servings, steps, meta, source, nutrition)?);
         }
         Ok(out)
     }
@@ -665,6 +695,64 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// Cached per-100 g macro profiles from network lookups. `found = 0` rows
+    /// are negative cache (name was searched, no usable result).
+    pub fn nutrition_cache_all(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Option<crate::domain::Macros>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, kcal, protein_g, fat_g, carbs_g, found FROM nutrition_cache")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let found: i64 = row.get(5)?;
+                let profile = if found != 0 {
+                    Some(crate::domain::Macros {
+                        kcal: row.get(1)?,
+                        protein_g: row.get(2)?,
+                        fat_g: row.get(3)?,
+                        carbs_g: row.get(4)?,
+                    })
+                } else {
+                    None
+                };
+                Ok((name, profile))
+            })?
+            .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete all cached nutrition lookups; returns the number of rows removed.
+    pub fn nutrition_cache_clear(&self) -> Result<usize> {
+        let n = self.conn.execute("DELETE FROM nutrition_cache", [])?;
+        Ok(n)
+    }
+
+    /// Insert or update one cache row; `None` records a negative result.
+    pub fn nutrition_cache_put(
+        &self,
+        name: &str,
+        profile: Option<&crate::domain::Macros>,
+    ) -> Result<()> {
+        match profile {
+            Some(m) => self.conn.execute(
+                "INSERT INTO nutrition_cache (name, kcal, protein_g, fat_g, carbs_g, found)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)
+                 ON CONFLICT(name) DO UPDATE SET kcal=excluded.kcal, protein_g=excluded.protein_g,
+                   fat_g=excluded.fat_g, carbs_g=excluded.carbs_g, found=1",
+                params![name, m.kcal, m.protein_g, m.fat_g, m.carbs_g],
+            )?,
+            None => self.conn.execute(
+                "INSERT INTO nutrition_cache (name, kcal, protein_g, fat_g, carbs_g, found)
+                 VALUES (?1, NULL, NULL, NULL, NULL, 0)
+                 ON CONFLICT(name) DO UPDATE SET found=0",
+                params![name],
+            )?,
+        };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -678,6 +766,48 @@ mod tests {
         r.ingredients = lines.iter().map(|l| normalize_line(l)).collect();
         r.steps = vec!["Cook it.".into()];
         r
+    }
+
+    #[test]
+    fn nutrition_survives_downgrade_meta_rewrite() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let mut r = sample_recipe("Cake", &["200 g flour"]);
+        r.meta.nutrition = Some(crate::domain::Nutrition {
+            kcal: Some(310.0),
+            protein_g: Some(9.0),
+            fat_g: Some(11.0),
+            carbs_g: Some(43.0),
+        });
+        let id = r.id.as_str().to_string();
+        store.save_recipe(&r).unwrap();
+
+        // Simulate an OLD binary rewriting meta_json without the nutrition
+        // field (leaving the dedicated column untouched).
+        store
+            .conn
+            .execute(
+                "UPDATE recipes SET meta_json = ?1 WHERE id = ?2",
+                params![r#"{"author":null,"cuisine":null,"tags":[],"prep_time_minutes":null,"cook_time_minutes":null,"source_url":null,"notes":null}"#, id],
+            )
+            .unwrap();
+
+        let loaded = store.get_recipe(&id).unwrap().unwrap();
+        let n = loaded.meta.nutrition.expect("nutrition survived downgrade");
+        assert_eq!(n.kcal, Some(310.0));
+        assert_eq!(n.carbs_g, Some(43.0));
+
+        // A pre-migration row (NULL column) falls back to meta_json's copy.
+        store
+            .conn
+            .execute(
+                "UPDATE recipes SET nutrition_json = NULL,
+                 meta_json = ?1 WHERE id = ?2",
+                params![r#"{"author":null,"cuisine":null,"tags":[],"prep_time_minutes":null,"cook_time_minutes":null,"source_url":null,"notes":null,"nutrition":{"kcal":100.0,"protein_g":null,"fat_g":null,"carbs_g":null}}"#, id],
+            )
+            .unwrap();
+        let legacy = store.get_recipe(&id).unwrap().unwrap();
+        assert_eq!(legacy.meta.nutrition.unwrap().kcal, Some(100.0));
     }
 
     #[test]
@@ -886,5 +1016,30 @@ mod tests {
         let keys = store.pantry_keys().unwrap();
         assert!(keys.contains(&IngredientKey::new("butter", UnitKind::Mass)));
         assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn nutrition_cache_roundtrip_with_negative() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let m = crate::domain::Macros {
+            kcal: 100.0,
+            protein_g: 1.0,
+            fat_g: 2.0,
+            carbs_g: 3.0,
+        };
+        store.nutrition_cache_put("tahini", Some(&m)).unwrap();
+        store.nutrition_cache_put("unobtainium", None).unwrap();
+        let all = store.nutrition_cache_all().unwrap();
+        assert_eq!(all.get("tahini").unwrap().unwrap().kcal, 100.0);
+        assert!(all.get("unobtainium").unwrap().is_none());
+        // update overwrites
+        let m2 = crate::domain::Macros { kcal: 200.0, ..m };
+        store.nutrition_cache_put("tahini", Some(&m2)).unwrap();
+        let all = store.nutrition_cache_all().unwrap();
+        assert_eq!(all.get("tahini").unwrap().unwrap().kcal, 200.0);
+        // clear removes every row
+        assert_eq!(store.nutrition_cache_clear().unwrap(), 2);
+        assert!(store.nutrition_cache_all().unwrap().is_empty());
     }
 }

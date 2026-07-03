@@ -15,7 +15,9 @@
 pub mod cli;
 pub mod domain;
 pub mod ingest;
+pub mod net;
 pub mod normalize;
+pub mod nutrition;
 pub mod planning;
 pub mod pricing;
 pub mod shopping;

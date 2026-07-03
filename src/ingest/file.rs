@@ -103,6 +103,7 @@ fn file_to_recipe(file: RecipeFile, source: RecipeSource) -> Recipe {
         cook_time_minutes: file.cook_time_minutes,
         source_url: file.source_url,
         notes: file.notes,
+        nutrition: None,
     };
     recipe.source = source;
     recipe.ingredients = file

@@ -63,6 +63,8 @@ pub struct RecipeMeta {
     pub source_url: Option<String>,
     /// Free-form notes.
     pub notes: Option<String>,
+    /// Published per-serving nutrition (schema.org `NutritionInformation`).
+    pub nutrition: Option<super::nutrition::Nutrition>,
 }
 
 /// Normalized recipe used throughout the system.

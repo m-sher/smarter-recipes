@@ -129,6 +129,28 @@ fn strip_leading_descriptors(name: &str) -> String {
     s.to_string()
 }
 
+/// Lookup candidates for a free-text ingredient name, most-specific first:
+/// the full lowercased name, then its last whitespace token, then the last
+/// hyphen segment of that token ("all-purpose flour" -> "flour").
+pub fn name_candidates(name: &str) -> Vec<String> {
+    let n = name.to_lowercase();
+    let mut out = vec![n.clone()];
+    if let Some(last) = n.split_whitespace().last() {
+        let last = last.trim_matches('-').to_string();
+        if last != n {
+            out.push(last);
+        }
+    }
+    if let Some(last) = n.split_whitespace().last() {
+        if let Some(seg) = last.split('-').next_back() {
+            if !out.iter().any(|x| x == seg) {
+                out.push(seg.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// True if every whitespace-separated token of `s` is a size/quality descriptor.
 /// Used to detect "skinless, boneless chicken breasts", where the noun follows a
 /// comma-separated list of descriptors rather than preceding it.

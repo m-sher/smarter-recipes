@@ -151,6 +151,28 @@ pub enum Commands {
         #[command(subcommand)]
         action: PantryCmd,
     },
+    /// Nutrition data management
+    Nutrition {
+        #[command(subcommand)]
+        action: NutritionCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NutritionCmd {
+    /// Resolve per-100 g profiles for ingredients not covered by the built-in
+    /// table, caching results (USDA FoodData Central, or an offline fixture)
+    Fetch {
+        /// JSON fixture file (name -> {kcal, protein_g, fat_g, carbs_g}) instead of the network
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        /// Max lookups this run
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
+    /// Clear the cached nutrition lookups (positive and negative), forcing a
+    /// re-fetch on the next `nutrition fetch`
+    ClearCache,
 }
 
 #[derive(Subcommand, Debug)]
@@ -380,6 +402,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
                 print_plan(&plan);
+                let extra = nutrition_extra(&store)?;
+                match crate::nutrition::plan_nutrition(&store, &plan, &extra) {
+                    Ok(pn) => print_plan_nutrition(&pn),
+                    Err(e) => eprintln!("note: nutrition estimate unavailable: {e:#}"),
+                }
             }
             if !dry_run {
                 store.save_plan(&plan)?;
@@ -606,8 +633,135 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             (false, None) => bail!("provide a recipe id or --all"),
         },
+        Commands::Nutrition { action } => match action {
+            NutritionCmd::Fetch { fixture, limit } => {
+                let extra = nutrition_extra(&store)?;
+                let cache = store.nutrition_cache_all()?;
+                // Distinct ingredient names with no macro profile yet.
+                let mut names: Vec<String> = std::collections::BTreeSet::from_iter(
+                    store
+                        .list_recipes(None)?
+                        .iter()
+                        .flat_map(|r| r.ingredients.iter())
+                        .filter(|l| l.canonical_quantity().is_some())
+                        .map(|l| IngredientKey::from_line(l).name),
+                )
+                .into_iter()
+                .filter(|n| crate::nutrition::resolve_profile(n, &extra).is_none())
+                .collect();
+                // Network runs skip names already tried (positive or negative
+                // cache). A fixture is a local overlay, so it re-checks every
+                // name and its misses are never written to the cache.
+                let from_network = fixture.is_none();
+                if from_network {
+                    names.retain(|n| !cache.contains_key(n));
+                }
+                if names.is_empty() {
+                    println!("All uncovered ingredient names have been looked up already.");
+                    return Ok(());
+                }
+                let source: Box<dyn crate::nutrition::NutritionSource> = match &fixture {
+                    Some(path) => {
+                        Box::new(crate::nutrition::FixtureNutritionSource::from_path(path)?)
+                    }
+                    None => Box::new(crate::nutrition::FdcSource::default()),
+                };
+                eprintln!(
+                    "Resolving {} of {} uncovered ingredient name(s) via {} …",
+                    names.len().min(limit),
+                    names.len(),
+                    source.name()
+                );
+                let mut found = 0usize;
+                let mut missed = 0usize;
+                let mut errored = 0usize;
+                for name in names.iter().take(limit) {
+                    match source.lookup(name) {
+                        Ok(Some(profile)) => {
+                            store.nutrition_cache_put(name, Some(&profile))?;
+                            eprintln!("  + {name}  ({:.0} kcal/100g)", profile.kcal);
+                            found += 1;
+                        }
+                        Ok(None) => {
+                            if from_network {
+                                store.nutrition_cache_put(name, None)?;
+                            }
+                            eprintln!("  - {name}  (no match)");
+                            missed += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("  ! {name}  ({e:#})");
+                            errored += 1;
+                        }
+                    }
+                }
+                // Remaining = names never resolved: those past the limit plus
+                // any that errored (errors are not recorded, so they retry).
+                let remaining = names.len() - found - missed;
+                println!(
+                    "Cached {found} profile(s), {missed} miss(es), {errored} error(s); \
+                     {remaining} name(s) remaining."
+                );
+            }
+            NutritionCmd::ClearCache => {
+                let n = store.nutrition_cache_clear()?;
+                println!("Cleared {n} cached nutrition entr(ies).");
+            }
+        },
     }
     Ok(())
+}
+
+/// Cache-backed extra profiles (positive entries only) for nutrition math.
+fn nutrition_extra(
+    store: &Store,
+) -> Result<std::collections::HashMap<String, crate::domain::Macros>> {
+    Ok(store
+        .nutrition_cache_all()?
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|m| (k, m)))
+        .collect())
+}
+
+fn print_plan_nutrition(pn: &crate::nutrition::PlanNutrition) {
+    // covered and uncovered are disjoint, so their sum is the distinct count.
+    let counted = pn.covered.len() + pn.uncovered.len();
+    if counted == 0 {
+        return;
+    }
+    if !pn.covered.is_empty() {
+        println!("\nEstimated nutrition (whole recipes, per day):");
+        for (day, m) in &pn.per_day {
+            println!(
+                "  Day {}: {:.0} kcal | protein {:.0} g | fat {:.0} g | carbs {:.0} g",
+                day + 1,
+                m.kcal,
+                m.protein_g,
+                m.fat_g,
+                m.carbs_g
+            );
+        }
+    }
+    let mut line = format!("  Coverage: {}/{} ingredients", pn.covered.len(), counted);
+    if !pn.uncovered.is_empty() {
+        let sample: Vec<&str> = pn.uncovered.iter().map(String::as_str).take(4).collect();
+        let more = pn.uncovered.len().saturating_sub(sample.len());
+        line.push_str(&format!(
+            " (uncovered: {}{})",
+            sample.join(", "),
+            if more > 0 {
+                format!(", +{more} more")
+            } else {
+                String::new()
+            }
+        ));
+        // Only suggest fetching for names a fetch could actually resolve
+        // (missing profile) — not those uncovered for lack of a gram conversion.
+        if !pn.fetchable.is_empty() {
+            line.push_str("; run `nutrition fetch` to resolve missing profiles");
+        }
+    }
+    println!("{line}");
 }
 
 /// Re-normalize every ingredient line from its stored original text.
@@ -758,6 +912,19 @@ fn print_recipe_detail(r: &Recipe) {
     println!("id:       {}", r.id);
     if let Some(s) = r.servings {
         println!("servings: {s}");
+    }
+    if let Some(n) = &r.meta.nutrition {
+        let fmt = |v: Option<f64>, unit: &str| {
+            v.map(|x| format!("{x:.0} {unit}"))
+                .unwrap_or_else(|| "?".into())
+        };
+        println!(
+            "nutrition (per serving, as published): {} | protein {} | fat {} | carbs {}",
+            fmt(n.kcal, "kcal"),
+            fmt(n.protein_g, "g"),
+            fmt(n.fat_g, "g"),
+            fmt(n.carbs_g, "g")
+        );
     }
     println!("\nIngredients:");
     for line in &r.ingredients {
