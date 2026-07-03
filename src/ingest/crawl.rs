@@ -110,9 +110,49 @@ pub fn recipe_source_url(r: &Recipe) -> Option<String> {
 
 /// Path segments that are almost never recipe content (budget protection).
 const DENY_SEGMENTS: &[&str] = &[
-    "about", "author", "authors", "tag", "tags", "feed", "feeds", "wp-admin", "wp-login", "cart",
-    "checkout", "account", "login", "register", "privacy", "terms", "contact", "search", "comment",
-    "comments", "cdn-cgi",
+    "about",
+    "author",
+    "authors",
+    "tag",
+    "tags",
+    "feed",
+    "feeds",
+    "wp-admin",
+    "wp-login",
+    "cart",
+    "checkout",
+    "account",
+    "login",
+    "register",
+    "privacy",
+    "privacy-policy",
+    "terms",
+    "terms-of-service",
+    "contact",
+    "search",
+    "comment",
+    "comments",
+    "cdn-cgi",
+    // Site chrome / non-recipe sections (search-scrape yield protection).
+    "videos",
+    "video",
+    "news",
+    "newsletter",
+    "email",
+    "menus",
+    "menu",
+    "auth",
+    "csrf",
+    "my-stuff",
+    "kitchen-tools",
+    "gear",
+    "accessibility",
+    "holidays-events",
+    "holidays",
+    "home-living",
+    "health-wellness",
+    "test-kitchen",
+    "food-news",
 ];
 
 const DENY_EXTENSIONS: &[&str] = &[
@@ -149,23 +189,10 @@ pub fn is_listing_url(u: &str) -> bool {
     if segments.is_empty() {
         return true;
     }
-    const LISTING_SEGMENTS: &[&str] = &[
-        "category",
-        "categories",
-        "tag",
-        "tags",
-        "author",
-        "authors",
-        "collection",
-        "collections",
-        "roundup",
-        "roundups",
-        "gallery",
-        "galleries",
-        "photos",
-        "topics",
-        "topic",
-    ];
+    // Keep this set stable for site `scrape` import policy (search-scrape must not
+    // silently change which paths count as listings on existing scrapes).
+    const LISTING_SEGMENTS: &[&str] =
+        &["category", "categories", "tag", "tags", "author", "authors"];
     if segments.iter().any(|s| LISTING_SEGMENTS.contains(s)) {
         return true;
     }
@@ -252,6 +279,8 @@ pub struct ScrapeParams {
     pub jobs: usize,
     /// BFS depth (1 = seeds / seed-links only).
     pub max_depth: usize,
+    /// Sleep between site-page fetch batches (politeness). Zero in unit tests.
+    pub request_delay: Duration,
 }
 
 impl ScrapeParams {
@@ -260,29 +289,59 @@ impl ScrapeParams {
             limit,
             jobs: jobs.max(1),
             max_depth: max_depth.max(1),
+            // Small inter-batch pause; keeps multi-host runs polite without
+            // serializing every request.
+            request_delay: Duration::from_millis(150),
+        }
+    }
+
+    /// Same as [`Self::new`] but with no delay (offline tests).
+    pub fn new_fast(limit: usize, jobs: usize, max_depth: usize) -> Self {
+        Self {
+            request_delay: Duration::ZERO,
+            ..Self::new(limit, jobs, max_depth)
         }
     }
 }
 
-/// Enqueue a batch of candidates, preserving discovery order within each class.
-/// Non-listing (likely recipe) URLs are placed ahead of any already-queued items
-/// and ahead of listing/index URLs so `--limit` prefers content over nav.
-fn enqueue_candidates(queue: &mut VecDeque<(String, usize)>, links: Vec<(String, usize)>) {
-    let mut content = Vec::new();
-    let mut listings = Vec::new();
-    for (link, depth) in links {
-        if is_listing_url(&link) {
-            listings.push((link, depth));
-        } else {
-            content.push((link, depth));
+/// Dual FIFO queues: non-listing (content) drained before listings, but both
+/// are strict FIFO so later seeds are not starved by earlier expansions.
+struct CandidateQueues {
+    content: VecDeque<(String, usize)>,
+    listings: VecDeque<(String, usize)>,
+}
+
+impl CandidateQueues {
+    fn new() -> Self {
+        Self {
+            content: VecDeque::new(),
+            listings: VecDeque::new(),
         }
     }
-    // push_front reverses; feed content in reverse so pop_front yields discovery order.
-    for item in content.into_iter().rev() {
-        queue.push_front(item);
+
+    fn is_empty(&self) -> bool {
+        self.content.is_empty() && self.listings.is_empty()
     }
-    for item in listings {
-        queue.push_back(item);
+
+    fn len(&self) -> usize {
+        self.content.len() + self.listings.len()
+    }
+
+    fn pop_front(&mut self) -> Option<(String, usize)> {
+        self.content
+            .pop_front()
+            .or_else(|| self.listings.pop_front())
+    }
+
+    /// Append links preserving discovery order within each class (true BFS).
+    fn enqueue_batch(&mut self, links: Vec<(String, usize)>) {
+        for (link, depth) in links {
+            if is_listing_url(&link) {
+                self.listings.push_back((link, depth));
+            } else {
+                self.content.push_back((link, depth));
+            }
+        }
     }
 }
 
@@ -356,7 +415,7 @@ pub fn scrape_from_seeds(
     let jobs = params.jobs;
     let max_depth = params.max_depth;
 
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut queue = CandidateQueues::new();
     let mut enqueued: HashSet<String> = extra_seen;
 
     let mut candidates = 0usize;
@@ -382,7 +441,7 @@ pub fn scrape_from_seeds(
         }
         initial.push((link.clone(), 1));
     }
-    enqueue_candidates(&mut queue, initial);
+    queue.enqueue_batch(initial);
 
     progress(ScrapeEvent::Planned {
         candidates,
@@ -390,7 +449,13 @@ pub fn scrape_from_seeds(
         to_fetch: queue.len().min(limit.saturating_sub(fetches_used)),
     });
 
+    let mut first_batch = true;
     while !queue.is_empty() && fetches_used < limit {
+        if !first_batch && params.request_delay > Duration::ZERO {
+            std::thread::sleep(params.request_delay);
+        }
+        first_batch = false;
+
         let mut batch: Vec<(String, usize)> = Vec::new();
         while batch.len() < jobs && fetches_used + batch.len() < limit {
             let Some(item) = queue.pop_front() else {
@@ -480,7 +545,7 @@ pub fn scrape_from_seeds(
                 }
                 let new_queued = batch_links.len();
                 if new_queued > 0 {
-                    enqueue_candidates(&mut queue, batch_links);
+                    queue.enqueue_batch(batch_links);
                     progress(ScrapeEvent::Planned {
                         candidates,
                         skipped: skipped_existing,
@@ -690,7 +755,31 @@ mod tests {
         skip: &HashSet<String>,
         depth: usize,
     ) -> ScrapeOutcome {
-        scrape_new_recipes(fetcher, base, limit, skip, 4, depth, &noop).unwrap()
+        scrape_new_recipes_fast(fetcher, base, limit, skip, 4, depth)
+    }
+
+    /// Like production `scrape_new_recipes` but zero inter-batch delay for tests.
+    fn scrape_new_recipes_fast(
+        fetcher: &dyn HtmlFetcher,
+        base_url: &str,
+        limit: usize,
+        skip: &HashSet<String>,
+        jobs: usize,
+        max_depth: usize,
+    ) -> ScrapeOutcome {
+        let seed_html = fetcher.fetch(base_url).unwrap();
+        let links = discover_scoped_links(base_url, &seed_html, base_url);
+        let mut bootstrap_seen = HashSet::new();
+        bootstrap_seen.insert(normalize_url(base_url));
+        scrape_from_seeds(
+            fetcher,
+            &links,
+            skip,
+            ScrapeParams::new_fast(limit, jobs, max_depth),
+            &noop,
+            bootstrap_seen,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -931,30 +1020,35 @@ mod tests {
 
     #[test]
     fn single_job_is_sequential_equivalent() {
-        let out = scrape_new_recipes(
+        let out = scrape_new_recipes_fast(
             &fetcher(),
             "https://site.com/recipes",
             10,
             &HashSet::new(),
             1,
             1,
-            &noop,
-        )
-        .unwrap();
+        );
         assert_eq!(out.recipes.len(), 3);
     }
 
     #[test]
     fn emits_progress_events() {
         let events = Mutex::new(Vec::new());
-        let _ = scrape_new_recipes(
-            &fetcher(),
+        let seed_html = fetcher().fetch("https://site.com/recipes").unwrap();
+        let links = discover_scoped_links(
             "https://site.com/recipes",
-            10,
+            &seed_html,
+            "https://site.com/recipes",
+        );
+        let mut bootstrap_seen = HashSet::new();
+        bootstrap_seen.insert(normalize_url("https://site.com/recipes"));
+        let _ = scrape_from_seeds(
+            &fetcher(),
+            &links,
             &HashSet::new(),
-            4,
-            1,
+            ScrapeParams::new_fast(10, 4, 1),
             &|e| events.lock().unwrap().push(e),
+            bootstrap_seen,
         )
         .unwrap();
         let ev = events.into_inner().unwrap();
@@ -986,7 +1080,7 @@ mod tests {
             &f,
             &seeds,
             &HashSet::new(),
-            ScrapeParams::new(10, 4, 2),
+            ScrapeParams::new_fast(10, 4, 2),
             &noop,
             HashSet::new(),
         )
@@ -994,6 +1088,67 @@ mod tests {
         let titles: HashSet<_> = out.recipes.iter().map(|r| r.title.as_str()).collect();
         assert!(titles.contains("Pie"));
         assert!(titles.contains("Stew"));
-        assert!(!titles.contains("Soup")); // never seeded or linked from list-only path used
+        assert!(!titles.contains("Soup"));
+    }
+
+    /// Regression: expansions must not jump ahead of later same-depth seeds.
+    /// With jobs=1 and limit=3, DFS/push_front would import R1,R1a,R1b.
+    #[test]
+    fn bfs_does_not_starve_later_seed_siblings() {
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://site.com/recipes".to_string(),
+            r#"<a href="/recipes/r1">R1</a>
+               <a href="/recipes/r2">R2</a>
+               <a href="/recipes/r3">R3</a>"#
+                .to_string(),
+        );
+        pages.insert(
+            "https://site.com/recipes/r1".to_string(),
+            r#"<html><head><script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Recipe","name":"R1",
+              "recipeIngredient":["1 cup flour","2 eggs"],
+              "recipeInstructions":"Mix."}
+            </script></head><body>
+            <a href="/recipes/r1a">R1a</a>
+            <a href="/recipes/r1b">R1b</a>
+            </body></html>"#
+                .to_string(),
+        );
+        pages.insert("https://site.com/recipes/r2".to_string(), recipe_html("R2"));
+        pages.insert("https://site.com/recipes/r3".to_string(), recipe_html("R3"));
+        pages.insert(
+            "https://site.com/recipes/r1a".to_string(),
+            recipe_html("R1a"),
+        );
+        pages.insert(
+            "https://site.com/recipes/r1b".to_string(),
+            recipe_html("R1b"),
+        );
+        let f = MapFetcher { pages };
+        let out = scrape_new_recipes_fast(&f, "https://site.com/recipes", 3, &HashSet::new(), 1, 2);
+        let titles: Vec<_> = out.recipes.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["R1", "R2", "R3"],
+            "true BFS must finish same-depth seeds before expansions; got {titles:?}"
+        );
+    }
+
+    #[test]
+    fn topics_and_collection_paths_are_not_forced_listing() {
+        // Expanded listing segments were reverted so site `scrape` import policy
+        // for these paths stays unchanged.
+        assert!(!is_listing_url("https://site.com/topics/one-pan-chicken"));
+        assert!(!is_listing_url("https://site.com/collection/summer-pies"));
+    }
+
+    #[test]
+    fn deny_list_covers_common_site_chrome() {
+        assert!(is_denied_url("https://www.delish.com/videos/foo"));
+        assert!(is_denied_url("https://www.delish.com/food-news/bar"));
+        assert!(is_denied_url("https://site.com/auth/csrf"));
+        assert!(is_denied_url("https://site.com/email/newsletter"));
+        assert!(!is_denied_url("https://site.com/recipes/chicken-soup"));
     }
 }
