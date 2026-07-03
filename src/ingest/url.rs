@@ -7,6 +7,18 @@ use anyhow::{bail, Context, Result};
 use scraper::{Html, Selector};
 use serde_json::Value;
 use std::time::Duration;
+use url::Url;
+
+/// A JSON-LD `url`/`@id` is safe to adopt as recipe identity only when it is the
+/// **same host** as the page we fetched and points at an actual page (not a
+/// fragment-only `@id` like `https://site.com/#recipe`, whose path collapses to
+/// the site root and would merge every recipe on that host into one identity).
+fn canonical_is_trustworthy(canonical: &str, fetch_url: &str) -> bool {
+    let (Ok(c), Ok(f)) = (Url::parse(canonical), Url::parse(fetch_url)) else {
+        return false;
+    };
+    c.host_str() == f.host_str() && !c.path().trim_end_matches('/').is_empty()
+}
 
 #[derive(Clone)]
 pub struct UrlSource {
@@ -38,11 +50,13 @@ impl RecipeSourceIngest for UrlSource {
         };
 
         if let Some(mut recipe) = extract_json_ld_recipe(&html)? {
-            // Prefer schema.org canonical url/@id for identity; else fetch URL.
+            // Prefer schema.org canonical url/@id for identity, but only when it's
+            // same-host and not a fragment-only site-root id; else the fetch URL.
             let identity = recipe
                 .meta
                 .source_url
                 .clone()
+                .filter(|canon| canonical_is_trustworthy(canon, url))
                 .unwrap_or_else(|| url.to_string());
             recipe.source = RecipeSource::Url {
                 url: identity.clone(),
@@ -453,5 +467,37 @@ mod tests {
             other => panic!("expected RecipeSource::Url, got {other:?}"),
         }
         assert_eq!(recipe.meta.source_url.as_deref(), Some(fetch));
+    }
+
+    #[test]
+    fn foreign_host_canonical_rejected() {
+        let html = r#"<script type="application/ld+json">
+          {"@context":"https://schema.org","@type":"Recipe","name":"X",
+           "url":"https://OTHER-site.com/stolen","recipeIngredient":["1 cup flour"]}
+        </script>"#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let fetch = "https://example.com/real-page";
+        let r = src.ingest(fetch).unwrap();
+        // Cross-host canonical must NOT be adopted as identity.
+        assert_eq!(r.meta.source_url.as_deref(), Some(fetch));
+    }
+
+    #[test]
+    fn fragment_only_at_id_rejected() {
+        let html = r#"<script type="application/ld+json">
+          {"@context":"https://schema.org","@type":"Recipe","name":"Y",
+           "@id":"https://example.com/#recipe","recipeIngredient":["1 cup flour"]}
+        </script>"#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let fetch = "https://example.com/soup-page";
+        let r = src.ingest(fetch).unwrap();
+        // A site-root fragment @id would collapse all recipes to one identity.
+        assert_eq!(r.meta.source_url.as_deref(), Some(fetch));
     }
 }

@@ -520,15 +520,16 @@ impl Store {
     ///
     /// URL check (when `source_url` is `Some`) runs first; title uses
     /// [`normalize_title_key`]. Intended for scrape/import skip-before-save.
-    pub fn is_duplicate(&self, title: &str, source_url: Option<&str>) -> Result<bool> {
-        if let Some(u) = source_url {
-            if self.find_id_by_normalized_source_url(u)?.is_some() {
-                return Ok(true);
-            }
+    /// A recipe is a duplicate when its source URL is already stored. Title is
+    /// deliberately NOT used for identity: distinct recipes that share a title
+    /// (e.g. "Banana Bread" from two different sites) must both be importable.
+    /// Same-recipe-different-URL is handled upstream by canonical-URL identity
+    /// and by not importing listing/category pages.
+    pub fn is_duplicate(&self, source_url: Option<&str>) -> Result<bool> {
+        match source_url {
+            Some(u) => Ok(self.find_id_by_normalized_source_url(u)?.is_some()),
+            None => Ok(false),
         }
-        Ok(self
-            .find_id_by_title_key(&normalize_title_key(title))?
-            .is_some())
     }
 
     /// List all pantry items, sorted by ingredient name.
@@ -628,6 +629,40 @@ impl Store {
              ON CONFLICT(plan_id) DO NOTHING",
             params![plan_id],
         )?;
+        Ok(())
+    }
+
+    /// Persist a completed restock atomically: overwrite every ledger row (rows
+    /// at ≤0 are removed) and mark the plan restocked, in one transaction. The
+    /// idempotency guard is re-checked inside the transaction so a partial
+    /// failure rolls back entirely rather than leaving stock mutated-but-unmarked.
+    pub fn apply_restock(&self, plan_id: &str, stock: &[crate::domain::PantryItem]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let already: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM plan_restocks WHERE plan_id = ?1",
+            params![plan_id],
+            |row| row.get(0),
+        )?;
+        if already > 0 {
+            anyhow::bail!("plan {plan_id} already restocked");
+        }
+        for item in stock {
+            let id = self.upsert_ingredient(&item.key)?;
+            if item.quantity_canonical <= 0.0 {
+                tx.execute("DELETE FROM pantry WHERE ingredient_id = ?1", params![id])?;
+            } else {
+                tx.execute(
+                    "INSERT INTO pantry (ingredient_id, quantity_canonical) VALUES (?1, ?2)
+                     ON CONFLICT(ingredient_id) DO UPDATE SET quantity_canonical = excluded.quantity_canonical",
+                    params![id, item.quantity_canonical],
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO plan_restocks (plan_id) VALUES (?1) ON CONFLICT(plan_id) DO NOTHING",
+            params![plan_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -741,13 +776,11 @@ mod tests {
     }
 
     #[test]
-    fn is_duplicate_by_url_or_title() {
+    fn is_duplicate_by_url_only() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path().join("t.db")).unwrap();
 
-        assert!(!store
-            .is_duplicate("Anything", Some("https://example.com/a"))
-            .unwrap());
+        assert!(!store.is_duplicate(Some("https://example.com/a")).unwrap());
 
         let mut r = Recipe::new("Grilled S'mores");
         r.source = RecipeSource::Url {
@@ -756,26 +789,16 @@ mod tests {
         r.meta.source_url = Some("https://example.com/grilled-smores".into());
         store.save_recipe(&r).unwrap();
 
-        // Same URL, different trailing slash / host case → duplicate.
+        // Same URL (trailing slash / host case) → duplicate.
         assert!(store
-            .is_duplicate(
-                "Different Title",
-                Some("https://EXAMPLE.com/grilled-smores/")
-            )
+            .is_duplicate(Some("https://EXAMPLE.com/grilled-smores/"))
             .unwrap());
 
-        // Same title key, different URL → duplicate.
-        assert!(store
-            .is_duplicate("  GRILLED S'MORES  ", Some("https://other.example/x"))
-            .unwrap());
+        // Same title, DIFFERENT url → NOT a duplicate (distinct recipe allowed).
+        assert!(!store.is_duplicate(Some("https://other.example/x")).unwrap());
 
-        // Title-only candidate (no URL) still matches existing title.
-        assert!(store.is_duplicate("grilled s'mores", None).unwrap());
-
-        // Unrelated title and URL → not a duplicate.
-        assert!(!store
-            .is_duplicate("Pasta Night", Some("https://example.com/pasta"))
-            .unwrap());
+        // No url → not a duplicate.
+        assert!(!store.is_duplicate(None).unwrap());
     }
 
     #[test]

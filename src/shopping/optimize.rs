@@ -113,10 +113,12 @@ pub fn optimize_purchase(
         }
 
         let p = pkgs[idx];
+        // Saturating throughout: a tiny package vs a large requirement can make the
+        // float→u32 cast reach u32::MAX; a plain `+ 1/2` would overflow-panic.
         let max_c = if p.size_canonical >= required && size < required {
-            ((required - size) / p.size_canonical).ceil() as u32 + 1
+            (((required - size) / p.size_canonical).ceil() as u32).saturating_add(1)
         } else {
-            ((required - size).max(0.0) / p.size_canonical).ceil() as u32 + 2
+            (((required - size).max(0.0) / p.size_canonical).ceil() as u32).saturating_add(2)
         };
         let max_c = max_c.min(opts.max_packages.saturating_sub(n));
 
@@ -363,6 +365,19 @@ mod tests {
         let (picks, purchased, _) = optimize_purchase(150.0, &pkgs, &OptimizeOptions::default());
         assert!(picks.iter().all(|p| p.label == "100g"));
         assert!(purchased.is_finite() && purchased >= 150.0);
+    }
+
+    #[test]
+    fn tiny_package_huge_requirement_does_not_overflow() {
+        // ratio far exceeds u32::MAX; must not panic on the count arithmetic.
+        let pkgs = vec![Package {
+            label: "tiny".into(),
+            size_canonical: 1e-6,
+            price_cents: Some(1),
+            kind: UnitKind::Mass,
+        }];
+        let (_picks, _purchased, _cost) =
+            optimize_purchase(5000.0, &pkgs, &OptimizeOptions::default());
     }
 
     #[test]
