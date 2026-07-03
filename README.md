@@ -119,6 +119,15 @@ smarter-recipes delete <id>
 # Reads each recipe's original ingredient text — no re-import needed.
 smarter-recipes reparse <id>
 smarter-recipes reparse --all
+
+# Nutrition: `plan` prints estimated per-day macros with explicit coverage
+# ("N/M ingredients"); `show` prints per-serving nutrition when the source
+# site published it. Estimates use a built-in USDA-style per-100 g table;
+# resolve uncovered ingredient names into a local cache via USDA FoodData
+# Central (set SMARTER_RECIPES_FDC_KEY for a personal key; DEMO_KEY default)
+# or an offline JSON fixture. Misses are cached and not retried.
+smarter-recipes nutrition fetch
+smarter-recipes nutrition fetch --fixture my_profiles.json --limit 50
 ```
 
 ### Package catalog JSON overlay
@@ -149,6 +158,7 @@ src/
   planning/     Min-union meal planner (no repeats; pantry-aware)
   shopping/     Package purchase optimizer (nets against pantry)
   pricing/      Package catalog, density table, and store sources (Open Food Facts / fixture)
+  nutrition/    Per-100 g macro table, USDA FDC source + cache, plan/recipe estimates
   cli/          clap commands
 ```
 
