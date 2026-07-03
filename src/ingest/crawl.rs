@@ -134,13 +134,12 @@ const DENY_SEGMENTS: &[&str] = &[
     "comments",
     "cdn-cgi",
     // Site chrome / non-recipe sections (search-scrape yield protection).
+    // Prefer specific segments over broad ones (e.g. food-news not bare "news")
+    // so site `scrape` does not drop legit recipes under generic paths.
     "videos",
     "video",
-    "news",
     "newsletter",
     "email",
-    "menus",
-    "menu",
     "auth",
     "csrf",
     "my-stuff",
@@ -148,11 +147,9 @@ const DENY_SEGMENTS: &[&str] = &[
     "gear",
     "accessibility",
     "holidays-events",
-    "holidays",
-    "home-living",
-    "health-wellness",
-    "test-kitchen",
     "food-news",
+    "sweepstakes",
+    "sweepstake",
 ];
 
 const DENY_EXTENSIONS: &[&str] = &[
@@ -171,9 +168,10 @@ pub fn is_denied_url(u: &str) -> bool {
     }
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     segments.iter().any(|seg| {
-        DENY_SEGMENTS
-            .iter()
-            .any(|d| seg == d || seg.starts_with(&format!("{d}.")))
+        DENY_SEGMENTS.iter().any(|d| {
+            // Exact segment, dotted prefix (about.html), or hyphenated (about-us-…).
+            seg == d || seg.starts_with(&format!("{d}.")) || seg.starts_with(&format!("{d}-"))
+        })
     })
 }
 
@@ -341,6 +339,28 @@ impl CandidateQueues {
             } else {
                 self.content.push_back((link, depth));
             }
+        }
+    }
+
+    /// Prefer non-listing children of a nav/roundup page over remaining unfetched
+    /// seeds (still FIFO among those children). Used only when the parent page
+    /// was not a recipe — keeps same-depth recipe seeds BFS-fair (#1 regression).
+    fn enqueue_batch_prefer_content(&mut self, links: Vec<(String, usize)>) {
+        let mut content = Vec::new();
+        let mut listings = Vec::new();
+        for (link, depth) in links {
+            if is_listing_url(&link) {
+                listings.push((link, depth));
+            } else {
+                content.push((link, depth));
+            }
+        }
+        // push_front reverses; feed in reverse so pop_front yields discovery order.
+        for item in content.into_iter().rev() {
+            self.content.push_front(item);
+        }
+        for item in listings {
+            self.listings.push_back(item);
         }
     }
 }
@@ -521,12 +541,25 @@ pub fn scrape_from_seeds(
 
         for (_bi, url, depth, html, fetch_ok, ingest) in batch_results {
             fetches_used += 1;
-            match (fetch_ok, ingest) {
-                (true, Ok(recipe)) => recipes.push(recipe),
-                (true, Err(reason)) => not_recipe.push((url.clone(), reason)),
-                (false, Err(reason)) => failed.push((url.clone(), reason)),
+            // Prefer children of nav/roundup pages over further unfetched seeds so
+            // listicle-heavy search SERPs still reach individual recipes under a
+            // modest --limit. Successful recipe pages keep normal BFS enqueue so
+            // same-depth siblings are not starved (see bfs_does_not_starve_*).
+            let prefer_children = match (fetch_ok, ingest) {
+                (true, Ok(recipe)) => {
+                    recipes.push(recipe);
+                    false
+                }
+                (true, Err(reason)) => {
+                    not_recipe.push((url.clone(), reason));
+                    true
+                }
+                (false, Err(reason)) => {
+                    failed.push((url.clone(), reason));
+                    false
+                }
                 (false, Ok(_)) => unreachable!("fetch failed cannot produce recipe"),
-            }
+            };
 
             // Host-scope expansion to the page's own host (supports multi-host seeds).
             if depth < max_depth && !html.is_empty() {
@@ -545,7 +578,11 @@ pub fn scrape_from_seeds(
                 }
                 let new_queued = batch_links.len();
                 if new_queued > 0 {
-                    queue.enqueue_batch(batch_links);
+                    if prefer_children {
+                        queue.enqueue_batch_prefer_content(batch_links);
+                    } else {
+                        queue.enqueue_batch(batch_links);
+                    }
                     progress(ScrapeEvent::Planned {
                         candidates,
                         skipped: skipped_existing,
@@ -1149,6 +1186,58 @@ mod tests {
         assert!(is_denied_url("https://www.delish.com/food-news/bar"));
         assert!(is_denied_url("https://site.com/auth/csrf"));
         assert!(is_denied_url("https://site.com/email/newsletter"));
+        assert!(is_denied_url("https://www.realsimple.com/about-us-5546943"));
+        assert!(is_denied_url("https://www.realsimple.com/sweepstakes"));
         assert!(!is_denied_url("https://site.com/recipes/chicken-soup"));
+        // Broad bare segments intentionally not denied:
+        assert!(!is_denied_url("https://site.com/news/recipe-trends"));
+        assert!(!is_denied_url("https://site.com/menu/weeknight-dinners"));
+    }
+
+    /// Listicle/roundup seeds: after a nav page expands to real recipes, those
+    /// children must be fetched before further listicle seeds under a tight limit.
+    #[test]
+    fn prefer_children_of_nav_over_remaining_seeds() {
+        let mut pages = HashMap::new();
+        // Three listicle "seeds" as if from search; only the first has crawlable recipe links.
+        pages.insert(
+            "https://a.com/roundup1".to_string(),
+            r#"<html><body>
+              <a href="/real-one">One</a>
+              <a href="/real-two">Two</a>
+            </body></html>"#
+                .to_string(),
+        );
+        pages.insert(
+            "https://b.com/roundup2".to_string(),
+            r#"<html><body><p>js listicle empty</p></body></html>"#.to_string(),
+        );
+        pages.insert(
+            "https://c.com/roundup3".to_string(),
+            r#"<html><body><p>js listicle empty</p></body></html>"#.to_string(),
+        );
+        pages.insert("https://a.com/real-one".to_string(), recipe_html("One"));
+        pages.insert("https://a.com/real-two".to_string(), recipe_html("Two"));
+        let f = MapFetcher { pages };
+        let seeds = vec![
+            "https://a.com/roundup1".to_string(),
+            "https://b.com/roundup2".to_string(),
+            "https://c.com/roundup3".to_string(),
+        ];
+        // Without prefer-children: would fetch 3 roundups under limit 3 → 0 recipes.
+        let out = scrape_from_seeds(
+            &f,
+            &seeds,
+            &HashSet::new(),
+            ScrapeParams::new_fast(3, 1, 2),
+            &noop,
+            HashSet::new(),
+        )
+        .unwrap();
+        let titles: HashSet<_> = out.recipes.iter().map(|r| r.title.as_str()).collect();
+        assert!(
+            titles.contains("One") && titles.contains("Two"),
+            "expected recipes from first listicle expansion, got {titles:?}"
+        );
     }
 }

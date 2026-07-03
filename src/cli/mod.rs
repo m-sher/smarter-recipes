@@ -66,9 +66,13 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Search DuckDuckGo for recipe pages, then multi-host crawl results
+    /// Search DuckDuckGo for recipe pages, then multi-host crawl results.
+    ///
+    /// Works best with **specific dish/ingredient** queries (e.g. "chicken
+    /// parmesan recipe"). Broad "best/ideas/high-protein dinners" queries often
+    /// hit JS-rendered listicles; static crawl may find few individual recipes.
     SearchScrape {
-        /// Search query, e.g. "high protein dinners"
+        /// Search query (prefer a specific dish, e.g. "chicken parmesan recipe")
         query: String,
         /// Max number of site pages to fetch this run (search SERP fetches are free)
         #[arg(long, default_value_t = 50)]
