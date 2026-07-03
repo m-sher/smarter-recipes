@@ -59,3 +59,79 @@ fn import_plan_shop() {
     }
     assert!(list.total_cost_cents.is_some());
 }
+
+#[test]
+fn plan_respects_per_day_protein_config() {
+    use smarter_recipes::domain::{Macros, RecipeId};
+    use smarter_recipes::planning::{
+        plan_bound_violations, plan_meals, NutritionBounds, PlanOptions,
+    };
+    use std::collections::HashMap;
+
+    let dessert1 = {
+        let mut r = smarter_recipes::domain::Recipe::new("Cake");
+        r.id = RecipeId::from("d1");
+        r.ingredients = vec![smarter_recipes::normalize::normalize_line("100 g sugar")];
+        r
+    };
+    let dessert2 = {
+        let mut r = smarter_recipes::domain::Recipe::new("Cookies");
+        r.id = RecipeId::from("d2");
+        r.ingredients = vec![
+            smarter_recipes::normalize::normalize_line("100 g sugar"),
+            smarter_recipes::normalize::normalize_line("50 g flour"),
+        ];
+        r
+    };
+    let protein = {
+        let mut r = smarter_recipes::domain::Recipe::new("Chicken Rice");
+        r.id = RecipeId::from("p1");
+        r.ingredients = vec![
+            smarter_recipes::normalize::normalize_line("200 g chicken"),
+            smarter_recipes::normalize::normalize_line("100 g rice"),
+        ];
+        r
+    };
+    let mut macros = HashMap::new();
+    macros.insert(
+        RecipeId::from("d1"),
+        Macros {
+            protein_g: 5.0,
+            ..Default::default()
+        },
+    );
+    macros.insert(
+        RecipeId::from("d2"),
+        Macros {
+            protein_g: 4.0,
+            ..Default::default()
+        },
+    );
+    macros.insert(
+        RecipeId::from("p1"),
+        Macros {
+            protein_g: 60.0,
+            ..Default::default()
+        },
+    );
+    let nutrition = NutritionBounds::from_toml_str(
+        r#"
+        [per_day]
+        protein_g = { min = 50.0 }
+        "#,
+    )
+    .unwrap();
+    let pool = vec![dessert1, dessert2, protein];
+    let plan = plan_meals(
+        &pool,
+        &PlanOptions {
+            days: 1,
+            meals_per_day: 2,
+            nutrition: nutrition.clone(),
+            recipe_macros: macros.clone(),
+            ..Default::default()
+        },
+    );
+    assert!(plan.meals.iter().any(|m| m.recipe_title == "Chicken Rice"));
+    assert!(plan_bound_violations(&pool, &plan, &nutrition, &macros).is_empty());
+}

@@ -1,0 +1,12 @@
+# Example nutrition constraints for `smarter-recipes plan --nutrition-config ...`
+# Values are whole-recipe estimated macros summed per scope.
+
+[per_day]
+protein_g = { min = 50.0, max = 200.0 }
+kcal = { max = 3000.0 }
+
+[per_meal]
+protein_g = { min = 15.0 }
+
+[plan]
+protein_g = { min = 350.0 }
