@@ -61,21 +61,84 @@ pub fn pantry_quantity_for(key: &IngredientKey, pantry: &[PantryItem]) -> f64 {
     }
 }
 
+/// Convert `amount` of `name` from one unit kind to another via the density
+/// table; identity for same-kind, `None` when no bridge exists.
+fn convert_kind(name: &str, amount: f64, from: UnitKind, to: UnitKind) -> Option<f64> {
+    match (from, to) {
+        (a, b) if a == b => Some(amount),
+        (UnitKind::Mass, UnitKind::Volume) => mass_g_to_volume_ml(name, amount),
+        (UnitKind::Volume, UnitKind::Mass) => volume_ml_to_mass_g(name, amount),
+        _ => None,
+    }
+}
+
+/// Consume up to `need` (in `key`'s canonical units) from the mutable `stock`
+/// ledger: exact-kind match first, then the density-bridged partner kind.
+/// Mutates `stock` (never below zero) so no unit of stock is credited twice.
+/// Returns the unmet remainder.
+fn consume_from_stock(stock: &mut [PantryItem], key: &IngredientKey, need: f64) -> f64 {
+    let mut remaining = need;
+    if let Some(item) = stock
+        .iter_mut()
+        .find(|p| p.key == *key && p.quantity_canonical > 0.0)
+    {
+        let take = remaining.min(item.quantity_canonical);
+        item.quantity_canonical -= take;
+        remaining -= take;
+    }
+    if remaining <= 1e-9 {
+        return 0.0;
+    }
+    let partner = match key.kind {
+        UnitKind::Volume => UnitKind::Mass,
+        UnitKind::Mass => UnitKind::Volume,
+        _ => return remaining,
+    };
+    if let Some(item) = stock
+        .iter_mut()
+        .find(|p| p.key.name == key.name && p.key.kind == partner && p.quantity_canonical > 0.0)
+    {
+        if let Some(avail_in_key) =
+            convert_kind(&key.name, item.quantity_canonical, partner, key.kind)
+        {
+            let take_key = remaining.min(avail_in_key);
+            if let Some(take_partner) = convert_kind(&key.name, take_key, key.kind, partner) {
+                item.quantity_canonical = (item.quantity_canonical - take_partner).max(0.0);
+                remaining -= take_key;
+            }
+        }
+    }
+    remaining.max(0.0)
+}
+
+/// Add `qty` (in `key`'s canonical units) into the `stock` ledger, merging with
+/// an existing exact-key row or appending a new one.
+fn add_to_stock(stock: &mut Vec<PantryItem>, key: &IngredientKey, qty: f64) {
+    if let Some(item) = stock.iter_mut().find(|p| p.key == *key) {
+        item.quantity_canonical += qty;
+    } else {
+        stock.push(PantryItem {
+            key: key.clone(),
+            quantity_canonical: qty,
+        });
+    }
+}
+
 /// Subtract on-hand pantry quantities from plan requirements.
 ///
-/// For each required ingredient, reduces the needed amount by matching pantry
-/// stock (exact [`IngredientKey`], or mass↔volume density bridge). Items fully
-/// covered by the pantry are omitted.
+/// Consumes a working copy of the pantry so a single stock row is never credited
+/// against more than one requirement (exact [`IngredientKey`] first, then the
+/// mass↔volume density bridge). Items fully covered by the pantry are omitted.
 pub fn apply_pantry_to_requirements(
     requirements: &[(IngredientKey, f64)],
     pantry: &[PantryItem],
 ) -> Vec<(IngredientKey, f64)> {
+    let mut stock = pantry.to_vec();
     let mut out = Vec::with_capacity(requirements.len());
     for (key, need) in requirements {
-        let have = pantry_quantity_for(key, pantry);
-        let remaining = need - have;
-        if remaining > 1e-9 {
-            out.push((key.clone(), remaining));
+        let shortfall = consume_from_stock(&mut stock, key, *need);
+        if shortfall > 1e-9 {
+            out.push((key.clone(), shortfall));
         }
     }
     out
@@ -161,13 +224,17 @@ pub fn restock_plan_from_shop(
     let list = shopping_list_for_plan(store, plan, catalog)?;
     let delta = compute_restock_delta(&gross, &list, catalog);
 
+    // Build the post-trip pantry ledger in memory (purchases in, then cooked
+    // amounts consumed against real stock via the density bridge), then persist
+    // every touched row plus the restock mark in one transaction.
+    let mut stock = store.list_pantry()?;
     for (key, qty) in &delta.additions {
-        store.pantry_add(key, *qty)?;
+        add_to_stock(&mut stock, key, *qty);
     }
     for (key, qty) in &delta.deductions {
-        store.pantry_add(key, -*qty)?;
+        consume_from_stock(&mut stock, key, *qty);
     }
-    store.mark_plan_restocked(&plan.id)?;
+    store.apply_restock(&plan.id, &stock)?;
     Ok(delta)
 }
 
@@ -337,6 +404,44 @@ mod tests {
         assert!(
             net.is_empty(),
             "mass flour stock should cover volume need via density: {net:?}"
+        );
+    }
+
+    #[test]
+    fn pantry_stock_not_double_credited_across_kinds() {
+        // One 250 g flour row must not satisfy BOTH a mass and a volume flour
+        // requirement in full.
+        let mass = IngredientKey::new("flour", UnitKind::Mass);
+        let vol = IngredientKey::new("flour", UnitKind::Volume);
+        let req = vec![(mass.clone(), 200.0), (vol.clone(), 236.6)]; // 200 g + 1 cup (~125 g)
+        let pantry = vec![PantryItem {
+            key: mass.clone(),
+            quantity_canonical: 250.0,
+        }];
+        let net = apply_pantry_to_requirements(&req, &pantry);
+        // 200 g consumed exact → 50 g left; the cup needs ~125 g but only 50 g
+        // remains → a shortfall must survive on exactly one line.
+        let total_remaining: f64 = net.iter().map(|(_, q)| q).sum();
+        assert!(total_remaining > 1.0, "double-credit regressed: {net:?}");
+    }
+
+    #[test]
+    fn consume_from_stock_bridges_and_depletes() {
+        let mut stock = vec![PantryItem {
+            key: IngredientKey::new("flour", UnitKind::Mass),
+            quantity_canonical: 500.0,
+        }];
+        // cook 1 cup (~236.6 ml → ~125 g) of flour by volume
+        let short = consume_from_stock(
+            &mut stock,
+            &IngredientKey::new("flour", UnitKind::Volume),
+            236.6,
+        );
+        assert!(short < 1e-6, "should be fully covered, short={short}");
+        assert!(
+            (stock[0].quantity_canonical - 374.6).abs() < 1.0,
+            "mass stock should drop by ~125 g: {}",
+            stock[0].quantity_canonical
         );
     }
 

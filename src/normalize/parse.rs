@@ -27,7 +27,7 @@ static RE_LEADING_QTY: Lazy<Regex> = Lazy::new(|| {
           | (?P<mixed_w>\d+)\s+(?P<mixed_n>\d+)\s*/\s*(?P<mixed_d>\d+)            # 1 1/2
           | (?P<frac_n>\d+)\s*/\s*(?P<frac_d>\d+)                                 # 1/2
           | (?P<dec>\d+(?:\.\d+)?)                                                # 2 or 2.5
-          | (?P<word>a|an|one|two|three|four|five|six|seven|eight|nine|ten|half|quarter)
+          | (?P<word>a|an|one|two|three|four|five|six|seven|eight|nine|ten|half|quarter)\b
         )
         \s*
         ",
@@ -273,6 +273,19 @@ fn split_note(rest: &str) -> (String, Option<String>) {
     (rest.to_string(), None)
 }
 
+/// Earliest char-boundary byte offset in `s` where any phrase begins
+/// (case-insensitive). Boundary-safe: never slices inside a multi-byte char,
+/// even when `to_lowercase` changes byte lengths (e.g. ` K` U+212A, ` İ`).
+fn taste_phrase_start(s: &str, phrases: &[&str]) -> Option<usize> {
+    s.char_indices().find_map(|(byte_idx, _)| {
+        let rest = s[byte_idx..].to_lowercase();
+        phrases
+            .iter()
+            .any(|p| rest.starts_with(p))
+            .then_some(byte_idx)
+    })
+}
+
 fn clean_name(name: &str) -> String {
     let mut s = name.trim().to_string();
     // Strip leading "of "
@@ -308,12 +321,13 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
     let has_taste_note =
         lower.contains("to taste") || lower.contains("as needed") || lower.contains("as desired");
     if has_taste_note && parse_quantity_prefix(line).is_none() {
-        // Strip trailing taste notes from the name, preserving non-lowercased source when possible.
+        // Strip trailing taste notes from the name, preserving original casing.
         let mut name = line.to_string();
-        for phrase in ["to taste", "as needed", "as desired", "or to taste"] {
-            if let Some(idx) = name.to_lowercase().find(phrase) {
-                name = name[..idx].to_string();
-            }
+        if let Some(cut) = taste_phrase_start(
+            &name,
+            &["or to taste", "to taste", "as needed", "as desired"],
+        ) {
+            name.truncate(cut);
         }
         // Also drop a dangling "(" left when the note was parenthesized, e.g.
         // "salt (to taste)" -> "salt (" -> "salt".
@@ -741,5 +755,30 @@ mod tests {
         let p = parse_ingredient_line("2.5 lb chicken breast, diced");
         assert_eq!(p.name, "chicken breast");
         assert_eq!(p.note.as_deref(), Some("diced"));
+    }
+
+    #[test]
+    fn word_number_needs_word_boundary() {
+        // Leading "a"/"ten" must not be consumed from ordinary ingredient names.
+        for line in ["avocado", "apple", "almonds", "tender greens", "onion"] {
+            let p = parse_ingredient_line(line);
+            assert_eq!(p.name, line, "{line} mis-parsed");
+            assert_eq!(p.quantity, None, "{line} got a phantom quantity");
+        }
+        // Genuine word numbers still parse.
+        let p = parse_ingredient_line("one onion");
+        assert_eq!(p.quantity, Some(1.0));
+        assert_eq!(p.name, "onion");
+    }
+
+    #[test]
+    fn to_taste_no_panic_on_multibyte_lowercase() {
+        // U+212A KELVIN SIGN lowercases to ASCII 'k' (byte length shrinks); the
+        // name-cut must stay on a char boundary rather than panic.
+        for line in ["\u{212A}é to taste", "İ salt to taste", "Köşe as needed"] {
+            let p = parse_ingredient_line(line);
+            assert!(p.quantity.is_none());
+            assert!(!p.name.contains("to taste") && !p.name.contains("as needed"));
+        }
     }
 }

@@ -226,9 +226,9 @@ pub fn run(cli: Cli) -> Result<()> {
             print_recipe_summary(&recipe);
             if dry_run {
                 println!("{}", serde_json::to_string_pretty(&recipe)?);
-            } else if store.is_duplicate(&recipe.title, recipe_source_url(&recipe).as_deref())? {
+            } else if store.is_duplicate(recipe_source_url(&recipe).as_deref())? {
                 println!(
-                    "Skipped: already have a recipe with this URL or title ({})",
+                    "Skipped: already have a recipe with this source URL ({})",
                     recipe.title
                 );
             } else {
@@ -288,7 +288,7 @@ pub fn run(cli: Cli) -> Result<()> {
             let mut saved = 0usize;
             for recipe in &outcome.recipes {
                 let source = recipe_source_url(recipe);
-                if store.is_duplicate(&recipe.title, source.as_deref())? {
+                if store.is_duplicate(source.as_deref())? {
                     skipped_dup += 1;
                     continue;
                 }
