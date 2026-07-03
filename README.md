@@ -10,7 +10,7 @@ CLI tool that ingests recipes from multiple sources, stores them in a local SQLi
 | **Normalization** | Free-text ingredient lines → name, quantity, unit; units converted to canonical g / ml / ea for aggregation |
 | **Storage** | Embedded SQLite; ingredients deduplicated by `(name, unit kind)`; pantry stock by same identity |
 | **Pantry** | Track on-hand ingredients; mark shopping results as purchased; plan and shop net of stock |
-| **Planning** | Multi-start min-union scheduler, no recipe repeats; pantry stock with quantity-aware binary shortfall; optional nutrition min/max bounds from TOML or per-day CLI flags (documented in `src/planning/mod.rs`) |
+| **Planning** | Min-union scheduler (exact ILP under nutrition constraints), no recipe repeats; pantry stock with quantity-aware binary shortfall; optional per-scope min/max **and macro-split ratio** bounds from TOML (per-day min/max also via CLI flags) (documented in `src/planning/mod.rs`) |
 | **Shopping** | Package multiset optimization: **cost first**, then **minimum leftover**; requirements reduced by pantry (documented in `src/shopping/mod.rs`) |
 | **Extensibility** | New ingest sources implement `RecipeSourceIngest`; custom package catalogs via JSON overlay |
 
@@ -185,7 +185,9 @@ src/
 
 ### Planning algorithm (summary)
 
-Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new **to-buy** keys after quantity-aware pantry consumption (shared with shopping’s stock ledger); keep the schedule with the smallest net to-buy count. Partial stock does not fully exempt a key. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. Recipes whose estimated whole-recipe energy is `kcal <= 0` are dropped from the pool (not treated as meals). With nutrition bounds, candidates that break per-meal mins/maxes or a day’s maxes are avoided when possible, and feasible schedules rank above infeasible ones (then least total violation, then min-union). See module docs in `src/planning/mod.rs`.
+**Unconstrained:** multi-start greedy — for each possible first recipe, repeatedly append the unused candidate that adds the fewest new **to-buy** keys after quantity-aware pantry consumption (shared with shopping’s stock ledger); keep the schedule with the smallest net to-buy count. Partial stock does not fully exempt a key. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. Recipes whose estimated whole-recipe energy is `kcal <= 0` are dropped from the pool (not treated as meals).
+
+**With nutrition bounds:** the selection is solved exactly as a small integer program (pure-Rust `microlp`) with a two-phase lexicographic objective — first minimize total bound-violation magnitude (so a feasible plan is returned whenever one exists), then minimize the net to-buy count. Falls back to the greedy scheduler if the model is too large or the solver declines. See module docs in `src/planning/mod.rs` and `src/planning/ilp.rs`.
 
 ### Nutrition bounds TOML
 
@@ -193,6 +195,10 @@ Multi-start greedy: for each possible first recipe, repeatedly append the unused
 [per_day]
 protein_g = { min = 50.0, max = 200.0 }
 kcal = { max = 3000.0 }
+# Target macro split as a share of total macro grams (protein_g + fat_g + carbs_g),
+# within a ±tolerance band in percentage points (default 5). Config only.
+ratio = { protein = 30, fat = 30, carb = 40 }
+# ratio = { protein = 30, fat = 30, carb = 40, tolerance = 8 }
 
 [per_meal]
 protein_g = { min = 15.0 }
@@ -201,7 +207,7 @@ protein_g = { min = 15.0 }
 protein_g = { min = 350.0 }
 ```
 
-CLI `--min-*` / `--max-*` flags overlay `per_day` only. Nutrients: `kcal`, `protein_g`, `fat_g`, `carbs_g`.
+CLI `--min-*` / `--max-*` flags overlay `per_day` min/max only. Nutrients: `kcal`, `protein_g`, `fat_g`, `carbs_g`. A `ratio` table (any scope, config only) targets a macro split by grams; a share is satisfied within its tolerance band, and deviation beyond the band (in grams) is reported as a best-effort violation and minimized by the solver.
 
 
 ### Purchase optimization (summary)

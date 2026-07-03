@@ -37,7 +37,55 @@ impl MacroRange {
     }
 }
 
-/// Min/max ranges for all tracked macros.
+/// Default tolerance (percentage points) for a macro-ratio target when the
+/// config omits `tolerance`.
+pub const DEFAULT_RATIO_TOLERANCE: f64 = 5.0;
+
+/// Target macro split for a scope, as a percentage of total macro grams
+/// (`protein_g + fat_g + carbs_g`). Each share is optional and independent; a
+/// share is satisfied when the actual share is within `tolerance` percentage
+/// points of the target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+pub struct MacroRatio {
+    pub protein: Option<f64>,
+    pub fat: Option<f64>,
+    pub carb: Option<f64>,
+    /// Allowed deviation in percentage points (default [`DEFAULT_RATIO_TOLERANCE`]).
+    pub tolerance: Option<f64>,
+}
+
+impl MacroRatio {
+    pub fn is_empty(&self) -> bool {
+        self.protein.is_none() && self.fat.is_none() && self.carb.is_none()
+    }
+
+    /// Tolerance in percentage points, defaulting when unset.
+    pub fn effective_tolerance(&self) -> f64 {
+        self.tolerance.unwrap_or(DEFAULT_RATIO_TOLERANCE)
+    }
+
+    fn validate(&self, scope: &str) -> Result<()> {
+        for (name, share) in [
+            ("protein", self.protein),
+            ("fat", self.fat),
+            ("carb", self.carb),
+        ] {
+            if let Some(s) = share {
+                if !s.is_finite() || !(0.0..=100.0).contains(&s) {
+                    bail!("{scope}.ratio.{name}: share must be a finite percentage in [0, 100]");
+                }
+            }
+        }
+        if let Some(t) = self.tolerance {
+            if !t.is_finite() || t < 0.0 {
+                bail!("{scope}.ratio.tolerance: must be a finite, non-negative percentage");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Min/max ranges for all tracked macros, plus an optional target macro split.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct MacroBounds {
     #[serde(default)]
@@ -48,6 +96,8 @@ pub struct MacroBounds {
     pub fat_g: MacroRange,
     #[serde(default)]
     pub carbs_g: MacroRange,
+    #[serde(default)]
+    pub ratio: MacroRatio,
 }
 
 impl MacroBounds {
@@ -56,6 +106,7 @@ impl MacroBounds {
             && self.protein_g.is_empty()
             && self.fat_g.is_empty()
             && self.carbs_g.is_empty()
+            && self.ratio.is_empty()
     }
 
     pub fn validate(&self, scope: &str) -> Result<()> {
@@ -63,6 +114,7 @@ impl MacroBounds {
         self.protein_g.validate(&format!("{scope}.protein_g"))?;
         self.fat_g.validate(&format!("{scope}.fat_g"))?;
         self.carbs_g.validate(&format!("{scope}.carbs_g"))?;
+        self.ratio.validate(scope)?;
         Ok(())
     }
 }
@@ -195,6 +247,8 @@ impl fmt::Display for NutrientKind {
 pub enum ViolationKind {
     BelowMin,
     AboveMax,
+    RatioBelowTarget,
+    RatioAboveTarget,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -219,17 +273,12 @@ pub struct BoundViolation {
     pub scope: BoundScope,
     pub nutrient: NutrientKind,
     pub kind: ViolationKind,
+    /// Actual value: grams/kcal for min/max, or the actual share (%) for ratio.
     pub actual: f64,
+    /// Bound value: the min/max, or the target share (%) for ratio.
     pub bound: f64,
-}
-
-impl BoundViolation {
-    pub fn magnitude(&self) -> f64 {
-        match self.kind {
-            ViolationKind::BelowMin => (self.bound - self.actual).max(0.0),
-            ViolationKind::AboveMax => (self.actual - self.bound).max(0.0),
-        }
-    }
+    /// How far outside the bound/band, in the metric's unit (grams or kcal).
+    pub magnitude: f64,
 }
 
 impl fmt::Display for BoundViolation {
@@ -243,6 +292,16 @@ impl fmt::Display for BoundViolation {
             ViolationKind::AboveMax => write!(
                 f,
                 "{} {} {:.1} above max {:.1}",
+                self.scope, self.nutrient, self.actual, self.bound
+            ),
+            ViolationKind::RatioBelowTarget => write!(
+                f,
+                "{} {} ratio {:.1}% below target {:.1}%",
+                self.scope, self.nutrient, self.actual, self.bound
+            ),
+            ViolationKind::RatioAboveTarget => write!(
+                f,
+                "{} {} ratio {:.1}% above target {:.1}%",
                 self.scope, self.nutrient, self.actual, self.bound
             ),
         }
@@ -284,6 +343,7 @@ pub fn evaluate_macros(
         totals.carbs_g,
         &bounds.carbs_g,
     );
+    check_ratio(&mut out, &scope, totals, &bounds.ratio);
     out
 }
 
@@ -302,6 +362,7 @@ fn check_range(
                 kind: ViolationKind::BelowMin,
                 actual,
                 bound: min,
+                magnitude: (min - actual).max(0.0),
             });
         }
     }
@@ -313,13 +374,64 @@ fn check_range(
                 kind: ViolationKind::AboveMax,
                 actual,
                 bound: max,
+                magnitude: (actual - max).max(0.0),
+            });
+        }
+    }
+}
+
+/// Emit a violation for each specified macro share that falls outside its
+/// tolerance band. Shares are of total macro grams; magnitude is grams beyond
+/// the band. Skips scopes with no macro grams (share undefined).
+fn check_ratio(
+    out: &mut Vec<BoundViolation>,
+    scope: &BoundScope,
+    totals: &Macros,
+    ratio: &MacroRatio,
+) {
+    if ratio.is_empty() {
+        return;
+    }
+    let base = totals.protein_g + totals.fat_g + totals.carbs_g;
+    if base <= 0.0 {
+        return;
+    }
+    let tol_g = ratio.effective_tolerance() / 100.0 * base;
+    for (nutrient, actual_g, target) in [
+        (NutrientKind::ProteinG, totals.protein_g, ratio.protein),
+        (NutrientKind::FatG, totals.fat_g, ratio.fat),
+        (NutrientKind::CarbsG, totals.carbs_g, ratio.carb),
+    ] {
+        let Some(target_pct) = target else {
+            continue;
+        };
+        let target_g = target_pct / 100.0 * base;
+        let actual_pct = actual_g / base * 100.0;
+        let dev = actual_g - target_g;
+        if dev > tol_g {
+            out.push(BoundViolation {
+                scope: scope.clone(),
+                nutrient,
+                kind: ViolationKind::RatioAboveTarget,
+                actual: actual_pct,
+                bound: target_pct,
+                magnitude: dev - tol_g,
+            });
+        } else if dev < -tol_g {
+            out.push(BoundViolation {
+                scope: scope.clone(),
+                nutrient,
+                kind: ViolationKind::RatioBelowTarget,
+                actual: actual_pct,
+                bound: target_pct,
+                magnitude: -dev - tol_g,
             });
         }
     }
 }
 
 pub fn violation_magnitude(violations: &[BoundViolation]) -> f64 {
-    violations.iter().map(BoundViolation::magnitude).sum()
+    violations.iter().map(|v| v.magnitude).sum()
 }
 
 /// How far `totals` still are below configured mins (0 if met or unset).
@@ -504,7 +616,7 @@ mod tests {
         let v = evaluate_macros(&bounds, &low, BoundScope::PerDay { day: 0 });
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, ViolationKind::BelowMin);
-        assert!((v[0].magnitude() - 30.0).abs() < 1e-9);
+        assert!((v[0].magnitude - 30.0).abs() < 1e-9);
 
         let high = Macros {
             protein_g: 150.0,
@@ -512,7 +624,7 @@ mod tests {
         };
         let v = evaluate_macros(&bounds, &high, BoundScope::PerDay { day: 1 });
         assert_eq!(v[0].kind, ViolationKind::AboveMax);
-        assert!((v[0].magnitude() - 50.0).abs() < 1e-9);
+        assert!((v[0].magnitude - 50.0).abs() < 1e-9);
     }
 
     #[test]
@@ -540,6 +652,7 @@ mod tests {
                 kind: ViolationKind::BelowMin,
                 actual: 10.0,
                 bound: 40.0,
+                magnitude: 30.0,
             },
             BoundViolation {
                 scope: BoundScope::Plan,
@@ -547,6 +660,7 @@ mod tests {
                 kind: ViolationKind::AboveMax,
                 actual: 120.0,
                 bound: 100.0,
+                magnitude: 20.0,
             },
         ];
         assert!((violation_magnitude(&vs) - 50.0).abs() < 1e-9);
@@ -613,5 +727,132 @@ mod tests {
         let v = evaluate_schedule(&bounds, &per_day, &per_meal, &plan);
         assert_eq!(v.len(), 3);
         assert!((violation_magnitude(&v) - (10.0 + 10.0 + 60.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ratio_toml_round_trip() {
+        let b = NutritionBounds::from_toml_str(
+            r#"
+            [per_day]
+            ratio = { protein = 35, fat = 30, carb = 35 }
+            [per_meal]
+            ratio = { protein = 40, tolerance = 8 }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(b.per_day.ratio.protein, Some(35.0));
+        assert_eq!(b.per_day.ratio.carb, Some(35.0));
+        assert_eq!(b.per_day.ratio.tolerance, None);
+        assert!((b.per_day.ratio.effective_tolerance() - DEFAULT_RATIO_TOLERANCE).abs() < 1e-9);
+        assert_eq!(b.per_meal.ratio.tolerance, Some(8.0));
+        assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn ratio_validate_rejects_out_of_range_share() {
+        let err = NutritionBounds::from_toml_str(
+            r#"
+            [per_day]
+            ratio = { protein = 150 }
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("ratio"), "{err:#}");
+    }
+
+    #[test]
+    fn ratio_within_band_produces_no_violation() {
+        let bounds = MacroBounds {
+            ratio: MacroRatio {
+                protein: Some(35.0),
+                fat: Some(30.0),
+                carb: Some(35.0),
+                tolerance: None, // default 5 pts
+            },
+            ..Default::default()
+        };
+        // 37/30/33 of 100 g total — all within +/-5 of target.
+        let totals = Macros {
+            protein_g: 37.0,
+            fat_g: 30.0,
+            carbs_g: 33.0,
+            ..Default::default()
+        };
+        let v = evaluate_macros(&bounds, &totals, BoundScope::PerDay { day: 0 });
+        assert!(v.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn ratio_out_of_band_reports_grams_beyond_band() {
+        let bounds = MacroBounds {
+            ratio: MacroRatio {
+                protein: Some(35.0),
+                fat: Some(30.0),
+                carb: Some(35.0),
+                tolerance: None, // default 5 pts => 5 g of 100
+            },
+            ..Default::default()
+        };
+        // 50/25/25 of 100 g: protein 50% (15 over target, 10 beyond band),
+        // carb 25% (10 under target, 5 beyond band), fat 25% (5 under => within band).
+        let totals = Macros {
+            protein_g: 50.0,
+            fat_g: 25.0,
+            carbs_g: 25.0,
+            ..Default::default()
+        };
+        let v = evaluate_macros(&bounds, &totals, BoundScope::PerDay { day: 0 });
+        assert_eq!(v.len(), 2, "{v:?}");
+        let protein = v
+            .iter()
+            .find(|x| x.nutrient == NutrientKind::ProteinG)
+            .unwrap();
+        assert_eq!(protein.kind, ViolationKind::RatioAboveTarget);
+        assert!((protein.actual - 50.0).abs() < 1e-9);
+        assert!((protein.bound - 35.0).abs() < 1e-9);
+        assert!((protein.magnitude - 10.0).abs() < 1e-9);
+        let carb = v
+            .iter()
+            .find(|x| x.nutrient == NutrientKind::CarbsG)
+            .unwrap();
+        assert_eq!(carb.kind, ViolationKind::RatioBelowTarget);
+        assert!((carb.magnitude - 5.0).abs() < 1e-9);
+        assert!((violation_magnitude(&v) - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ratio_skipped_when_no_macro_grams() {
+        let bounds = MacroBounds {
+            ratio: MacroRatio {
+                protein: Some(35.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let v = evaluate_macros(&bounds, &Macros::default(), BoundScope::Plan);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn ratio_tolerance_override_tightens_band() {
+        let bounds = MacroBounds {
+            ratio: MacroRatio {
+                protein: Some(35.0),
+                tolerance: Some(1.0), // +/-1 pt
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // 37% protein: within default 5 but outside a 1-pt band (1 g beyond).
+        let totals = Macros {
+            protein_g: 37.0,
+            fat_g: 30.0,
+            carbs_g: 33.0,
+            ..Default::default()
+        };
+        let v = evaluate_macros(&bounds, &totals, BoundScope::PerDay { day: 0 });
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ViolationKind::RatioAboveTarget);
+        assert!((v[0].magnitude - 1.0).abs() < 1e-9);
     }
 }
