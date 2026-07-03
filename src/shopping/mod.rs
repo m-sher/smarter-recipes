@@ -76,7 +76,10 @@ fn convert_kind(name: &str, amount: f64, from: UnitKind, to: UnitKind) -> Option
 /// ledger: exact-kind match first, then the density-bridged partner kind.
 /// Mutates `stock` (never below zero) so no unit of stock is credited twice.
 /// Returns the unmet remainder.
-fn consume_from_stock(stock: &mut [PantryItem], key: &IngredientKey, need: f64) -> f64 {
+///
+/// Used by shopping to net requirements and by planning for virtual consumption
+/// while scoring quantity-aware coverage.
+pub fn consume_from_stock(stock: &mut [PantryItem], key: &IngredientKey, need: f64) -> f64 {
     let mut remaining = need;
     if let Some(item) = stock
         .iter_mut()
