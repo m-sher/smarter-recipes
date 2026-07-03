@@ -76,7 +76,10 @@ fn convert_kind(name: &str, amount: f64, from: UnitKind, to: UnitKind) -> Option
 /// ledger: exact-kind match first, then the density-bridged partner kind.
 /// Mutates `stock` (never below zero) so no unit of stock is credited twice.
 /// Returns the unmet remainder.
-fn consume_from_stock(stock: &mut [PantryItem], key: &IngredientKey, need: f64) -> f64 {
+///
+/// Used by shopping to net requirements and by planning for virtual consumption
+/// while scoring quantity-aware coverage.
+pub fn consume_from_stock(stock: &mut [PantryItem], key: &IngredientKey, need: f64) -> f64 {
     let mut remaining = need;
     if let Some(item) = stock
         .iter_mut()
@@ -142,25 +145,6 @@ pub fn apply_pantry_to_requirements(
         }
     }
     out
-}
-
-/// Expand pantry identities for planner coverage: mass stock of a density-known
-/// dry good also covers the volume key (and vice versa).
-pub fn pantry_keys_for_planning(pantry: &[PantryItem]) -> HashSet<IngredientKey> {
-    let mut keys = HashSet::new();
-    for item in pantry {
-        keys.insert(item.key.clone());
-        match item.key.kind {
-            UnitKind::Mass if volume_ml_to_mass_g(&item.key.name, 1.0).is_some() => {
-                keys.insert(IngredientKey::new(&item.key.name, UnitKind::Volume));
-            }
-            UnitKind::Volume if volume_ml_to_mass_g(&item.key.name, 1.0).is_some() => {
-                keys.insert(IngredientKey::new(&item.key.name, UnitKind::Mass));
-            }
-            _ => {}
-        }
-    }
-    keys
 }
 
 /// Purchases to add and cooked amounts to deduct when completing a plan trip.

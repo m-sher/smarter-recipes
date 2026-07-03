@@ -12,10 +12,7 @@ use crate::planning::{
 use crate::pricing::{
     enrich_catalog_from_source, FixtureStoreSource, OpenFoodFactsSource, PackageCatalog,
 };
-use crate::shopping::{
-    pantry_keys_for_planning, restock_plan_from_shop, shopping_list_for_plan,
-    trip_breakdown_for_plan,
-};
+use crate::shopping::{restock_plan_from_shop, shopping_list_for_plan, trip_breakdown_for_plan};
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -428,8 +425,7 @@ pub fn run(cli: Cli) -> Result<()> {
             if recipes.is_empty() {
                 bail!("recipe pool is empty; import recipes first");
             }
-            let pantry_items = store.list_pantry()?;
-            let pantry = pantry_keys_for_planning(&pantry_items);
+            let pantry = store.list_pantry()?;
             let cli_nutrition = CliPerDayNutrition {
                 min_kcal,
                 max_kcal,

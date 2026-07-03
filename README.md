@@ -10,7 +10,7 @@ CLI tool that ingests recipes from multiple sources, stores them in a local SQLi
 | **Normalization** | Free-text ingredient lines → name, quantity, unit; units converted to canonical g / ml / ea for aggregation |
 | **Storage** | Embedded SQLite; ingredients deduplicated by `(name, unit kind)`; pantry stock by same identity |
 | **Pantry** | Track on-hand ingredients; mark shopping results as purchased; plan and shop net of stock |
-| **Planning** | Multi-start min-union scheduler, no recipe repeats; pantry keys not counted as “new”; optional nutrition min/max bounds from TOML or per-day CLI flags (documented in `src/planning/mod.rs`) |
+| **Planning** | Multi-start min-union scheduler, no recipe repeats; pantry stock with quantity-aware binary shortfall; optional nutrition min/max bounds from TOML or per-day CLI flags (documented in `src/planning/mod.rs`) |
 | **Shopping** | Package multiset optimization: **cost first**, then **minimum leftover**; requirements reduced by pantry (documented in `src/shopping/mod.rs`) |
 | **Extensibility** | New ingest sources implement `RecipeSourceIngest`; custom package catalogs via JSON overlay |
 
@@ -181,11 +181,11 @@ src/
 4. **New ingest source** — Implement `RecipeSourceIngest` in `ingest/`, wire it in `ingest_from`.
 5. **Density table** — Volume-measured dry goods (flour, sugar, salt, …) convert to mass for realistic packages (`src/pricing/density.rs`).
 6. **Store sources** — `ProductSource` trait with Open Food Facts + fixture backends (`--fetch-prices`). Graceful fallback to the offline catalog.
-7. **Pantry** — On-hand stock feeds planning (keys already covered; presence-only, not quantity) and shopping (quantities subtracted, with mass↔volume density bridging). `pantry restock <plan>` models **buy then cook**: add purchased packages, then deduct the plan’s full requirements, leaving packaging leftovers. Each plan may be restocked once.
+7. **Pantry** — On-hand stock feeds planning and shopping with the same quantity ledger (canonical units, mass↔volume density bridging). Planning uses **binary shortfall**: a key counts as needing to buy iff demand exceeds on-hand quantity after virtual consumption across the schedule; unquantified lines fall back to presence. `pantry restock <plan>` models **buy then cook**: add purchased packages, then deduct the plan’s full requirements, leaving packaging leftovers. Each plan may be restocked once.
 
 ### Planning algorithm (summary)
 
-Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new ingredient keys (relative to pantry + already selected); keep the schedule with the smallest **net** union (`|union − pantry|`). Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. Recipes whose estimated whole-recipe energy is `kcal <= 0` are dropped from the pool (not treated as meals). With nutrition bounds, candidates that break per-meal mins/maxes or a day’s maxes are avoided when possible, and feasible schedules rank above infeasible ones (then least total violation, then min-union). See module docs in `src/planning/mod.rs`.
+Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new **to-buy** keys after quantity-aware pantry consumption (shared with shopping’s stock ledger); keep the schedule with the smallest net to-buy count. Partial stock does not fully exempt a key. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. Recipes whose estimated whole-recipe energy is `kcal <= 0` are dropped from the pool (not treated as meals). With nutrition bounds, candidates that break per-meal mins/maxes or a day’s maxes are avoided when possible, and feasible schedules rank above infeasible ones (then least total violation, then min-union). See module docs in `src/planning/mod.rs`.
 
 ### Nutrition bounds TOML
 
