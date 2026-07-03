@@ -700,7 +700,10 @@ pub fn run(cli: Cli) -> Result<()> {
                         .map(|l| IngredientKey::from_line(l).name),
                 )
                 .into_iter()
-                .filter(|n| crate::nutrition::resolve_profile(n, &extra).is_none())
+                .filter(|n| {
+                    !crate::nutrition::is_probable_junk_name(n)
+                        && crate::nutrition::resolve_profile(n, &extra).is_none()
+                })
                 .collect();
                 // Network runs skip names already tried (positive or negative
                 // cache). A fixture is a local overlay, so it re-checks every
@@ -728,6 +731,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 let mut found = 0usize;
                 let mut missed = 0usize;
                 let mut errored = 0usize;
+                let mut rate_limited = false;
                 for name in names.iter().take(limit) {
                     match source.lookup(name) {
                         Ok(Some(profile)) => {
@@ -743,6 +747,13 @@ pub fn run(cli: Cli) -> Result<()> {
                             missed += 1;
                         }
                         Err(e) => {
+                            // A persistent rate limit means every further request
+                            // will also fail — stop so we don't burn the quota.
+                            if let Some(rl) = e.downcast_ref::<crate::nutrition::RateLimited>() {
+                                eprintln!("  ! stopping: {rl}");
+                                rate_limited = true;
+                                break;
+                            }
                             eprintln!("  ! {name}  ({e:#})");
                             errored += 1;
                         }
@@ -755,6 +766,11 @@ pub fn run(cli: Cli) -> Result<()> {
                     "Cached {found} profile(s), {missed} miss(es), {errored} error(s); \
                      {remaining} name(s) remaining."
                 );
+                if rate_limited {
+                    println!(
+                        "Stopped early due to rate limiting; rerun `nutrition fetch` later to continue."
+                    );
+                }
             }
             NutritionCmd::ClearCache => {
                 let n = store.nutrition_cache_clear()?;

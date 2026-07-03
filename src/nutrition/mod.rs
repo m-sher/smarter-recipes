@@ -24,12 +24,45 @@ pub trait NutritionSource {
     fn lookup(&self, ingredient: &str) -> Result<Option<Macros>>;
 }
 
+/// Throttle between FoodData Central requests to avoid tripping burst limits.
+const FDC_REQUEST_DELAY: Duration = Duration::from_millis(250);
+/// How many times to retry a single request that returns HTTP 429.
+const FDC_MAX_RETRIES: u32 = 3;
+
+/// Returned when FoodData Central keeps replying HTTP 429 after retries, so the
+/// caller can stop the batch instead of burning the remaining quota.
+#[derive(Debug)]
+pub struct RateLimited {
+    pub using_demo_key: bool,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.using_demo_key {
+            write!(
+                f,
+                "FoodData Central rate limit (HTTP 429). The shared DEMO_KEY is heavily throttled; \
+                 set SMARTER_RECIPES_FDC_KEY to a free key from https://api.data.gov/signup/ or retry later"
+            )
+        } else {
+            write!(
+                f,
+                "FoodData Central rate limit (HTTP 429); slow down or retry later"
+            )
+        }
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
 /// USDA FoodData Central search API. Uses `SMARTER_RECIPES_FDC_KEY` when set,
 /// else the public `DEMO_KEY` (rate-limited; fine for occasional fetches).
 pub struct FdcSource {
     client: reqwest::blocking::Client,
     api_key: String,
     pub base_url: String,
+    /// Delay applied before each network request (0 to disable).
+    pub request_delay: Duration,
     /// Canned response body for offline tests.
     pub offline_body: Option<String>,
 }
@@ -45,6 +78,7 @@ impl Default for FdcSource {
             client,
             api_key: std::env::var("SMARTER_RECIPES_FDC_KEY").unwrap_or_else(|_| "DEMO_KEY".into()),
             base_url: "https://api.nal.usda.gov".into(),
+            request_delay: FDC_REQUEST_DELAY,
             offline_body: None,
         }
     }
@@ -59,21 +93,7 @@ impl NutritionSource for FdcSource {
         let body = if let Some(ref b) = self.offline_body {
             b.clone()
         } else {
-            let url = format!(
-                "{}/fdc/v1/foods/search?api_key={}&query={}&dataType=Foundation,SR%20Legacy&pageSize=25",
-                self.base_url.trim_end_matches('/'),
-                self.api_key,
-                crate::net::encode_query(ingredient)
-            );
-            let resp = self
-                .client
-                .get(&url)
-                .send()
-                .context("FoodData Central request")?;
-            if !resp.status().is_success() {
-                bail!("FoodData Central HTTP {}", resp.status());
-            }
-            resp.text()?
+            self.fetch_body(ingredient)?
         };
         // A 2xx body that is not FDC JSON (captive portal, gateway HTML) is an
         // error, not a definitive "no match" — otherwise the caller would
@@ -82,6 +102,72 @@ impl NutritionSource for FdcSource {
             serde_json::from_str(&body).context("FoodData Central response was not JSON")?;
         Ok(parse_fdc_search(&v))
     }
+}
+
+impl FdcSource {
+    /// Perform one search request, throttled and retrying HTTP 429 with backoff.
+    /// A 429 that survives [`FDC_MAX_RETRIES`] surfaces as [`RateLimited`] so the
+    /// caller can stop rather than burn the remaining quota. HTML entities in the
+    /// stored name are decoded so junk like `salt&amp;pepper` still queries well.
+    fn fetch_body(&self, ingredient: &str) -> Result<String> {
+        let query = crate::net::decode_html_entities(ingredient);
+        let url = format!(
+            "{}/fdc/v1/foods/search?api_key={}&query={}&dataType=Foundation,SR%20Legacy&pageSize=25",
+            self.base_url.trim_end_matches('/'),
+            self.api_key,
+            crate::net::encode_query(&query)
+        );
+        if self.request_delay > Duration::ZERO {
+            std::thread::sleep(self.request_delay);
+        }
+        let mut attempt = 0u32;
+        loop {
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .context("FoodData Central request")?;
+            let status = resp.status();
+            if status.as_u16() == 429 {
+                if attempt >= FDC_MAX_RETRIES {
+                    return Err(anyhow::Error::new(RateLimited {
+                        using_demo_key: self.api_key == "DEMO_KEY",
+                    }));
+                }
+                let wait = retry_after(resp.headers()).unwrap_or_else(|| backoff(attempt));
+                std::thread::sleep(wait);
+                attempt += 1;
+                continue;
+            }
+            if !status.is_success() {
+                bail!("FoodData Central HTTP {status}");
+            }
+            return resp.text().context("reading FoodData Central body");
+        }
+    }
+}
+
+/// Retry delay from a `Retry-After` header (seconds form), capped at 60s.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    parse_retry_after_secs(raw)
+}
+
+fn parse_retry_after_secs(raw: &str) -> Option<Duration> {
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_secs(secs.min(60)))
+}
+
+/// Exponential backoff for retry `attempt` (0-based): 0.5s, 1s, 2s, … capped 8s.
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_millis((500u64 << attempt.min(4)).min(8_000))
+}
+
+/// True for names not worth an FDC lookup: empty, or HTML-entity leftovers
+/// (e.g. `&nbsp`) that slipped past ingest cleaning in already-stored recipes.
+pub fn is_probable_junk_name(name: &str) -> bool {
+    let t = name.trim();
+    t.is_empty() || t.starts_with('&') || !t.chars().any(|c| c.is_alphabetic())
 }
 
 /// Extract per-100 g macros from an FDC search response, preferring the food
@@ -596,6 +682,42 @@ mod tests {
             ..Default::default()
         };
         assert!(src.lookup("flour").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_retry_after_reads_seconds_and_caps() {
+        assert_eq!(parse_retry_after_secs("5"), Some(Duration::from_secs(5)));
+        assert_eq!(
+            parse_retry_after_secs(" 12 "),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            parse_retry_after_secs("100000"),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_retry_after_secs("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        );
+        assert_eq!(parse_retry_after_secs("nonsense"), None);
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(backoff(0), Duration::from_millis(500));
+        assert_eq!(backoff(1), Duration::from_millis(1000));
+        assert_eq!(backoff(2), Duration::from_millis(2000));
+        assert!(backoff(10) <= Duration::from_millis(8000));
+    }
+
+    #[test]
+    fn junk_names_are_skipped() {
+        assert!(is_probable_junk_name("&nbsp"));
+        assert!(is_probable_junk_name(""));
+        assert!(is_probable_junk_name("   "));
+        assert!(is_probable_junk_name("1/2"));
+        assert!(!is_probable_junk_name("olive oil"));
+        assert!(!is_probable_junk_name("(1 oz) taco seasoning"));
     }
 
     #[test]

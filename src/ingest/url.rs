@@ -124,7 +124,17 @@ fn find_recipe_objects(v: &Value, out: &mut Vec<Value>) {
     }
 }
 
+/// Collect string values from a JSON-LD field, decoding HTML entities. JSON-LD
+/// is plain JSON, so sites that embed `&nbsp;` / `&amp;` in `recipeIngredient`
+/// values would otherwise leak them into ingredient names.
 fn json_ld_string_list(v: &Value) -> Vec<String> {
+    raw_json_ld_string_list(v)
+        .into_iter()
+        .map(|s| crate::net::decode_html_entities(&s))
+        .collect()
+}
+
+fn raw_json_ld_string_list(v: &Value) -> Vec<String> {
     match v {
         Value::String(s) => vec![s.clone()],
         Value::Array(arr) => arr
@@ -464,6 +474,36 @@ mod tests {
         assert_eq!(r.ingredients.len(), 3);
         assert_eq!(r.steps.len(), 2);
         assert_eq!(r.meta.author.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn json_ld_ingredients_decode_html_entities() {
+        // Sites embed raw HTML entities in JSON-LD `recipeIngredient` values;
+        // they must not leak into ingredient text (regression for "&nbsp").
+        let html = r#"
+        <html><head>
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Recipe","name":"Entity Test",
+         "recipeIngredient":["salt &amp; pepper","1 cup&nbsp;flour"]}
+        </script>
+        </head><body></body></html>
+        "#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let r = src.ingest("https://example.com/e").unwrap();
+        let originals: Vec<&str> = r.ingredients.iter().map(|l| l.original.as_str()).collect();
+        assert!(
+            originals
+                .iter()
+                .all(|o| !o.contains("&nbsp") && !o.contains("&amp")),
+            "raw entities leaked: {originals:?}"
+        );
+        assert!(
+            originals.iter().any(|o| o.contains("salt & pepper")),
+            "{originals:?}"
+        );
     }
 
     #[test]
