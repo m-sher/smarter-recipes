@@ -164,6 +164,39 @@ fn parse_servings(v: &Value) -> Option<f64> {
     }
 }
 
+/// First numeric value in a nutrition string, e.g. `"344 kcal"`, `"12.5 g"`,
+/// `"1,234 kcal"` (thousands separators stripped).
+fn leading_number(s: &str) -> Option<f64> {
+    let cleaned = s.replace(',', "");
+    let start = cleaned.find(|c: char| c.is_ascii_digit())?;
+    let tail = &cleaned[start..];
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(tail.len());
+    tail[..end].parse().ok()
+}
+
+fn nutrition_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => leading_number(s),
+        _ => None,
+    }
+}
+
+/// Parse a schema.org `NutritionInformation` object (per serving).
+fn nutrition_from_json_ld(v: &Value) -> Option<crate::domain::Nutrition> {
+    let obj = v.as_object()?;
+    let get = |k: &str| obj.get(k).and_then(nutrition_number);
+    let n = crate::domain::Nutrition {
+        kcal: get("calories"),
+        protein_g: get("proteinContent"),
+        fat_g: get("fatContent"),
+        carbs_g: get("carbohydrateContent"),
+    };
+    (!n.is_empty()).then_some(n)
+}
+
 fn recipe_from_json_ld(obj: &Value) -> Option<Recipe> {
     let title = obj.get("name").and_then(|n| n.as_str())?.to_string();
 
@@ -190,6 +223,9 @@ fn recipe_from_json_ld(obj: &Value) -> Option<Recipe> {
     }
     if let Some(cats) = obj.get("recipeCategory") {
         meta.tags = json_ld_string_list(cats);
+    }
+    if let Some(n) = obj.get("nutrition") {
+        meta.nutrition = nutrition_from_json_ld(n);
     }
     // Prefer schema.org Recipe url, then absolute http(s) @id.
     if let Some(u) = obj
@@ -499,5 +535,44 @@ mod tests {
         let r = src.ingest(fetch).unwrap();
         // A site-root fragment @id would collapse all recipes to one identity.
         assert_eq!(r.meta.source_url.as_deref(), Some(fetch));
+    }
+
+    #[test]
+    fn json_ld_nutrition_parsed_per_serving() {
+        let html = r#"<script type="application/ld+json">
+          {"@context":"https://schema.org","@type":"Recipe","name":"N",
+           "recipeIngredient":["1 cup flour"],
+           "nutrition":{"@type":"NutritionInformation","calories":"344 kcal",
+                        "proteinContent":"12.5 g","fatContent":"9 g",
+                        "carbohydrateContent":"52 g"}}
+        </script>"#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let r = src.ingest("https://example.com/n").unwrap();
+        let n = r.meta.nutrition.expect("nutrition captured");
+        assert_eq!(n.kcal, Some(344.0));
+        assert_eq!(n.protein_g, Some(12.5));
+        assert_eq!(n.fat_g, Some(9.0));
+        assert_eq!(n.carbs_g, Some(52.0));
+    }
+
+    #[test]
+    fn json_ld_nutrition_absent_or_empty_is_none() {
+        let html = r#"<script type="application/ld+json">
+          {"@context":"https://schema.org","@type":"Recipe","name":"M",
+           "recipeIngredient":["1 egg"],
+           "nutrition":{"@type":"NutritionInformation","calories":"unknown"}}
+        </script>"#;
+        let src = UrlSource {
+            offline_html: Some(html.into()),
+            ..Default::default()
+        };
+        let r = src.ingest("https://example.com/m").unwrap();
+        assert!(r.meta.nutrition.is_none());
+        assert_eq!(leading_number("1,234 kcal"), Some(1234.0));
+        assert_eq!(leading_number("about 20g"), Some(20.0));
+        assert_eq!(leading_number("n/a"), None);
     }
 }

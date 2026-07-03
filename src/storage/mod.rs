@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS plan_restocks (
     restocked_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS nutrition_cache (
+    name TEXT PRIMARY KEY,
+    kcal REAL,
+    protein_g REAL,
+    fat_g REAL,
+    carbs_g REAL,
+    found INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_recipes_title ON recipes(title);
 CREATE INDEX IF NOT EXISTS idx_ri_ingredient ON recipe_ingredients(ingredient_id);
 "#;
@@ -665,6 +674,58 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// Cached per-100 g macro profiles from network lookups. `found = 0` rows
+    /// are negative cache (name was searched, no usable result).
+    pub fn nutrition_cache_all(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Option<crate::domain::Macros>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, kcal, protein_g, fat_g, carbs_g, found FROM nutrition_cache")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let found: i64 = row.get(5)?;
+                let profile = if found != 0 {
+                    Some(crate::domain::Macros {
+                        kcal: row.get(1)?,
+                        protein_g: row.get(2)?,
+                        fat_g: row.get(3)?,
+                        carbs_g: row.get(4)?,
+                    })
+                } else {
+                    None
+                };
+                Ok((name, profile))
+            })?
+            .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Insert or update one cache row; `None` records a negative result.
+    pub fn nutrition_cache_put(
+        &self,
+        name: &str,
+        profile: Option<&crate::domain::Macros>,
+    ) -> Result<()> {
+        match profile {
+            Some(m) => self.conn.execute(
+                "INSERT INTO nutrition_cache (name, kcal, protein_g, fat_g, carbs_g, found)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)
+                 ON CONFLICT(name) DO UPDATE SET kcal=excluded.kcal, protein_g=excluded.protein_g,
+                   fat_g=excluded.fat_g, carbs_g=excluded.carbs_g, found=1",
+                params![name, m.kcal, m.protein_g, m.fat_g, m.carbs_g],
+            )?,
+            None => self.conn.execute(
+                "INSERT INTO nutrition_cache (name, kcal, protein_g, fat_g, carbs_g, found)
+                 VALUES (?1, NULL, NULL, NULL, NULL, 0)
+                 ON CONFLICT(name) DO UPDATE SET found=0",
+                params![name],
+            )?,
+        };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -886,5 +947,27 @@ mod tests {
         let keys = store.pantry_keys().unwrap();
         assert!(keys.contains(&IngredientKey::new("butter", UnitKind::Mass)));
         assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn nutrition_cache_roundtrip_with_negative() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let m = crate::domain::Macros {
+            kcal: 100.0,
+            protein_g: 1.0,
+            fat_g: 2.0,
+            carbs_g: 3.0,
+        };
+        store.nutrition_cache_put("tahini", Some(&m)).unwrap();
+        store.nutrition_cache_put("unobtainium", None).unwrap();
+        let all = store.nutrition_cache_all().unwrap();
+        assert_eq!(all.get("tahini").unwrap().unwrap().kcal, 100.0);
+        assert!(all.get("unobtainium").unwrap().is_none());
+        // update overwrites
+        let m2 = crate::domain::Macros { kcal: 200.0, ..m };
+        store.nutrition_cache_put("tahini", Some(&m2)).unwrap();
+        let all = store.nutrition_cache_all().unwrap();
+        assert_eq!(all.get("tahini").unwrap().unwrap().kcal, 200.0);
     }
 }

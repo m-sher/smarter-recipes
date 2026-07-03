@@ -308,35 +308,13 @@ impl PackageCatalog {
         }
     }
 
-    /// Base names to try for catalog lookup (full name, last token, known synonyms).
-    fn name_candidates(name: &str) -> Vec<String> {
-        let n = name.to_lowercase();
-        let mut out = vec![n.clone()];
-        // Last whitespace-separated token (e.g. flour from "all-purpose flour")
-        if let Some(last) = n.split_whitespace().last() {
-            let last = last.trim_matches('-').to_string();
-            if last != n {
-                out.push(last);
-            }
-        }
-        // Also try last hyphen segment of last token
-        if let Some(last) = n.split_whitespace().last() {
-            if let Some(seg) = last.split('-').next_back() {
-                if !out.iter().any(|x| x == seg) {
-                    out.push(seg.to_string());
-                }
-            }
-        }
-        out
-    }
-
     /// Resolve packages for an ingredient key without density conversion.
     pub fn packages_for(&self, key: &IngredientKey) -> Vec<Package> {
         self.packages_for_kind(&key.name, key.kind)
     }
 
     fn packages_for_kind(&self, name: &str, kind: UnitKind) -> Vec<Package> {
-        let candidates = Self::name_candidates(name);
+        let candidates = crate::domain::name_candidates(name);
         // Try name#kind for each candidate
         for cand in &candidates {
             let kind_key = format!("{}#{}", cand, Self::kind_suffix(kind));
