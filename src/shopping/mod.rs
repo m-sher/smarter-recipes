@@ -147,25 +147,6 @@ pub fn apply_pantry_to_requirements(
     out
 }
 
-/// Expand pantry identities for planner coverage: mass stock of a density-known
-/// dry good also covers the volume key (and vice versa).
-pub fn pantry_keys_for_planning(pantry: &[PantryItem]) -> HashSet<IngredientKey> {
-    let mut keys = HashSet::new();
-    for item in pantry {
-        keys.insert(item.key.clone());
-        match item.key.kind {
-            UnitKind::Mass if volume_ml_to_mass_g(&item.key.name, 1.0).is_some() => {
-                keys.insert(IngredientKey::new(&item.key.name, UnitKind::Volume));
-            }
-            UnitKind::Volume if volume_ml_to_mass_g(&item.key.name, 1.0).is_some() => {
-                keys.insert(IngredientKey::new(&item.key.name, UnitKind::Mass));
-            }
-            _ => {}
-        }
-    }
-    keys
-}
-
 /// Purchases to add and cooked amounts to deduct when completing a plan trip.
 ///
 /// Apply **additions first**, then **deductions**. With an empty pantry the net
