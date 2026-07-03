@@ -7,15 +7,20 @@ mod crawl;
 mod file;
 mod manual;
 mod ocr;
+mod search;
 mod url;
 
 pub use crawl::{
     discover_recipe_links, discover_scoped_links, is_listing_url, normalize_url, recipe_source_url,
-    scrape_new_recipes, HttpFetcher, ScrapeEvent, ScrapeOutcome,
+    scrape_from_seeds, scrape_new_recipes, HttpFetcher, ScrapeEvent, ScrapeOutcome, ScrapeParams,
 };
 pub use file::FileSource;
 pub use manual::read_manual_recipe;
 pub use ocr::ImageOcrSource;
+pub use search::{
+    duckduckgo_search_url, parse_duckduckgo_results, search_result_urls, search_scrape_recipes,
+    unwrap_ddg_redirect,
+};
 pub use url::UrlSource;
 
 use crate::domain::Recipe;

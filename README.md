@@ -71,6 +71,17 @@ smarter-recipes scrape 'https://example.com/category/chicken' --depth 3 --limit 
 smarter-recipes scrape 'https://example.com/recipes' --dry-run
 smarter-recipes scrape 'https://example.com/recipes' --retry-failed
 
+# Search DuckDuckGo, then multi-host BFS from result URLs (same identity rules).
+# --pages is how many SERP pages to load; --limit is site-page fetch budget;
+# --depth is same-host expansion from each result (default 2).
+#
+# Tip: prefer specific dish/ingredient queries ("chicken parmesan recipe",
+# "overnight oats"). Broad "best / ideas / high protein dinners" queries often
+# land on JS-rendered listicle pages; static HTML crawling finds mostly site nav
+# and may import few or no recipes. No headless browser — by design.
+smarter-recipes search-scrape 'chicken parmesan recipe' --limit 50 --jobs 8 --depth 2 --pages 2
+smarter-recipes search-scrape 'overnight oats' --limit 80 --dry-run
+
 # Browse
 smarter-recipes list
 smarter-recipes list --filter pasta
