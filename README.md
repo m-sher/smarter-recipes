@@ -185,7 +185,7 @@ src/
 
 ### Planning algorithm (summary)
 
-Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new ingredient keys (relative to pantry + already selected); keep the schedule with the smallest **net** union (`|union − pantry|`). Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. With nutrition bounds, candidates that break per-meal mins/maxes or a day’s maxes are avoided when possible, and feasible schedules rank above infeasible ones (then least total violation, then min-union). See module docs in `src/planning/mod.rs`.
+Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new ingredient keys (relative to pantry + already selected); keep the schedule with the smallest **net** union (`|union − pantry|`). Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. Recipes whose estimated whole-recipe energy is `kcal <= 0` are dropped from the pool (not treated as meals). With nutrition bounds, candidates that break per-meal mins/maxes or a day’s maxes are avoided when possible, and feasible schedules rank above infeasible ones (then least total violation, then min-union). See module docs in `src/planning/mod.rs`.
 
 ### Nutrition bounds TOML
 

@@ -96,6 +96,7 @@ fn plan_respects_per_day_protein_config() {
     macros.insert(
         RecipeId::from("d1"),
         Macros {
+            kcal: 800.0,
             protein_g: 5.0,
             ..Default::default()
         },
@@ -103,6 +104,7 @@ fn plan_respects_per_day_protein_config() {
     macros.insert(
         RecipeId::from("d2"),
         Macros {
+            kcal: 700.0,
             protein_g: 4.0,
             ..Default::default()
         },
@@ -110,6 +112,7 @@ fn plan_respects_per_day_protein_config() {
     macros.insert(
         RecipeId::from("p1"),
         Macros {
+            kcal: 500.0,
             protein_g: 60.0,
             ..Default::default()
         },

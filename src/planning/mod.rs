@@ -19,6 +19,11 @@
 //! plan-total min/max ranges; if none are feasible, return the least total
 //! violation (then min-union) and list violations in the rationale.
 //!
+//! When [`PlanOptions::recipe_macros`] contains an estimate for a recipe with
+//! `kcal <= 0`, that recipe is dropped from the pool entirely (not a meal).
+//! Recipes omitted from the map are left untouched for callers that do not
+//! compute estimates.
+//!
 //! # Algorithm
 //!
 //! Exact minimum-union subset selection is combinatorial. For household-scale
@@ -104,13 +109,24 @@ fn recipe_keys(recipe: &Recipe) -> HashSet<IngredientKey> {
         .collect()
 }
 
+/// True when a precomputed estimate exists and reports no calories.
+fn is_zero_kcal_meal(recipe_macros: &HashMap<RecipeId, Macros>, id: &RecipeId) -> bool {
+    recipe_macros
+        .get(id)
+        .is_some_and(|m| m.kcal <= 0.0 || !m.kcal.is_finite())
+}
+
 /// Deduplicate by `recipe_id`, drop empty-ingredient recipes when any non-empty
-/// recipe exists, then collapse by normalized title key (first wins among
-/// survivors). Empty filtering must run before title collapse so an empty stub
-/// cannot claim a title and block a fuller same-title recipe. Returns recipes
-/// paired with precomputed key sets so `recipe_keys` runs once per id-unique
-/// recipe.
-fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>) {
+/// recipe exists, drop recipes whose precomputed estimate is zero kcal, then
+/// collapse by normalized title key (first wins among survivors). Empty
+/// filtering must run before title collapse so an empty stub cannot claim a
+/// title and block a fuller same-title recipe. Returns recipes paired with
+/// precomputed key sets so `recipe_keys` runs once per id-unique recipe, plus
+/// how many candidates were removed for zero estimated calories.
+fn normalize_pool<'a>(
+    pool: &'a [Recipe],
+    recipe_macros: &HashMap<RecipeId, Macros>,
+) -> (Vec<&'a Recipe>, Vec<HashSet<IngredientKey>>, usize) {
     // Phase 1: id-dedupe and precompute keys.
     let mut seen_ids = HashSet::new();
     let mut recipes: Vec<&Recipe> = Vec::new();
@@ -137,7 +153,20 @@ fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>
         }
     }
 
-    // Phase 3: title-key first-wins among survivors only.
+    // Phase 3: drop recipes with a known non-positive calorie estimate.
+    let mut dropped_zero_kcal = 0usize;
+    let mut i = 0;
+    while i < recipes.len() {
+        if is_zero_kcal_meal(recipe_macros, &recipes[i].id) {
+            recipes.remove(i);
+            keys.remove(i);
+            dropped_zero_kcal += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Phase 4: title-key first-wins among survivors only.
     let mut seen_titles = HashSet::new();
     let mut out_recipes: Vec<&Recipe> = Vec::new();
     let mut out_keys: Vec<HashSet<IngredientKey>> = Vec::new();
@@ -149,7 +178,7 @@ fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>
         out_recipes.push(r);
         out_keys.push(k);
     }
-    (out_recipes, out_keys)
+    (out_recipes, out_keys, dropped_zero_kcal)
 }
 
 /// Full union size of ingredient keys for recipes at the given pool indices.
@@ -455,16 +484,25 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let pantry = &opts.pantry;
     let bounds = &opts.nutrition;
 
-    let (pool, keys) = normalize_pool(pool);
+    let (pool, keys, dropped_zero_kcal) = normalize_pool(pool, &opts.recipe_macros);
     let macros = align_macros(&pool, opts);
 
     if pool.is_empty() || slots == 0 {
+        let rationale = if slots == 0 {
+            "Empty pool or zero slots; no meals planned.".into()
+        } else if dropped_zero_kcal > 0 {
+            format!(
+                "No meals planned: all {dropped_zero_kcal} candidate recipe(s) had no estimated calories (kcal <= 0), so none qualify as meals."
+            )
+        } else {
+            "Empty pool or zero slots; no meals planned.".into()
+        };
         return MealPlan {
             id: plan_id,
             days: opts.days,
             meals_per_day: opts.meals_per_day,
             meals: vec![],
-            rationale: "Empty pool or zero slots; no meals planned.".into(),
+            rationale,
         };
     }
 
@@ -537,6 +575,14 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         })
         .collect();
 
+    let zero_kcal_note = if dropped_zero_kcal > 0 {
+        format!(
+            " Excluded {dropped_zero_kcal} recipe(s) with no estimated calories (kcal <= 0; not treated as meals)."
+        )
+    } else {
+        String::new()
+    };
+
     let partial_note = if meals.len() < slots {
         format!(
             " Pool has only {} unique non-empty recipe(s); requested {} slot(s), so the plan is partial (repeats are never used).",
@@ -571,7 +617,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let rationale = format!(
         "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
          Multi-start greedy selection minimizes distinct ingredient keys \
-         (no recipe repeats). {pantry_note}{nutrition_note}{partial_note}",
+         (no recipe repeats). {pantry_note}{zero_kcal_note}{nutrition_note}{partial_note}",
         meals.len(),
         opts.days,
         pool.len(),
@@ -1143,6 +1189,7 @@ mod tests {
             (
                 "d1",
                 Macros {
+                    kcal: 500.0,
                     protein_g: 5.0,
                     ..Default::default()
                 },
@@ -1150,6 +1197,7 @@ mod tests {
             (
                 "d2",
                 Macros {
+                    kcal: 400.0,
                     protein_g: 4.0,
                     ..Default::default()
                 },
@@ -1183,6 +1231,99 @@ mod tests {
     }
 
     #[test]
+    fn zero_kcal_recipes_excluded_from_pool() {
+        let real = rec_with_id("real", "Chicken", &["200 g chicken"]);
+        let zero = rec_with_id("zero", "Wonton Guide", &["wonton wrappers"]);
+        let also_zero = rec_with_id("z2", "Kabobs", &["8 pretzel sticks"]);
+        let macros = macro_map(&[
+            (
+                "real",
+                Macros {
+                    kcal: 400.0,
+                    protein_g: 50.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "zero",
+                Macros {
+                    kcal: 0.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "z2",
+                Macros {
+                    kcal: 0.0,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let pool = vec![real, zero, also_zero];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 3,
+                meals_per_day: 1,
+                recipe_macros: macros,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 1);
+        assert_eq!(plan.meals[0].recipe_title, "Chicken");
+        assert!(
+            plan.rationale
+                .to_lowercase()
+                .contains("no estimated calories")
+                || plan.rationale.to_lowercase().contains("zero kcal"),
+            "rationale should mention exclusion: {}",
+            plan.rationale
+        );
+        assert!(plan.rationale.contains("partial"));
+    }
+
+    #[test]
+    fn missing_macro_entry_not_treated_as_zero_kcal() {
+        // Legacy callers that omit recipe_macros keep prior scheduling behavior.
+        let a = rec_with_id("a", "Guide", &["wonton wrappers"]);
+        let b = rec_with_id("b", "Soup", &["1 cup broth"]);
+        let plan = plan_meals(
+            &[a, b],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 2);
+    }
+
+    #[test]
+    fn all_zero_kcal_pool_plans_nothing() {
+        let a = rec_with_id("a", "A", &["x"]);
+        let b = rec_with_id("b", "B", &["y"]);
+        let macros = macro_map(&[("a", Macros::default()), ("b", Macros::default())]);
+        let plan = plan_meals(
+            &[a, b],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                recipe_macros: macros,
+                ..Default::default()
+            },
+        );
+        assert!(plan.meals.is_empty());
+        assert!(
+            plan.rationale
+                .to_lowercase()
+                .contains("no estimated calories")
+                || plan.rationale.to_lowercase().contains("zero kcal"),
+            "{}",
+            plan.rationale
+        );
+    }
+
+    #[test]
     fn per_meal_min_filters_too_low_protein_recipe() {
         let low = rec_with_id("low", "Broth", &["1 cup broth"]);
         let high = rec_with_id("high", "Steak", &["200 g beef"]);
@@ -1191,6 +1332,7 @@ mod tests {
             (
                 "low",
                 Macros {
+                    kcal: 50.0,
                     protein_g: 2.0,
                     ..Default::default()
                 },
@@ -1198,6 +1340,7 @@ mod tests {
             (
                 "high",
                 Macros {
+                    kcal: 400.0,
                     protein_g: 40.0,
                     ..Default::default()
                 },
@@ -1205,6 +1348,7 @@ mod tests {
             (
                 "other",
                 Macros {
+                    kcal: 200.0,
                     protein_g: 18.0,
                     ..Default::default()
                 },
