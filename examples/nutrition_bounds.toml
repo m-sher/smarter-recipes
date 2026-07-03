@@ -2,11 +2,12 @@
 # Values are whole-recipe estimated macros summed per scope.
 
 [per_day]
-protein_g = { min = 50.0, max = 200.0 }
-kcal = { max = 3000.0 }
+protein_g = { min = 80.0, max = 150.0 }
+kcal = { min = 800, max = 1600.0 }
+fat_g = { max = 100 }
+carbs_g = { max = 100 }
+ratio = { protein = 35, fat = 30, carb = 35 }
 
 [per_meal]
-protein_g = { min = 15.0 }
 
 [plan]
-protein_g = { min = 350.0 }

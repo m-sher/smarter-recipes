@@ -73,12 +73,13 @@
 //! Complexity: O(P² · S · K) where P = pool size, S = slots, K = avg keys/recipe
 //! — fine for tens to low hundreds of recipes.
 
+mod ilp;
 mod nutrition_bounds;
 
 pub use nutrition_bounds::{
     evaluate_macros, evaluate_schedule, exceeds_max, load_nutrition_bounds, min_deficit,
     violates_per_meal, violation_magnitude, BoundScope, BoundViolation, CliPerDayNutrition,
-    MacroBounds, MacroRange, NutrientKind, NutritionBounds, ViolationKind,
+    MacroBounds, MacroRange, MacroRatio, NutrientKind, NutritionBounds, ViolationKind,
 };
 
 use crate::domain::{
@@ -503,6 +504,38 @@ fn better_scored(pool: &[&Recipe], a: &ScoredSchedule, b: &ScoredSchedule) -> bo
     lex_better_schedule(pool, &a.indices, &b.indices)
 }
 
+/// Greedy fallback for the constrained path: multi-start greedy ranked by
+/// [`better_scored`]. Used when the exact solver declines (too large, error, or
+/// time budget). Never worse than the pre-ILP behavior.
+fn greedy_constrained_scored(input: &GreedyInput<'_>, target: usize) -> ScoredSchedule {
+    let mut best: Option<ScoredSchedule> = None;
+    for seed in 0..input.pool.len() {
+        let indices = greedy_from_seed(input, seed, target);
+        let candidate = score_schedule(
+            input.pool,
+            input.reqs,
+            input.macros,
+            indices,
+            input.pantry,
+            input.bounds,
+            input.meals_per_day,
+        );
+        let take = match &best {
+            None => true,
+            Some(b) => better_scored(input.pool, &candidate, b),
+        };
+        if take {
+            best = Some(candidate);
+        }
+    }
+    best.unwrap_or_else(|| ScoredSchedule {
+        indices: Vec::new(),
+        net_union: 0,
+        magnitude: 0.0,
+        violations: Vec::new(),
+    })
+}
+
 /// When every recipe must be used, multi-start only reorders. Build one order
 /// greedily from the lexicographically smallest (title, id) seed.
 fn order_full_pool(input: &GreedyInput<'_>) -> Vec<usize> {
@@ -591,6 +624,9 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         meals_per_day: mpd,
     };
 
+    // Track whether the exact solver produced the constrained plan (for the
+    // rationale lead); the greedy fallback labels itself best-effort.
+    let mut planner_ilp = false;
     let scored = if target == pool.len() && bounds.is_empty() {
         let indices = order_full_pool(&input);
         score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd)
@@ -610,24 +646,15 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         let indices = best.map(|(s, _)| s).unwrap_or_default();
         score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd)
     } else {
-        let mut best: Option<ScoredSchedule> = None;
-        for seed in 0..pool.len() {
-            let indices = greedy_from_seed(&input, seed, target);
-            let candidate = score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd);
-            let take = match &best {
-                None => true,
-                Some(b) => better_scored(&pool, &candidate, b),
-            };
-            if take {
-                best = Some(candidate);
+        // Non-empty bounds: solve the selection exactly, falling back to the
+        // greedy planner when the solver declines.
+        match ilp::solve_constrained(&input, target) {
+            Some(indices) => {
+                planner_ilp = true;
+                score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd)
             }
+            None => greedy_constrained_scored(&input, target),
         }
-        best.unwrap_or_else(|| ScoredSchedule {
-            indices: Vec::new(),
-            net_union: 0,
-            magnitude: 0.0,
-            violations: Vec::new(),
-        })
     };
 
     let selected = &scored.indices;
@@ -688,14 +715,35 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         )
     };
 
-    let rationale = format!(
-        "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
-         Multi-start greedy selection minimizes distinct ingredient keys \
-         (no recipe repeats). {pantry_note}{zero_kcal_note}{nutrition_note}{partial_note}",
-        meals.len(),
-        opts.days,
-        pool.len(),
-    );
+    let rationale = if bounds.is_empty() {
+        format!(
+            "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
+             Multi-start greedy selection minimizes distinct ingredient keys \
+             (no recipe repeats). {pantry_note}{zero_kcal_note}{nutrition_note}{partial_note}",
+            meals.len(),
+            opts.days,
+            pool.len(),
+        )
+    } else {
+        let (lead, method) = if planner_ilp {
+            (
+                "Exact ILP planner",
+                "Integer optimization minimizes distinct ingredient keys under the configured nutrition bounds",
+            )
+        } else {
+            (
+                "Best-effort planner",
+                "Greedy fallback minimizes distinct ingredient keys under the configured nutrition bounds",
+            )
+        };
+        format!(
+            "{lead}: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
+             {method} (no recipe repeats). {pantry_note}{zero_kcal_note}{nutrition_note}{partial_note}",
+            meals.len(),
+            opts.days,
+            pool.len(),
+        )
+    };
 
     MealPlan {
         id: plan_id,
@@ -1599,5 +1647,363 @@ mod tests {
             "{}",
             plan.rationale
         );
+    }
+
+    #[test]
+    fn ilp_selects_protein_meal_exactly() {
+        // Feasible per-day case: exactly 2 meals, must include the protein dish,
+        // and the plan is feasible (drives the flat single-day ILP path).
+        let (pool, macros) = dessert_protein_pool();
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(50.0),
+                    max: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 2,
+            nutrition: nutrition.clone(),
+            recipe_macros: macros.clone(),
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 2);
+        assert!(titles(&plan).contains(&"Chicken Rice"));
+        assert!(plan_bound_violations(&pool, &plan, &nutrition, &macros).is_empty());
+        assert!(plan.rationale.contains("Exact ILP planner"));
+    }
+
+    fn balanced_protein_pool() -> (Vec<Recipe>, HashMap<RecipeId, Macros>) {
+        let c1 = rec_with_id("c1", "Chicken A", &["200 g chicken", "100 g rice"]);
+        let c2 = rec_with_id("c2", "Chicken B", &["200 g chicken", "100 g beans"]);
+        let k1 = rec_with_id("k1", "Cake A", &["100 g sugar", "100 g flour"]);
+        let k2 = rec_with_id("k2", "Cake B", &["100 g sugar", "50 g cocoa"]);
+        let macros = macro_map(&[
+            (
+                "c1",
+                Macros {
+                    kcal: 500.0,
+                    protein_g: 60.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "c2",
+                Macros {
+                    kcal: 500.0,
+                    protein_g: 60.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "k1",
+                Macros {
+                    kcal: 800.0,
+                    protein_g: 5.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "k2",
+                Macros {
+                    kcal: 700.0,
+                    protein_g: 4.0,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        (vec![c1, c2, k1, k2], macros)
+    }
+
+    #[test]
+    fn ilp_partition_balances_protein_across_days() {
+        // days=2, meals_per_day=2, per-day protein min forces a chicken on each
+        // day (two desserts on a day would fail). Exercises the partition model.
+        let (pool, macros) = balanced_protein_pool();
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(50.0),
+                    max: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = PlanOptions {
+            days: 2,
+            meals_per_day: 2,
+            nutrition: nutrition.clone(),
+            recipe_macros: macros.clone(),
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 4);
+        let violations = plan_bound_violations(&pool, &plan, &nutrition, &macros);
+        assert!(
+            violations.is_empty(),
+            "each day must reach the protein min: {violations:?}"
+        );
+
+        // Pool-order independent: reversed input yields the same plan.
+        let reversed: Vec<Recipe> = pool.iter().rev().cloned().collect();
+        let plan2 = plan_meals(&reversed, &opts);
+        assert_eq!(
+            titles(&plan),
+            titles(&plan2),
+            "partition output must be pool-order independent"
+        );
+    }
+
+    #[test]
+    fn ilp_flat_deterministic_across_pool_order() {
+        let (pool, macros) = dessert_protein_pool();
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(50.0),
+                    max: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 2,
+            nutrition,
+            recipe_macros: macros,
+            ..Default::default()
+        };
+        let p1 = plan_meals(&pool, &opts);
+        let reversed: Vec<Recipe> = pool.iter().rev().cloned().collect();
+        let p2 = plan_meals(&reversed, &opts);
+        assert_eq!(titles(&p1), titles(&p2));
+    }
+
+    #[test]
+    fn ilp_size_guard_falls_back_to_greedy() {
+        // A pool past the integer-variable guard must fall back to the greedy
+        // planner and still return a valid, feasible plan.
+        let mut pool = Vec::new();
+        let mut macros = HashMap::new();
+        for i in 0..130u32 {
+            let id = format!("r{i}");
+            pool.push(rec_with_id(
+                &id,
+                &format!("R{i:03}"),
+                &[&format!("1 cup ing{i}")],
+            ));
+            macros.insert(
+                RecipeId::from(id.as_str()),
+                Macros {
+                    kcal: 200.0,
+                    protein_g: 10.0,
+                    ..Default::default()
+                },
+            );
+        }
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(1.0),
+                    max: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 3,
+                meals_per_day: 1,
+                nutrition,
+                recipe_macros: macros,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 3);
+        assert_eq!(unique_recipe_ids(&plan), 3);
+        assert!(
+            plan.rationale.contains("Best-effort planner"),
+            "large pool should trigger greedy fallback: {}",
+            plan.rationale
+        );
+    }
+
+    #[test]
+    fn ilp_ratio_prefers_balanced_macros() {
+        // A per-day macro-split target should steer selection to the balanced
+        // recipe over a carb-heavy one (flat single-day path).
+        let pool = vec![
+            rec_with_id("bal", "Balanced Bowl", &["100 g mix"]),
+            rec_with_id("sk", "Sugar Bomb", &["100 g sugar"]),
+        ];
+        let macros = macro_map(&[
+            (
+                "bal",
+                Macros {
+                    kcal: 500.0,
+                    protein_g: 30.0,
+                    fat_g: 30.0,
+                    carbs_g: 40.0,
+                },
+            ),
+            (
+                "sk",
+                Macros {
+                    kcal: 500.0,
+                    protein_g: 5.0,
+                    fat_g: 5.0,
+                    carbs_g: 90.0,
+                },
+            ),
+        ]);
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                ratio: MacroRatio {
+                    protein: Some(30.0),
+                    fat: Some(30.0),
+                    carb: Some(40.0),
+                    tolerance: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 1,
+            nutrition: nutrition.clone(),
+            recipe_macros: macros.clone(),
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(titles(&plan), vec!["Balanced Bowl"]);
+        assert!(plan_bound_violations(&pool, &plan, &nutrition, &macros).is_empty());
+    }
+
+    #[test]
+    fn ilp_ratio_infeasible_reports_best_effort() {
+        let pool = vec![rec_with_id("sk", "Sugar Bomb", &["100 g sugar"])];
+        let macros = macro_map(&[(
+            "sk",
+            Macros {
+                kcal: 500.0,
+                protein_g: 5.0,
+                fat_g: 5.0,
+                carbs_g: 90.0,
+            },
+        )]);
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                ratio: MacroRatio {
+                    protein: Some(40.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 1,
+            nutrition: nutrition.clone(),
+            recipe_macros: macros.clone(),
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 1);
+        let v = plan_bound_violations(&pool, &plan, &nutrition, &macros);
+        assert!(
+            v.iter().any(|x| x.kind == ViolationKind::RatioBelowTarget),
+            "expected a ratio violation, got {v:?}"
+        );
+        assert!(plan.rationale.to_lowercase().contains("best effort"));
+    }
+
+    fn ratio_partition_pool() -> (Vec<Recipe>, HashMap<RecipeId, Macros>) {
+        let pool = vec![
+            rec_with_id("p1", "Protein A", &["200 g chicken"]),
+            rec_with_id("p2", "Protein B", &["200 g turkey"]),
+            rec_with_id("c1", "Carb A", &["200 g rice"]),
+            rec_with_id("c2", "Carb B", &["200 g pasta"]),
+        ];
+        let macros = macro_map(&[
+            (
+                "p1",
+                Macros {
+                    kcal: 200.0,
+                    protein_g: 40.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "p2",
+                Macros {
+                    kcal: 200.0,
+                    protein_g: 40.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "c1",
+                Macros {
+                    kcal: 160.0,
+                    carbs_g: 40.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "c2",
+                Macros {
+                    kcal: 160.0,
+                    carbs_g: 40.0,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        (pool, macros)
+    }
+
+    #[test]
+    fn ilp_partition_ratio_balances_and_is_deterministic() {
+        // days=2, mpd=2, per-day 50/50 protein/carb split forces each day to pair
+        // one protein recipe with one carb recipe (partition ratio buckets).
+        let (pool, macros) = ratio_partition_pool();
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                ratio: MacroRatio {
+                    protein: Some(50.0),
+                    fat: None,
+                    carb: Some(50.0),
+                    tolerance: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = PlanOptions {
+            days: 2,
+            meals_per_day: 2,
+            nutrition: nutrition.clone(),
+            recipe_macros: macros.clone(),
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 4);
+        assert!(
+            plan_bound_violations(&pool, &plan, &nutrition, &macros).is_empty(),
+            "each day should balance 50/50 protein/carb"
+        );
+        let reversed: Vec<Recipe> = pool.iter().rev().cloned().collect();
+        let plan2 = plan_meals(&reversed, &opts);
+        assert_eq!(titles(&plan), titles(&plan2));
     }
 }
