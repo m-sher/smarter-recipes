@@ -54,7 +54,17 @@
 //! Complexity: O(P² · S · K) where P = pool size, S = slots, K = avg keys/recipe
 //! — fine for tens to low hundreds of recipes.
 
-use crate::domain::{normalize_title_key, IngredientKey, MealPlan, PlannedMeal, Recipe, RecipeId};
+mod nutrition_bounds;
+
+pub use nutrition_bounds::{
+    evaluate_macros, evaluate_schedule, exceeds_max, load_nutrition_bounds, min_deficit,
+    violates_per_meal, violation_magnitude, BoundScope, BoundViolation, CliPerDayNutrition,
+    MacroBounds, MacroRange, NutrientKind, NutritionBounds, ViolationKind,
+};
+
+use crate::domain::{
+    normalize_title_key, IngredientKey, Macros, MealPlan, PlannedMeal, Recipe, RecipeId,
+};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -63,6 +73,10 @@ pub struct PlanOptions {
     pub meals_per_day: u32,
     /// Ingredient keys already on hand; excluded from "new" cost and net union.
     pub pantry: HashSet<IngredientKey>,
+    /// Optional macro min/max constraints. Empty keeps legacy min-union behavior.
+    pub nutrition: NutritionBounds,
+    /// Precomputed whole-recipe estimated macros (missing ids treat as zero).
+    pub recipe_macros: HashMap<RecipeId, Macros>,
 }
 
 impl Default for PlanOptions {
@@ -71,6 +85,8 @@ impl Default for PlanOptions {
             days: 7,
             meals_per_day: 1,
             pantry: HashSet::new(),
+            nutrition: NutritionBounds::default(),
+            recipe_macros: HashMap::new(),
         }
     }
 }
@@ -736,6 +752,7 @@ mod tests {
             days: 1,
             meals_per_day: 1,
             pantry,
+            ..Default::default()
         };
         let plan = plan_meals(&pool, &opts);
         assert_eq!(plan.meals.len(), 1);
@@ -758,6 +775,7 @@ mod tests {
             days: 2,
             meals_per_day: 1,
             pantry,
+            ..Default::default()
         };
         let plan = plan_meals(&pool, &opts);
         // Full union is 4 (flour, milk, eggs, bread); net after pantry is 2.

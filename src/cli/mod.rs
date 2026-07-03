@@ -396,6 +396,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 days,
                 meals_per_day: per_day,
                 pantry,
+                ..Default::default()
             };
             let plan = plan_meals(&recipes, &opts);
             if json {
