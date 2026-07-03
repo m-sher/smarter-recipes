@@ -14,6 +14,17 @@
 //! as "new" when scoring candidates, and the reported plan cost is the size of
 //! the union **minus** pantry keys (ingredients you still need to source).
 //!
+//! Optional [`NutritionBounds`] steer selection using precomputed whole-recipe
+//! estimated [`Macros`]: prefer schedules that satisfy per-meal, per-day, and
+//! plan-total min/max ranges; if none are feasible, return the least total
+//! violation (then min-union). The rationale records a short status; callers
+//! render the full violation list separately (e.g. CLI summary).
+//!
+//! When [`PlanOptions::recipe_macros`] contains an estimate for a recipe with
+//! `kcal <= 0`, that recipe is dropped from the pool entirely (not a meal).
+//! Recipes omitted from the map are left untouched for callers that do not
+//! compute estimates.
+//!
 //! # Algorithm
 //!
 //! Exact minimum-union subset selection is combinatorial. For household-scale
@@ -54,7 +65,17 @@
 //! Complexity: O(P² · S · K) where P = pool size, S = slots, K = avg keys/recipe
 //! — fine for tens to low hundreds of recipes.
 
-use crate::domain::{normalize_title_key, IngredientKey, MealPlan, PlannedMeal, Recipe, RecipeId};
+mod nutrition_bounds;
+
+pub use nutrition_bounds::{
+    evaluate_macros, evaluate_schedule, exceeds_max, load_nutrition_bounds, min_deficit,
+    violates_per_meal, violation_magnitude, BoundScope, BoundViolation, CliPerDayNutrition,
+    MacroBounds, MacroRange, NutrientKind, NutritionBounds, ViolationKind,
+};
+
+use crate::domain::{
+    normalize_title_key, IngredientKey, Macros, MealPlan, PlannedMeal, Recipe, RecipeId,
+};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -63,6 +84,10 @@ pub struct PlanOptions {
     pub meals_per_day: u32,
     /// Ingredient keys already on hand; excluded from "new" cost and net union.
     pub pantry: HashSet<IngredientKey>,
+    /// Optional macro min/max constraints. Empty keeps legacy min-union behavior.
+    pub nutrition: NutritionBounds,
+    /// Precomputed whole-recipe estimated macros (missing ids treat as zero).
+    pub recipe_macros: HashMap<RecipeId, Macros>,
 }
 
 impl Default for PlanOptions {
@@ -71,6 +96,8 @@ impl Default for PlanOptions {
             days: 7,
             meals_per_day: 1,
             pantry: HashSet::new(),
+            nutrition: NutritionBounds::default(),
+            recipe_macros: HashMap::new(),
         }
     }
 }
@@ -83,13 +110,24 @@ fn recipe_keys(recipe: &Recipe) -> HashSet<IngredientKey> {
         .collect()
 }
 
+/// True when a precomputed estimate exists and reports no calories.
+fn is_zero_kcal_meal(recipe_macros: &HashMap<RecipeId, Macros>, id: &RecipeId) -> bool {
+    recipe_macros
+        .get(id)
+        .is_some_and(|m| m.kcal <= 0.0 || !m.kcal.is_finite())
+}
+
 /// Deduplicate by `recipe_id`, drop empty-ingredient recipes when any non-empty
-/// recipe exists, then collapse by normalized title key (first wins among
-/// survivors). Empty filtering must run before title collapse so an empty stub
-/// cannot claim a title and block a fuller same-title recipe. Returns recipes
-/// paired with precomputed key sets so `recipe_keys` runs once per id-unique
-/// recipe.
-fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>) {
+/// recipe exists, drop recipes whose precomputed estimate is zero kcal, then
+/// collapse by normalized title key (first wins among survivors). Empty
+/// filtering must run before title collapse so an empty stub cannot claim a
+/// title and block a fuller same-title recipe. Returns recipes paired with
+/// precomputed key sets so `recipe_keys` runs once per id-unique recipe, plus
+/// how many candidates were removed for zero estimated calories.
+fn normalize_pool<'a>(
+    pool: &'a [Recipe],
+    recipe_macros: &HashMap<RecipeId, Macros>,
+) -> (Vec<&'a Recipe>, Vec<HashSet<IngredientKey>>, usize) {
     // Phase 1: id-dedupe and precompute keys.
     let mut seen_ids = HashSet::new();
     let mut recipes: Vec<&Recipe> = Vec::new();
@@ -116,7 +154,20 @@ fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>
         }
     }
 
-    // Phase 3: title-key first-wins among survivors only.
+    // Phase 3: drop recipes with a known non-positive calorie estimate.
+    let mut dropped_zero_kcal = 0usize;
+    let mut i = 0;
+    while i < recipes.len() {
+        if is_zero_kcal_meal(recipe_macros, &recipes[i].id) {
+            recipes.remove(i);
+            keys.remove(i);
+            dropped_zero_kcal += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Phase 4: title-key first-wins among survivors only.
     let mut seen_titles = HashSet::new();
     let mut out_recipes: Vec<&Recipe> = Vec::new();
     let mut out_keys: Vec<HashSet<IngredientKey>> = Vec::new();
@@ -128,7 +179,7 @@ fn normalize_pool(pool: &[Recipe]) -> (Vec<&Recipe>, Vec<HashSet<IngredientKey>>
         out_recipes.push(r);
         out_keys.push(k);
     }
-    (out_recipes, out_keys)
+    (out_recipes, out_keys, dropped_zero_kcal)
 }
 
 /// Full union size of ingredient keys for recipes at the given pool indices.
@@ -158,52 +209,126 @@ fn net_union_size(
     u.len()
 }
 
+fn macros_for(opts: &PlanOptions, id: &RecipeId) -> Macros {
+    opts.recipe_macros.get(id).copied().unwrap_or_default()
+}
+
+fn align_macros(pool: &[&Recipe], opts: &PlanOptions) -> Vec<Macros> {
+    pool.iter().map(|r| macros_for(opts, &r.id)).collect()
+}
+
+fn deficit_key(bounds: &MacroBounds, day_macros: &Macros, add: &Macros) -> u64 {
+    let mut trial = *day_macros;
+    trial.add(add);
+    (min_deficit(bounds, &trial) * 1000.0).round() as u64
+}
+
+fn candidate_sort_key<'a>(
+    pool: &[&'a Recipe],
+    keys: &[HashSet<IngredientKey>],
+    coverage: &HashSet<IngredientKey>,
+    macros: &[Macros],
+    bounds: &NutritionBounds,
+    day_macros: &Macros,
+    i: usize,
+) -> (usize, usize, u64, &'a str, &'a str) {
+    let new_keys = keys[i].difference(coverage).count();
+    let deficit = if bounds.is_empty() {
+        0
+    } else {
+        deficit_key(&bounds.per_day, day_macros, &macros[i])
+    };
+    (
+        new_keys,
+        keys[i].len(),
+        deficit,
+        pool[i].title.as_str(),
+        pool[i].id.as_str(),
+    )
+}
+
+fn nutrition_allows(bounds: &NutritionBounds, macros: &Macros, day_macros: &Macros) -> bool {
+    if !bounds.per_meal.is_empty() && violates_per_meal(&bounds.per_meal, macros) {
+        return false;
+    }
+    if !bounds.per_day.is_empty() && exceeds_max(&bounds.per_day, day_macros, macros) {
+        return false;
+    }
+    true
+}
+
+struct GreedyInput<'a> {
+    pool: &'a [&'a Recipe],
+    keys: &'a [HashSet<IngredientKey>],
+    macros: &'a [Macros],
+    pantry: &'a HashSet<IngredientKey>,
+    bounds: &'a NutritionBounds,
+    meals_per_day: u32,
+}
+
 /// Greedy growth from `seed`: always add the unused recipe that introduces the
 /// fewest new keys (relative to pantry + already selected). Returns selected
 /// pool indices in plan order.
-fn greedy_from_seed(
-    pool: &[&Recipe],
-    keys: &[HashSet<IngredientKey>],
-    seed: usize,
-    target: usize,
-    pantry: &HashSet<IngredientKey>,
-) -> Vec<usize> {
+fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<usize> {
+    let GreedyInput {
+        pool,
+        keys,
+        macros,
+        pantry,
+        bounds,
+        meals_per_day,
+    } = input;
+    let mpd = (*meals_per_day).max(1);
     let mut selected = Vec::with_capacity(target);
     selected.push(seed);
-    let mut coverage = pantry.clone();
+    let mut coverage = (**pantry).clone();
     coverage.extend(keys[seed].iter().cloned());
     let mut used_ids: HashSet<&str> = HashSet::new();
     used_ids.insert(pool[seed].id.as_str());
+    let mut day_macros = macros[seed];
+    let mut cur_day = 0u32;
 
     while selected.len() < target {
-        // Tie-break key: fewest new keys, then compact recipe, then title, then id.
-        let choice = (0..pool.len())
-            .filter(|&i| !used_ids.contains(pool[i].id.as_str()))
-            .min_by_key(|&i| {
-                let new_keys = keys[i].difference(&coverage).count();
-                (
-                    new_keys,
-                    keys[i].len(),
-                    pool[i].title.as_str(),
-                    pool[i].id.as_str(),
-                )
-            });
-        let Some(choice) = choice else {
+        let slot = selected.len() as u32;
+        let day = slot / mpd;
+        if day != cur_day {
+            cur_day = day;
+            day_macros = Macros::default();
+        }
+
+        let mut best: Option<usize> = None;
+        let mut best_key = None;
+        let mut best_relaxed: Option<usize> = None;
+        let mut best_relaxed_key = None;
+        for i in 0..pool.len() {
+            if used_ids.contains(pool[i].id.as_str()) {
+                continue;
+            }
+            let key = candidate_sort_key(pool, keys, &coverage, macros, bounds, &day_macros, i);
+            let allowed = bounds.is_empty() || nutrition_allows(bounds, &macros[i], &day_macros);
+            if allowed {
+                if best_key.as_ref().is_none_or(|bk| key < *bk) {
+                    best = Some(i);
+                    best_key = Some(key);
+                }
+            } else if best_relaxed_key.as_ref().is_none_or(|bk| key < *bk) {
+                best_relaxed = Some(i);
+                best_relaxed_key = Some(key);
+            }
+        }
+        let Some(choice) = best.or(best_relaxed) else {
             break;
         };
         selected.push(choice);
         coverage.extend(keys[choice].iter().cloned());
         used_ids.insert(pool[choice].id.as_str());
+        day_macros.add(&macros[choice]);
     }
     selected
 }
 
-/// True if `a` beats incumbent `b`: smaller union wins; ties by lex
-/// `(title, id)` sequence. Equal schedules keep the incumbent (`false`).
-fn better_schedule(pool: &[&Recipe], a: &[usize], ua: usize, b: &[usize], ub: usize) -> bool {
-    if ua != ub {
-        return ua < ub;
-    }
+/// True if `a` beats incumbent `b` on lex `(title, id)` sequence only.
+fn lex_better_schedule(pool: &[&Recipe], a: &[usize], b: &[usize]) -> bool {
     for (&ia, &ib) in a.iter().zip(b.iter()) {
         match (
             pool[ia].title.as_str().cmp(pool[ib].title.as_str()),
@@ -216,21 +341,119 @@ fn better_schedule(pool: &[&Recipe], a: &[usize], ua: usize, b: &[usize], ub: us
             (std::cmp::Ordering::Equal, std::cmp::Ordering::Equal) => {}
         }
     }
-    // Lengths are always `target` under greedy_from_seed; keep incumbent.
     false
+}
+
+/// True if `a` beats incumbent `b`: smaller union wins; ties by lex
+/// `(title, id)` sequence. Equal schedules keep the incumbent (`false`).
+fn better_schedule(pool: &[&Recipe], a: &[usize], ua: usize, b: &[usize], ub: usize) -> bool {
+    if ua != ub {
+        return ua < ub;
+    }
+    lex_better_schedule(pool, a, b)
+}
+
+struct ScoredSchedule {
+    indices: Vec<usize>,
+    net_union: usize,
+    magnitude: f64,
+    violations: Vec<BoundViolation>,
+}
+
+fn score_schedule(
+    _pool: &[&Recipe],
+    keys: &[HashSet<IngredientKey>],
+    macros: &[Macros],
+    indices: Vec<usize>,
+    pantry: &HashSet<IngredientKey>,
+    bounds: &NutritionBounds,
+    meals_per_day: u32,
+) -> ScoredSchedule {
+    let net_union = net_union_size(keys, &indices, pantry);
+    let violations = if bounds.is_empty() {
+        Vec::new()
+    } else {
+        schedule_violations(macros, &indices, bounds, meals_per_day)
+    };
+    let magnitude = violation_magnitude(&violations);
+    ScoredSchedule {
+        indices,
+        net_union,
+        magnitude,
+        violations,
+    }
+}
+
+fn schedule_violations(
+    macros: &[Macros],
+    indices: &[usize],
+    bounds: &NutritionBounds,
+    meals_per_day: u32,
+) -> Vec<BoundViolation> {
+    let mpd = meals_per_day.max(1);
+    let mut per_day: Vec<(u32, Macros)> = Vec::new();
+    let mut per_meal: Vec<(u32, u32, Macros)> = Vec::new();
+    let mut plan_total = Macros::default();
+    for (slot, &ri) in indices.iter().enumerate() {
+        let day = slot as u32 / mpd;
+        let meal = slot as u32 % mpd;
+        let m = macros[ri];
+        per_meal.push((day, meal, m));
+        plan_total.add(&m);
+        match per_day.last_mut() {
+            Some((d, acc)) if *d == day => acc.add(&m),
+            _ => per_day.push((day, m)),
+        }
+    }
+    evaluate_schedule(bounds, &per_day, &per_meal, &plan_total)
+}
+
+fn better_scored(pool: &[&Recipe], a: &ScoredSchedule, b: &ScoredSchedule) -> bool {
+    let a_ok = a.magnitude == 0.0;
+    let b_ok = b.magnitude == 0.0;
+    if a_ok != b_ok {
+        return a_ok;
+    }
+    if (a.magnitude - b.magnitude).abs() > 1e-9 {
+        return a.magnitude < b.magnitude;
+    }
+    if a.net_union != b.net_union {
+        return a.net_union < b.net_union;
+    }
+    lex_better_schedule(pool, &a.indices, &b.indices)
 }
 
 /// When every recipe must be used, multi-start only reorders. Build one order
 /// greedily from the lexicographically smallest (title, id) seed.
-fn order_full_pool(
-    pool: &[&Recipe],
-    keys: &[HashSet<IngredientKey>],
-    pantry: &HashSet<IngredientKey>,
-) -> Vec<usize> {
-    let seed = (0..pool.len())
-        .min_by_key(|&i| (pool[i].title.as_str(), pool[i].id.as_str()))
+fn order_full_pool(input: &GreedyInput<'_>) -> Vec<usize> {
+    let seed = (0..input.pool.len())
+        .min_by_key(|&i| (input.pool[i].title.as_str(), input.pool[i].id.as_str()))
         .expect("non-empty pool");
-    greedy_from_seed(pool, keys, seed, pool.len(), pantry)
+    greedy_from_seed(input, seed, input.pool.len())
+}
+
+/// Violations for a saved plan against bounds using precomputed recipe macros.
+pub fn plan_bound_violations(
+    _pool: &[Recipe],
+    plan: &MealPlan,
+    bounds: &NutritionBounds,
+    recipe_macros: &HashMap<RecipeId, Macros>,
+) -> Vec<BoundViolation> {
+    if bounds.is_empty() {
+        return Vec::new();
+    }
+    let mut per_day_map: std::collections::BTreeMap<u32, Macros> =
+        std::collections::BTreeMap::new();
+    let mut per_meal: Vec<(u32, u32, Macros)> = Vec::new();
+    let mut plan_total = Macros::default();
+    for m in &plan.meals {
+        let macros = recipe_macros.get(&m.recipe_id).copied().unwrap_or_default();
+        per_meal.push((m.day, m.meal, macros));
+        plan_total.add(&macros);
+        per_day_map.entry(m.day).or_default().add(&macros);
+    }
+    let per_day: Vec<(u32, Macros)> = per_day_map.into_iter().collect();
+    evaluate_schedule(bounds, &per_day, &per_meal, &plan_total)
 }
 
 /// Build a meal plan from a candidate pool (no recipe repeats by id or
@@ -239,6 +462,11 @@ fn order_full_pool(
 /// When `opts.pantry` is non-empty, those ingredient keys are treated as already
 /// covered: they do not count as new when scoring, and the reported distinct
 /// count is net of pantry stock.
+///
+/// When `opts.nutrition` is non-empty, selection prefers schedules that satisfy
+/// macro min/max bounds (estimated whole-recipe macros in `opts.recipe_macros`).
+/// If no feasible schedule exists, the least-violation plan is returned and
+/// the rationale notes the violation count (details via [`plan_bound_violations`]).
 pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let slots = opts
         .days
@@ -247,28 +475,48 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         .unwrap_or(0);
     let plan_id = uuid::Uuid::new_v4().to_string();
     let pantry = &opts.pantry;
+    let bounds = &opts.nutrition;
 
-    let (pool, keys) = normalize_pool(pool);
+    let (pool, keys, dropped_zero_kcal) = normalize_pool(pool, &opts.recipe_macros);
+    let macros = align_macros(&pool, opts);
 
     if pool.is_empty() || slots == 0 {
+        let rationale = if slots == 0 {
+            "Empty pool or zero slots; no meals planned.".into()
+        } else if dropped_zero_kcal > 0 {
+            format!(
+                "No meals planned: all {dropped_zero_kcal} candidate recipe(s) had no estimated calories (kcal <= 0), so none qualify as meals."
+            )
+        } else {
+            "Empty pool or zero slots; no meals planned.".into()
+        };
         return MealPlan {
             id: plan_id,
             days: opts.days,
             meals_per_day: opts.meals_per_day,
             meals: vec![],
-            rationale: "Empty pool or zero slots; no meals planned.".into(),
+            rationale,
         };
     }
 
     let target = slots.min(pool.len());
+    let mpd = opts.meals_per_day.max(1);
+    let input = GreedyInput {
+        pool: &pool,
+        keys: &keys,
+        macros: &macros,
+        pantry,
+        bounds,
+        meals_per_day: mpd,
+    };
 
-    let selected = if target == pool.len() {
-        // Set is forced; only construction order matters.
-        order_full_pool(&pool, &keys, pantry)
-    } else {
-        let mut best: Option<(Vec<usize>, usize)> = None; // (schedule, net_union_size)
+    let scored = if target == pool.len() && bounds.is_empty() {
+        let indices = order_full_pool(&input);
+        score_schedule(&pool, &keys, &macros, indices, pantry, bounds, mpd)
+    } else if bounds.is_empty() {
+        let mut best: Option<(Vec<usize>, usize)> = None;
         for seed in 0..pool.len() {
-            let candidate = greedy_from_seed(&pool, &keys, seed, target, pantry);
+            let candidate = greedy_from_seed(&input, seed, target);
             let ua = net_union_size(&keys, &candidate, pantry);
             let take = match &best {
                 None => true,
@@ -278,14 +526,32 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
                 best = Some((candidate, ua));
             }
         }
-        best.map(|(s, _)| s).unwrap_or_default()
+        let indices = best.map(|(s, _)| s).unwrap_or_default();
+        score_schedule(&pool, &keys, &macros, indices, pantry, bounds, mpd)
+    } else {
+        let mut best: Option<ScoredSchedule> = None;
+        for seed in 0..pool.len() {
+            let indices = greedy_from_seed(&input, seed, target);
+            let candidate = score_schedule(&pool, &keys, &macros, indices, pantry, bounds, mpd);
+            let take = match &best {
+                None => true,
+                Some(b) => better_scored(&pool, &candidate, b),
+            };
+            if take {
+                best = Some(candidate);
+            }
+        }
+        best.unwrap_or_else(|| ScoredSchedule {
+            indices: Vec::new(),
+            net_union: 0,
+            magnitude: 0.0,
+            violations: Vec::new(),
+        })
     };
 
-    let total_unique = union_size(&keys, &selected);
-    let net_unique = net_union_size(&keys, &selected, pantry);
-
-    // meals_per_day is non-zero when slots > 0 (checked_mul path); guard for safety.
-    let mpd = opts.meals_per_day.max(1);
+    let selected = &scored.indices;
+    let total_unique = union_size(&keys, selected);
+    let net_unique = scored.net_union;
 
     let meals: Vec<PlannedMeal> = selected
         .iter()
@@ -301,6 +567,14 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
             }
         })
         .collect();
+
+    let zero_kcal_note = if dropped_zero_kcal > 0 {
+        format!(
+            " Excluded {dropped_zero_kcal} recipe(s) with no estimated calories (kcal <= 0; not treated as meals)."
+        )
+    } else {
+        String::new()
+    };
 
     let partial_note = if meals.len() < slots {
         format!(
@@ -322,10 +596,21 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         )
     };
 
+    let nutrition_note = if bounds.is_empty() {
+        String::new()
+    } else if scored.violations.is_empty() {
+        " Nutrition constraints satisfied.".to_string()
+    } else {
+        format!(
+            " Nutrition constraints not fully met (best effort, {} violation(s)).",
+            scored.violations.len()
+        )
+    };
+
     let rationale = format!(
         "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
          Multi-start greedy selection minimizes distinct ingredient keys \
-         (no recipe repeats). {pantry_note}{partial_note}",
+         (no recipe repeats). {pantry_note}{zero_kcal_note}{nutrition_note}{partial_note}",
         meals.len(),
         opts.days,
         pool.len(),
@@ -736,6 +1021,7 @@ mod tests {
             days: 1,
             meals_per_day: 1,
             pantry,
+            ..Default::default()
         };
         let plan = plan_meals(&pool, &opts);
         assert_eq!(plan.meals.len(), 1);
@@ -758,6 +1044,7 @@ mod tests {
             days: 2,
             meals_per_day: 1,
             pantry,
+            ..Default::default()
         };
         let plan = plan_meals(&pool, &opts);
         // Full union is 4 (flour, milk, eggs, bread); net after pantry is 2.
@@ -787,5 +1074,315 @@ mod tests {
         let t = titles(&plan);
         assert!(t.contains(&"Pancakes"));
         assert!(t.contains(&"French Toast"));
+    }
+
+    fn macro_map(entries: &[(&str, Macros)]) -> HashMap<RecipeId, Macros> {
+        entries
+            .iter()
+            .map(|(id, m)| (RecipeId::from(*id), *m))
+            .collect()
+    }
+
+    fn dessert_protein_pool() -> (Vec<Recipe>, HashMap<RecipeId, Macros>) {
+        let dessert1 = rec_with_id("d1", "Cake", &["100 g sugar", "100 g flour"]);
+        let dessert2 = rec_with_id("d2", "Cookies", &["100 g sugar", "50 g flour"]);
+        let protein = rec_with_id("p1", "Chicken Rice", &["200 g chicken", "100 g rice"]);
+        let macros = macro_map(&[
+            (
+                "d1",
+                Macros {
+                    kcal: 800.0,
+                    protein_g: 5.0,
+                    fat_g: 10.0,
+                    carbs_g: 150.0,
+                },
+            ),
+            (
+                "d2",
+                Macros {
+                    kcal: 700.0,
+                    protein_g: 4.0,
+                    fat_g: 20.0,
+                    carbs_g: 100.0,
+                },
+            ),
+            (
+                "p1",
+                Macros {
+                    kcal: 500.0,
+                    protein_g: 60.0,
+                    fat_g: 10.0,
+                    carbs_g: 40.0,
+                },
+            ),
+        ]);
+        (vec![dessert1, dessert2, protein], macros)
+    }
+
+    #[test]
+    fn unconstrained_still_prefers_shared_dessert_cluster() {
+        let (pool, macros) = dessert_protein_pool();
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 2,
+                recipe_macros: macros,
+                ..Default::default()
+            },
+        );
+        let t = titles(&plan);
+        assert!(t.contains(&"Cake"));
+        assert!(t.contains(&"Cookies"));
+        assert!(!t.contains(&"Chicken Rice"));
+    }
+
+    #[test]
+    fn per_day_min_protein_avoids_two_desserts() {
+        let (pool, macros) = dessert_protein_pool();
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(50.0),
+                    max: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 2,
+                nutrition: nutrition.clone(),
+                recipe_macros: macros.clone(),
+                ..Default::default()
+            },
+        );
+        let t = titles(&plan);
+        assert!(
+            t.contains(&"Chicken Rice"),
+            "expected a protein meal, got {t:?}"
+        );
+        let violations = plan_bound_violations(&pool, &plan, &nutrition, &macros);
+        assert!(
+            violations.is_empty(),
+            "expected feasible plan, got {violations:?}"
+        );
+        assert!(plan.rationale.to_lowercase().contains("nutrition"));
+        assert!(plan.rationale.to_lowercase().contains("satisfied"));
+        assert!(!plan.rationale.contains("day "));
+    }
+
+    #[test]
+    fn infeasible_bounds_return_best_effort_with_violations() {
+        let dessert1 = rec_with_id("d1", "Cake", &["100 g sugar"]);
+        let dessert2 = rec_with_id("d2", "Cookies", &["100 g sugar", "50 g flour"]);
+        let macros = macro_map(&[
+            (
+                "d1",
+                Macros {
+                    kcal: 500.0,
+                    protein_g: 5.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "d2",
+                Macros {
+                    kcal: 400.0,
+                    protein_g: 4.0,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(50.0),
+                    max: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pool = vec![dessert1, dessert2];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 2,
+                nutrition: nutrition.clone(),
+                recipe_macros: macros.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 2);
+        let violations = plan_bound_violations(&pool, &plan, &nutrition, &macros);
+        assert!(!violations.is_empty());
+        assert!(plan.rationale.to_lowercase().contains("best effort"));
+        assert!(
+            plan.rationale
+                .contains(&format!("{} violation(s)", violations.len())),
+            "rationale should include violation count only, got: {}",
+            plan.rationale
+        );
+        // Details belong in plan_bound_violations / CLI summary, not inline.
+        assert!(!plan.rationale.contains("protein_g"));
+    }
+
+    #[test]
+    fn zero_kcal_recipes_excluded_from_pool() {
+        let real = rec_with_id("real", "Chicken", &["200 g chicken"]);
+        let zero = rec_with_id("zero", "Wonton Guide", &["wonton wrappers"]);
+        let also_zero = rec_with_id("z2", "Kabobs", &["8 pretzel sticks"]);
+        let macros = macro_map(&[
+            (
+                "real",
+                Macros {
+                    kcal: 400.0,
+                    protein_g: 50.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "zero",
+                Macros {
+                    kcal: 0.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "z2",
+                Macros {
+                    kcal: 0.0,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let pool = vec![real, zero, also_zero];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 3,
+                meals_per_day: 1,
+                recipe_macros: macros,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 1);
+        assert_eq!(plan.meals[0].recipe_title, "Chicken");
+        assert!(
+            plan.rationale
+                .to_lowercase()
+                .contains("no estimated calories")
+                || plan.rationale.to_lowercase().contains("zero kcal"),
+            "rationale should mention exclusion: {}",
+            plan.rationale
+        );
+        assert!(plan.rationale.contains("partial"));
+    }
+
+    #[test]
+    fn missing_macro_entry_not_treated_as_zero_kcal() {
+        // Legacy callers that omit recipe_macros keep prior scheduling behavior.
+        let a = rec_with_id("a", "Guide", &["wonton wrappers"]);
+        let b = rec_with_id("b", "Soup", &["1 cup broth"]);
+        let plan = plan_meals(
+            &[a, b],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 2);
+    }
+
+    #[test]
+    fn all_zero_kcal_pool_plans_nothing() {
+        let a = rec_with_id("a", "A", &["x"]);
+        let b = rec_with_id("b", "B", &["y"]);
+        let macros = macro_map(&[("a", Macros::default()), ("b", Macros::default())]);
+        let plan = plan_meals(
+            &[a, b],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                recipe_macros: macros,
+                ..Default::default()
+            },
+        );
+        assert!(plan.meals.is_empty());
+        assert!(
+            plan.rationale
+                .to_lowercase()
+                .contains("no estimated calories")
+                || plan.rationale.to_lowercase().contains("zero kcal"),
+            "{}",
+            plan.rationale
+        );
+    }
+
+    #[test]
+    fn per_meal_min_filters_too_low_protein_recipe() {
+        let low = rec_with_id("low", "Broth", &["1 cup broth"]);
+        let high = rec_with_id("high", "Steak", &["200 g beef"]);
+        let other = rec_with_id("other", "Eggs", &["3 eggs"]);
+        let macros = macro_map(&[
+            (
+                "low",
+                Macros {
+                    kcal: 50.0,
+                    protein_g: 2.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "high",
+                Macros {
+                    kcal: 400.0,
+                    protein_g: 40.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "other",
+                Macros {
+                    kcal: 200.0,
+                    protein_g: 18.0,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let nutrition = NutritionBounds {
+            per_meal: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(15.0),
+                    max: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pool = vec![low, high, other];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                nutrition: nutrition.clone(),
+                recipe_macros: macros.clone(),
+                ..Default::default()
+            },
+        );
+        let t = titles(&plan);
+        assert!(
+            !t.contains(&"Broth"),
+            "low-protein meal should be avoided: {t:?}"
+        );
+        let violations = plan_bound_violations(&pool, &plan, &nutrition, &macros);
+        assert!(violations.is_empty(), "{violations:?}");
     }
 }
