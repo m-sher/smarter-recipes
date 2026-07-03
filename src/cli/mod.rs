@@ -3,7 +3,7 @@
 use crate::domain::{IngredientKey, MealPlan, Recipe, ShoppingList, UnitKind};
 use crate::ingest::{
     ingest_from, normalize_url, read_manual_recipe, recipe_source_url, scrape_new_recipes,
-    HttpFetcher, ScrapeEvent,
+    search_scrape_recipes, HttpFetcher, ScrapeEvent, ScrapeOutcome, ScrapeParams,
 };
 use crate::normalize::normalize_line;
 use crate::planning::{
@@ -59,6 +59,29 @@ pub enum Commands {
         /// How deep to follow descendant links under the seed path (1 = seed's links only)
         #[arg(long, default_value_t = 1)]
         depth: usize,
+        /// Re-attempt URLs previously recorded as failures
+        #[arg(long)]
+        retry_failed: bool,
+        /// Discover and report without saving
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Search DuckDuckGo for recipe pages, then multi-host crawl results
+    SearchScrape {
+        /// Search query, e.g. "high protein dinners"
+        query: String,
+        /// Max number of site pages to fetch this run (search SERP fetches are free)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Number of pages to fetch concurrently
+        #[arg(long, default_value_t = 8)]
+        jobs: usize,
+        /// BFS depth from each search result (1 = results only; 2 = one same-host hop)
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        /// How many DuckDuckGo result pages to load
+        #[arg(long, default_value_t = 2)]
+        pages: usize,
         /// Re-attempt URLs previously recorded as failures
         #[arg(long)]
         retry_failed: bool,
@@ -292,17 +315,7 @@ pub fn run(cli: Cli) -> Result<()> {
             retry_failed,
             dry_run,
         } => {
-            // Skip URLs already imported, plus previously-failed URLs unless retrying.
-            let mut skip: HashSet<String> = store
-                .list_recipes(None)?
-                .iter()
-                .filter_map(recipe_source_url)
-                .map(|u| normalize_url(&u))
-                .collect();
-            if !retry_failed {
-                skip.extend(store.failed_scrape_urls()?);
-            }
-
+            let skip = scrape_skip_set(&store, retry_failed)?;
             eprintln!("Scanning {url} (depth {depth}) …");
             let fetcher = HttpFetcher::default();
             let outcome = scrape_new_recipes(
@@ -312,70 +325,33 @@ pub fn run(cli: Cli) -> Result<()> {
                 &skip,
                 jobs,
                 depth,
-                &|event| {
-                    match event {
-                    ScrapeEvent::Planned {
-                        candidates,
-                        skipped,
-                        to_fetch,
-                    } => eprintln!(
-                        "Found {candidates} same-host link(s); {skipped} already known; queue {to_fetch} …"
-                    ),
-                    ScrapeEvent::Imported { url, title } => eprintln!("  ✓ {title}  ({url})"),
-                    ScrapeEvent::NotRecipe { url, reason } => {
-                        eprintln!("  · nav {url}  ({reason})")
-                    }
-                    ScrapeEvent::Failed { url, reason } => {
-                        eprintln!("  ✗ fetch {url}  ({reason})")
-                    }
-                }
-                },
+                &scrape_progress_printer,
             )?;
-
-            let mut skipped_dup = 0usize;
-            let mut saved = 0usize;
-            for recipe in &outcome.recipes {
-                let source = recipe_source_url(recipe);
-                if store.is_duplicate(source.as_deref())? {
-                    skipped_dup += 1;
-                    continue;
-                }
-                if !dry_run {
-                    store.save_recipe(recipe)?;
-                    // A URL that now succeeds should no longer be remembered as failed.
-                    if let Some(u) = source {
-                        store.clear_scrape_failure(&normalize_url(&u))?;
-                    }
-                }
-                saved += 1;
-            }
-            // Persist only hard fetch failures — nav/category pages stay re-crawlable.
-            if !dry_run {
-                for (link, reason) in &outcome.failed {
-                    store.record_scrape_failure(&normalize_url(link), reason)?;
-                }
-            }
-
-            if dry_run {
-                println!(
-                    "(dry run) {} new recipe(s), {} nav (not recipe), {} fetch failed, {} skipped known URL, {} would skip URL/title dup — nothing saved",
-                    saved,
-                    outcome.not_recipe.len(),
-                    outcome.failed.len(),
-                    outcome.skipped_existing,
-                    skipped_dup
-                );
-            } else {
-                println!(
-                    "Imported {} new recipe(s) to {} ({} nav, {} fetch failed, {} skipped known URL, {} skipped URL/title dup)",
-                    saved,
-                    store.path().display(),
-                    outcome.not_recipe.len(),
-                    outcome.failed.len(),
-                    outcome.skipped_existing,
-                    skipped_dup
-                );
-            }
+            apply_scrape_outcome(&store, &outcome, dry_run)?;
+        }
+        Commands::SearchScrape {
+            query,
+            limit,
+            jobs,
+            depth,
+            pages,
+            retry_failed,
+            dry_run,
+        } => {
+            let skip = scrape_skip_set(&store, retry_failed)?;
+            eprintln!(
+                "Searching DuckDuckGo for {query:?} ({pages} result page(s), depth {depth}, limit {limit}) …"
+            );
+            let fetcher = HttpFetcher::default();
+            let outcome = search_scrape_recipes(
+                &fetcher,
+                &query,
+                &skip,
+                ScrapeParams::new(limit, jobs, depth),
+                pages,
+                &scrape_progress_printer,
+            )?;
+            apply_scrape_outcome(&store, &outcome, dry_run)?;
         }
         Commands::List { filter, full_id } => {
             let recipes = store.list_recipes(filter.as_deref())?;
@@ -777,6 +753,84 @@ pub fn run(cli: Cli) -> Result<()> {
                 println!("Cleared {n} cached nutrition entr(ies).");
             }
         },
+    }
+    Ok(())
+}
+
+fn scrape_skip_set(store: &Store, retry_failed: bool) -> Result<HashSet<String>> {
+    let mut skip: HashSet<String> = store
+        .list_recipes(None)?
+        .iter()
+        .filter_map(recipe_source_url)
+        .map(|u| normalize_url(&u))
+        .collect();
+    if !retry_failed {
+        skip.extend(store.failed_scrape_urls()?);
+    }
+    Ok(skip)
+}
+
+fn scrape_progress_printer(event: ScrapeEvent) {
+    match event {
+        ScrapeEvent::Planned {
+            candidates,
+            skipped,
+            to_fetch,
+        } => eprintln!(
+            "Found {candidates} candidate link(s); {skipped} already known; queue {to_fetch} …"
+        ),
+        ScrapeEvent::Imported { url, title } => eprintln!("  ✓ {title}  ({url})"),
+        ScrapeEvent::NotRecipe { url, reason } => {
+            eprintln!("  · nav {url}  ({reason})")
+        }
+        ScrapeEvent::Failed { url, reason } => {
+            eprintln!("  ✗ fetch {url}  ({reason})")
+        }
+    }
+}
+
+fn apply_scrape_outcome(store: &Store, outcome: &ScrapeOutcome, dry_run: bool) -> Result<()> {
+    let mut skipped_dup = 0usize;
+    let mut saved = 0usize;
+    for recipe in &outcome.recipes {
+        let source = recipe_source_url(recipe);
+        if store.is_duplicate(source.as_deref())? {
+            skipped_dup += 1;
+            continue;
+        }
+        if !dry_run {
+            store.save_recipe(recipe)?;
+            if let Some(u) = source {
+                store.clear_scrape_failure(&normalize_url(&u))?;
+            }
+        }
+        saved += 1;
+    }
+    if !dry_run {
+        for (link, reason) in &outcome.failed {
+            store.record_scrape_failure(&normalize_url(link), reason)?;
+        }
+    }
+
+    if dry_run {
+        println!(
+            "(dry run) {} new recipe(s), {} nav (not recipe), {} fetch failed, {} skipped known URL, {} would skip URL/title dup — nothing saved",
+            saved,
+            outcome.not_recipe.len(),
+            outcome.failed.len(),
+            outcome.skipped_existing,
+            skipped_dup
+        );
+    } else {
+        println!(
+            "Imported {} new recipe(s) to {} ({} nav, {} fetch failed, {} skipped known URL, {} skipped URL/title dup)",
+            saved,
+            store.path().display(),
+            outcome.not_recipe.len(),
+            outcome.failed.len(),
+            outcome.skipped_existing,
+            skipped_dup
+        );
     }
     Ok(())
 }

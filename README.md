@@ -71,6 +71,12 @@ smarter-recipes scrape 'https://example.com/category/chicken' --depth 3 --limit 
 smarter-recipes scrape 'https://example.com/recipes' --dry-run
 smarter-recipes scrape 'https://example.com/recipes' --retry-failed
 
+# Search DuckDuckGo, then multi-host BFS from result URLs (same identity rules).
+# --pages is how many SERP pages to load; --limit is site-page fetch budget;
+# --depth is same-host expansion from each result (default 2).
+smarter-recipes search-scrape 'best meal prep' --limit 100 --jobs 8 --depth 2 --pages 3
+smarter-recipes search-scrape 'high protein dinners' --limit 80 --dry-run
+
 # Browse
 smarter-recipes list
 smarter-recipes list --filter pasta

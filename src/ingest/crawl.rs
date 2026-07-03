@@ -149,8 +149,23 @@ pub fn is_listing_url(u: &str) -> bool {
     if segments.is_empty() {
         return true;
     }
-    const LISTING_SEGMENTS: &[&str] =
-        &["category", "categories", "tag", "tags", "author", "authors"];
+    const LISTING_SEGMENTS: &[&str] = &[
+        "category",
+        "categories",
+        "tag",
+        "tags",
+        "author",
+        "authors",
+        "collection",
+        "collections",
+        "roundup",
+        "roundups",
+        "gallery",
+        "galleries",
+        "photos",
+        "topics",
+        "topic",
+    ];
     if segments.iter().any(|s| LISTING_SEGMENTS.contains(s)) {
         return true;
     }
@@ -228,6 +243,49 @@ pub struct ScrapeOutcome {
     pub not_recipe: Vec<(String, String)>,
 }
 
+/// Shared fetch budget / concurrency for multi-seed and site scrapes.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrapeParams {
+    /// Max page fetches (not counting search SERPs).
+    pub limit: usize,
+    /// Concurrent fetches per batch.
+    pub jobs: usize,
+    /// BFS depth (1 = seeds / seed-links only).
+    pub max_depth: usize,
+}
+
+impl ScrapeParams {
+    pub fn new(limit: usize, jobs: usize, max_depth: usize) -> Self {
+        Self {
+            limit,
+            jobs: jobs.max(1),
+            max_depth: max_depth.max(1),
+        }
+    }
+}
+
+/// Enqueue a batch of candidates, preserving discovery order within each class.
+/// Non-listing (likely recipe) URLs are placed ahead of any already-queued items
+/// and ahead of listing/index URLs so `--limit` prefers content over nav.
+fn enqueue_candidates(queue: &mut VecDeque<(String, usize)>, links: Vec<(String, usize)>) {
+    let mut content = Vec::new();
+    let mut listings = Vec::new();
+    for (link, depth) in links {
+        if is_listing_url(&link) {
+            listings.push((link, depth));
+        } else {
+            content.push((link, depth));
+        }
+    }
+    // push_front reverses; feed content in reverse so pop_front yields discovery order.
+    for item in content.into_iter().rev() {
+        queue.push_front(item);
+    }
+    for item in listings {
+        queue.push_back(item);
+    }
+}
+
 fn fetch_html(fetcher: &dyn HtmlFetcher, url: &str) -> Result<String, String> {
     fetcher.fetch(url).map_err(|e| e.to_string())
 }
@@ -245,6 +303,7 @@ fn ingest_html(url: &str, html: &str) -> Result<Recipe, String> {
 /// - Depth `1` (default): only links found on the seed page.
 /// - Depth `N`: also scan fetched pages for further same-host links, up to depth `N`.
 ///
+/// The seed itself is used only for link discovery (not counted against `limit`).
 /// `limit` bounds non-seed page fetches, not successes. Only hard failures are in
 /// [`ScrapeOutcome::failed`]; non-recipe pages are in [`ScrapeOutcome::not_recipe`].
 pub fn scrape_new_recipes(
@@ -256,17 +315,49 @@ pub fn scrape_new_recipes(
     max_depth: usize,
     progress: &(dyn Fn(ScrapeEvent) + Sync),
 ) -> Result<ScrapeOutcome> {
-    let max_depth = max_depth.max(1);
-    let jobs = jobs.max(1);
-    let root_norm = normalize_url(base_url);
-
     let seed_html = fetcher
         .fetch(base_url)
         .with_context(|| format!("fetching index page {base_url}"))?;
 
+    let links = discover_scoped_links(base_url, &seed_html, base_url);
+    // Index URL is not a fetch target; mark it seen so we don't loop back to it.
+    let mut bootstrap_seen = HashSet::new();
+    bootstrap_seen.insert(normalize_url(base_url));
+    scrape_from_seeds(
+        fetcher,
+        &links,
+        skip,
+        ScrapeParams::new(limit, jobs, max_depth),
+        progress,
+        bootstrap_seen,
+    )
+}
+
+/// BFS-fetch `seeds` (each is a page fetch target) up to `params.limit` fetches.
+///
+/// Unlike [`scrape_new_recipes`], seeds themselves are fetched and may be imported
+/// as recipes. Link expansion is **same-host as the page being scanned** so multi-host
+/// search results each open their own host frontier under a shared budget.
+///
+/// - Depth `1`: fetch seeds only (no expansion).
+/// - Depth `N`: expand same-host links from fetched pages while `depth < N`.
+///
+/// `extra_seen` seeds the enqueued set without counting as candidates (e.g. an index
+/// URL that was already fetched outside this function).
+pub fn scrape_from_seeds(
+    fetcher: &dyn HtmlFetcher,
+    seeds: &[String],
+    skip: &HashSet<String>,
+    params: ScrapeParams,
+    progress: &(dyn Fn(ScrapeEvent) + Sync),
+    extra_seen: HashSet<String>,
+) -> Result<ScrapeOutcome> {
+    let limit = params.limit;
+    let jobs = params.jobs;
+    let max_depth = params.max_depth;
+
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-    let mut enqueued: HashSet<String> = HashSet::new();
-    enqueued.insert(root_norm.clone());
+    let mut enqueued: HashSet<String> = extra_seen;
 
     let mut candidates = 0usize;
     let mut skipped_existing = 0usize;
@@ -275,8 +366,9 @@ pub fn scrape_new_recipes(
     let mut not_recipe: Vec<(String, String)> = Vec::new();
     let mut fetches_used = 0usize;
 
-    for link in discover_scoped_links(base_url, &seed_html, base_url) {
-        let n = normalize_url(&link);
+    let mut initial: Vec<(String, usize)> = Vec::new();
+    for link in seeds {
+        let n = normalize_url(link);
         if !enqueued.insert(n.clone()) {
             continue;
         }
@@ -285,8 +377,12 @@ pub fn scrape_new_recipes(
             skipped_existing += 1;
             continue;
         }
-        queue.push_back((link, 1));
+        if is_denied_url(link) {
+            continue;
+        }
+        initial.push((link.clone(), 1));
     }
+    enqueue_candidates(&mut queue, initial);
 
     progress(ScrapeEvent::Planned {
         candidates,
@@ -367,9 +463,10 @@ pub fn scrape_new_recipes(
                 (false, Ok(_)) => unreachable!("fetch failed cannot produce recipe"),
             }
 
+            // Host-scope expansion to the page's own host (supports multi-host seeds).
             if depth < max_depth && !html.is_empty() {
-                let mut new_queued = 0usize;
-                for link in discover_scoped_links(&url, &html, base_url) {
+                let mut batch_links: Vec<(String, usize)> = Vec::new();
+                for link in discover_scoped_links(&url, &html, &url) {
                     let n = normalize_url(&link);
                     if !enqueued.insert(n.clone()) {
                         continue;
@@ -379,10 +476,11 @@ pub fn scrape_new_recipes(
                         skipped_existing += 1;
                         continue;
                     }
-                    queue.push_back((link, depth + 1));
-                    new_queued += 1;
+                    batch_links.push((link, depth + 1));
                 }
+                let new_queued = batch_links.len();
                 if new_queued > 0 {
+                    enqueue_candidates(&mut queue, batch_links);
                     progress(ScrapeEvent::Planned {
                         candidates,
                         skipped: skipped_existing,
@@ -867,5 +965,35 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn multi_seed_fetches_seeds_across_hosts() {
+        let mut pages = HashMap::new();
+        pages.insert("https://a.com/pie".to_string(), recipe_html("Pie"));
+        pages.insert("https://b.com/soup".to_string(), recipe_html("Soup"));
+        pages.insert(
+            "https://b.com/list".to_string(),
+            r#"<a href="/stew">Stew</a>"#.to_string(),
+        );
+        pages.insert("https://b.com/stew".to_string(), recipe_html("Stew"));
+        let f = MapFetcher { pages };
+        let seeds = vec![
+            "https://a.com/pie".to_string(),
+            "https://b.com/list".to_string(),
+        ];
+        let out = scrape_from_seeds(
+            &f,
+            &seeds,
+            &HashSet::new(),
+            ScrapeParams::new(10, 4, 2),
+            &noop,
+            HashSet::new(),
+        )
+        .unwrap();
+        let titles: HashSet<_> = out.recipes.iter().map(|r| r.title.as_str()).collect();
+        assert!(titles.contains("Pie"));
+        assert!(titles.contains("Stew"));
+        assert!(!titles.contains("Soup")); // never seeded or linked from list-only path used
     }
 }
