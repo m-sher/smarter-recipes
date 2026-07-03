@@ -10,7 +10,7 @@ CLI tool that ingests recipes from multiple sources, stores them in a local SQLi
 | **Normalization** | Free-text ingredient lines → name, quantity, unit; units converted to canonical g / ml / ea for aggregation |
 | **Storage** | Embedded SQLite; ingredients deduplicated by `(name, unit kind)`; pantry stock by same identity |
 | **Pantry** | Track on-hand ingredients; mark shopping results as purchased; plan and shop net of stock |
-| **Planning** | Multi-start min-union scheduler, no recipe repeats; pantry stock applied with quantity-aware binary shortfall (documented in `src/planning/mod.rs`) |
+| **Planning** | Multi-start min-union scheduler, no recipe repeats; pantry stock with quantity-aware binary shortfall; optional nutrition min/max bounds from TOML or per-day CLI flags (documented in `src/planning/mod.rs`) |
 | **Shopping** | Package multiset optimization: **cost first**, then **minimum leftover**; requirements reduced by pantry (documented in `src/shopping/mod.rs`) |
 | **Extensibility** | New ingest sources implement `RecipeSourceIngest`; custom package catalogs via JSON overlay |
 
@@ -91,6 +91,15 @@ smarter-recipes plan --days 5 --per-day 1
 
 # Restrict the candidate pool
 smarter-recipes plan --days 3 --pool <id1>,<id2>,<id3>
+
+# Steer selection with estimated macro ranges (whole-recipe estimates).
+# CLI flags set per-day bounds; a TOML file can also set per_meal and plan totals.
+# Feasible plans are preferred; if none exist, the least-violation plan is kept
+# with warnings. Estimates are trusted as-is; coverage is always printed.
+smarter-recipes plan --days 5 --per-day 2 --min-protein-g 50 --max-kcal 3000
+smarter-recipes plan --days 5 --nutrition-config examples/nutrition_bounds.toml
+smarter-recipes plan --days 5 --nutrition-config examples/nutrition_bounds.toml --min-protein-g 60
+
 
 # Shopping list with package recommendations + leftover flags
 # (amounts already in the pantry are subtracted / omitted)
@@ -176,7 +185,24 @@ src/
 
 ### Planning algorithm (summary)
 
-Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new **to-buy** keys after quantity-aware pantry consumption (shared with shopping’s stock ledger); keep the schedule with the smallest net to-buy count. Partial stock does not fully exempt a key. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. See module docs in `src/planning/mod.rs`.
+Multi-start greedy: for each possible first recipe, repeatedly append the unused candidate that adds the fewest new **to-buy** keys after quantity-aware pantry consumption (shared with shopping’s stock ledger); keep the schedule with the smallest net to-buy count. Partial stock does not fully exempt a key. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. Recipes whose estimated whole-recipe energy is `kcal <= 0` are dropped from the pool (not treated as meals). With nutrition bounds, candidates that break per-meal mins/maxes or a day’s maxes are avoided when possible, and feasible schedules rank above infeasible ones (then least total violation, then min-union). See module docs in `src/planning/mod.rs`.
+
+### Nutrition bounds TOML
+
+```toml
+[per_day]
+protein_g = { min = 50.0, max = 200.0 }
+kcal = { max = 3000.0 }
+
+[per_meal]
+protein_g = { min = 15.0 }
+
+[plan]
+protein_g = { min = 350.0 }
+```
+
+CLI `--min-*` / `--max-*` flags overlay `per_day` only. Nutrients: `kcal`, `protein_g`, `fat_g`, `carbs_g`.
+
 
 ### Purchase optimization (summary)
 

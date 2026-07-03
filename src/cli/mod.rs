@@ -6,7 +6,9 @@ use crate::ingest::{
     HttpFetcher, ScrapeEvent,
 };
 use crate::normalize::normalize_line;
-use crate::planning::{plan_meals, PlanOptions};
+use crate::planning::{
+    load_nutrition_bounds, plan_bound_violations, plan_meals, CliPerDayNutrition, PlanOptions,
+};
 use crate::pricing::{
     enrich_catalog_from_source, FixtureStoreSource, OpenFoodFactsSource, PackageCatalog,
 };
@@ -92,6 +94,33 @@ pub enum Commands {
         /// Restrict pool to these recipe ids (comma-separated); default: all
         #[arg(long)]
         pool: Option<String>,
+        /// TOML nutrition bounds (per_day / per_meal / plan scopes)
+        #[arg(long)]
+        nutrition_config: Option<PathBuf>,
+        /// Per-day minimum kcal (overrides config file)
+        #[arg(long)]
+        min_kcal: Option<f64>,
+        /// Per-day maximum kcal (overrides config file)
+        #[arg(long)]
+        max_kcal: Option<f64>,
+        /// Per-day minimum protein grams (overrides config file)
+        #[arg(long)]
+        min_protein_g: Option<f64>,
+        /// Per-day maximum protein grams (overrides config file)
+        #[arg(long)]
+        max_protein_g: Option<f64>,
+        /// Per-day minimum fat grams (overrides config file)
+        #[arg(long)]
+        min_fat_g: Option<f64>,
+        /// Per-day maximum fat grams (overrides config file)
+        #[arg(long)]
+        max_fat_g: Option<f64>,
+        /// Per-day minimum carbs grams (overrides config file)
+        #[arg(long)]
+        min_carbs_g: Option<f64>,
+        /// Per-day maximum carbs grams (overrides config file)
+        #[arg(long)]
+        max_carbs_g: Option<f64>,
         /// Print plan as JSON
         #[arg(long)]
         json: bool,
@@ -380,6 +409,15 @@ pub fn run(cli: Cli) -> Result<()> {
             days,
             per_day,
             pool,
+            nutrition_config,
+            min_kcal,
+            max_kcal,
+            min_protein_g,
+            max_protein_g,
+            min_fat_g,
+            max_fat_g,
+            min_carbs_g,
+            max_carbs_g,
             json,
             dry_run,
         } => {
@@ -388,20 +426,39 @@ pub fn run(cli: Cli) -> Result<()> {
                 bail!("recipe pool is empty; import recipes first");
             }
             let pantry = store.list_pantry()?;
+            let cli_nutrition = CliPerDayNutrition {
+                min_kcal,
+                max_kcal,
+                min_protein_g,
+                max_protein_g,
+                min_fat_g,
+                max_fat_g,
+                min_carbs_g,
+                max_carbs_g,
+            };
+            let nutrition = load_nutrition_bounds(nutrition_config.as_deref(), &cli_nutrition)?;
+            let extra = nutrition_extra(&store)?;
+            let recipe_macros = recipe_macros_for_pool(&recipes, &extra);
             let opts = PlanOptions {
                 days,
                 meals_per_day: per_day,
                 pantry,
+                nutrition: nutrition.clone(),
+                recipe_macros: recipe_macros.clone(),
             };
             let plan = plan_meals(&recipes, &opts);
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
                 print_plan(&plan);
-                let extra = nutrition_extra(&store)?;
                 match crate::nutrition::plan_nutrition(&store, &plan, &extra) {
                     Ok(pn) => print_plan_nutrition(&pn),
                     Err(e) => eprintln!("note: nutrition estimate unavailable: {e:#}"),
+                }
+                if !nutrition.is_empty() {
+                    let violations =
+                        plan_bound_violations(&recipes, &plan, &nutrition, &recipe_macros);
+                    print_plan_constraints(&violations);
                 }
             }
             if !dry_run {
@@ -717,6 +774,33 @@ fn nutrition_extra(
         .into_iter()
         .filter_map(|(k, v)| v.map(|m| (k, m)))
         .collect())
+}
+
+fn recipe_macros_for_pool(
+    recipes: &[Recipe],
+    extra: &std::collections::HashMap<String, crate::domain::Macros>,
+) -> std::collections::HashMap<crate::domain::RecipeId, crate::domain::Macros> {
+    recipes
+        .iter()
+        .map(|r| {
+            (
+                r.id.clone(),
+                crate::nutrition::recipe_nutrition(r, extra).macros,
+            )
+        })
+        .collect()
+}
+
+fn print_plan_constraints(violations: &[crate::planning::BoundViolation]) {
+    println!("\nNutrition constraints:");
+    if violations.is_empty() {
+        println!("  All configured bounds satisfied.");
+        return;
+    }
+    println!("  Best effort; {} bound(s) not met:", violations.len());
+    for v in violations {
+        println!("  - {v}");
+    }
 }
 
 fn print_plan_nutrition(pn: &crate::nutrition::PlanNutrition) {
