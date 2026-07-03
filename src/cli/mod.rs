@@ -462,10 +462,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 if !nutrition.is_empty() {
                     let violations =
                         plan_bound_violations(&recipes, &plan, &nutrition, &recipe_macros);
-                    print_plan_constraints(!violations.is_empty(), &violations);
-                    for v in &violations {
-                        eprintln!("warning: nutrition constraint violated: {v}");
-                    }
+                    print_plan_constraints(&violations);
                 }
             }
             if !dry_run {
@@ -798,14 +795,15 @@ fn recipe_macros_for_pool(
         .collect()
 }
 
-fn print_plan_constraints(has_violations: bool, violations: &[crate::planning::BoundViolation]) {
+fn print_plan_constraints(violations: &[crate::planning::BoundViolation]) {
     println!("\nNutrition constraints:");
-    if !has_violations {
+    if violations.is_empty() {
         println!("  All configured bounds satisfied.");
         return;
     }
+    println!("  Best effort; {} bound(s) not met:", violations.len());
     for v in violations {
-        println!("  violation: {v}");
+        println!("  - {v}");
     }
 }
 

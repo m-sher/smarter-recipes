@@ -17,7 +17,8 @@
 //! Optional [`NutritionBounds`] steer selection using precomputed whole-recipe
 //! estimated [`Macros`]: prefer schedules that satisfy per-meal, per-day, and
 //! plan-total min/max ranges; if none are feasible, return the least total
-//! violation (then min-union) and list violations in the rationale.
+//! violation (then min-union). The rationale records a short status; callers
+//! render the full violation list separately (e.g. CLI summary).
 //!
 //! When [`PlanOptions::recipe_macros`] contains an estimate for a recipe with
 //! `kcal <= 0`, that recipe is dropped from the pool entirely (not a meal).
@@ -455,14 +456,6 @@ pub fn plan_bound_violations(
     evaluate_schedule(bounds, &per_day, &per_meal, &plan_total)
 }
 
-fn format_violations(violations: &[BoundViolation]) -> String {
-    violations
-        .iter()
-        .map(|v| v.to_string())
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 /// Build a meal plan from a candidate pool (no recipe repeats by id or
 /// normalized title).
 ///
@@ -473,7 +466,7 @@ fn format_violations(violations: &[BoundViolation]) -> String {
 /// When `opts.nutrition` is non-empty, selection prefers schedules that satisfy
 /// macro min/max bounds (estimated whole-recipe macros in `opts.recipe_macros`).
 /// If no feasible schedule exists, the least-violation plan is returned and
-/// violations are listed in the rationale.
+/// the rationale notes the violation count (details via [`plan_bound_violations`]).
 pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let slots = opts
         .days
@@ -609,8 +602,8 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         " Nutrition constraints satisfied.".to_string()
     } else {
         format!(
-            " Nutrition constraint violations (best effort): {}.",
-            format_violations(&scored.violations)
+            " Nutrition constraints not fully met (best effort, {} violation(s)).",
+            scored.violations.len()
         )
     };
 
@@ -1178,7 +1171,8 @@ mod tests {
             "expected feasible plan, got {violations:?}"
         );
         assert!(plan.rationale.to_lowercase().contains("nutrition"));
-        assert!(!plan.rationale.to_lowercase().contains("violation"));
+        assert!(plan.rationale.to_lowercase().contains("satisfied"));
+        assert!(!plan.rationale.contains("day "));
     }
 
     #[test]
@@ -1227,7 +1221,15 @@ mod tests {
         assert_eq!(plan.meals.len(), 2);
         let violations = plan_bound_violations(&pool, &plan, &nutrition, &macros);
         assert!(!violations.is_empty());
-        assert!(plan.rationale.to_lowercase().contains("violation"));
+        assert!(plan.rationale.to_lowercase().contains("best effort"));
+        assert!(
+            plan.rationale
+                .contains(&format!("{} violation(s)", violations.len())),
+            "rationale should include violation count only, got: {}",
+            plan.rationale
+        );
+        // Details belong in plan_bound_violations / CLI summary, not inline.
+        assert!(!plan.rationale.contains("protein_g"));
     }
 
     #[test]
