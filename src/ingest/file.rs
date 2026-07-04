@@ -24,6 +24,8 @@ struct RecipeFile {
     #[serde(default)]
     cuisine: Option<String>,
     #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
     prep_time_minutes: Option<u32>,
@@ -98,6 +100,7 @@ fn file_to_recipe(file: RecipeFile, source: RecipeSource) -> Recipe {
     recipe.meta = RecipeMeta {
         author: file.author,
         cuisine: file.cuisine,
+        category: file.category,
         tags: file.tags,
         prep_time_minutes: file.prep_time_minutes,
         cook_time_minutes: file.cook_time_minutes,

@@ -57,6 +57,12 @@ pub enum RecipeSource {
 pub struct RecipeMeta {
     pub author: Option<String>,
     pub cuisine: Option<String>,
+    /// schema.org `recipeCategory` — the publisher's own classification
+    /// ("Main Course", "Sauce", "Dessert", …). Used to tell standalone meals
+    /// from components (sauces, dressings, condiments). Joined when the source
+    /// lists several.
+    #[serde(default)]
+    pub category: Option<String>,
     pub tags: Vec<String>,
     pub prep_time_minutes: Option<u32>,
     pub cook_time_minutes: Option<u32>,

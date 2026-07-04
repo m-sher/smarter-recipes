@@ -291,7 +291,10 @@ fn recipe_from_json_ld(obj: &Value) -> Option<Recipe> {
         meta.cuisine = Some(c.to_string());
     }
     if let Some(cats) = obj.get("recipeCategory") {
-        meta.tags = json_ld_string_list(cats);
+        let list = json_ld_string_list(cats);
+        if !list.is_empty() {
+            meta.category = Some(list.join(", "));
+        }
     }
     if let Some(n) = obj.get("nutrition") {
         meta.nutrition = nutrition_from_json_ld(n);
@@ -474,6 +477,33 @@ mod tests {
         assert_eq!(r.ingredients.len(), 3);
         assert_eq!(r.steps.len(), 2);
         assert_eq!(r.meta.author.as_deref(), Some("Ada"));
+    }
+
+    #[test]
+    fn json_ld_captures_recipe_category() {
+        // A single recipeCategory string.
+        let one = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Recipe","name":"Tahini Sauce",
+         "recipeCategory":"Sauce","recipeIngredient":["1/2 cup tahini","2 tbsp lemon juice"]}
+        </script></head><body></body></html>"#;
+        let src = UrlSource {
+            offline_html: Some(one.into()),
+            ..Default::default()
+        };
+        let r = src.ingest("https://example.com/tahini").unwrap();
+        assert_eq!(r.meta.category.as_deref(), Some("Sauce"));
+
+        // An array of categories is joined.
+        let many = r#"<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Recipe","name":"Chili",
+         "recipeCategory":["Main Course","Dinner"],"recipeIngredient":["1 lb beef","1 can beans"]}
+        </script></head><body></body></html>"#;
+        let src = UrlSource {
+            offline_html: Some(many.into()),
+            ..Default::default()
+        };
+        let r = src.ingest("https://example.com/chili").unwrap();
+        assert_eq!(r.meta.category.as_deref(), Some("Main Course, Dinner"));
     }
 
     #[test]

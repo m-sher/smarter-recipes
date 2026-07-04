@@ -1248,6 +1248,9 @@ fn print_recipe_summary(r: &Recipe) {
 fn print_recipe_detail(r: &Recipe) {
     println!("{}", r.title);
     println!("id:       {}", r.id);
+    if let Some(c) = &r.meta.category {
+        println!("category: {c}");
+    }
     if let Some(s) = r.servings {
         println!("servings: {s}");
     }
