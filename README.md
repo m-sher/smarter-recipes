@@ -17,12 +17,7 @@ CLI tool that ingests recipes from multiple sources, stores them in a local SQLi
 ## Requirements
 
 - **Rust** 1.74+ (edition 2021)
-- **A C++ compiler, [CMake](https://cmake.org/), and libclang** — the nutrition-constrained
-  planner solves an exact integer program with [HiGHS](https://highs.dev/), which is built
-  from source on first compile. On Debian/Ubuntu: `sudo apt install cmake g++ libclang-dev`
-  (macOS: `brew install cmake` — the toolchain ships Clang; other platforms need the
-  equivalent). If libclang is installed somewhere non-standard, point bindgen at it with
-  `export LIBCLANG_PATH=/path/to/dir/containing/libclang`.
+- **CMake, a C++ compiler, and libclang** — [HiGHS](https://highs.dev/) (the exact meal-plan solver) is built from source. Debian/Ubuntu: `sudo apt install cmake g++ libclang-dev`.
 - **Optional:** [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for image import (`tesseract` on `PATH`)
 - Network access only for `import url …` (core logic runs fully offline)
 

@@ -725,28 +725,21 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
 
     let rationale = if bounds.is_empty() {
         format!(
-            "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
-             Multi-start greedy selection minimizes distinct ingredient keys \
-             (no recipe repeats). {pantry_note}{non_meal_note}{nutrition_note}{partial_note}",
+            "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
+             no recipe repeats. {pantry_note}{non_meal_note}{nutrition_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
         )
     } else {
-        let (lead, method) = if planner_ilp {
-            (
-                "Exact ILP planner",
-                "Integer optimization minimizes distinct ingredient keys under the configured nutrition bounds",
-            )
+        let lead = if planner_ilp {
+            "Exact ILP planner"
         } else {
-            (
-                "Best-effort planner",
-                "Greedy fallback minimizes distinct ingredient keys under the configured nutrition bounds",
-            )
+            "Best-effort planner"
         };
         format!(
-            "{lead}: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
-             {method} (no recipe repeats). {pantry_note}{non_meal_note}{nutrition_note}{partial_note}",
+            "{lead}: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
+             no recipe repeats. {pantry_note}{non_meal_note}{nutrition_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
