@@ -33,7 +33,7 @@ use microlp::{ComparisonOp, OptimizationDirection, Problem, Solution, StopReason
 
 use super::{
     evaluate_macros, weighted_magnitude, BoundScope, GreedyInput, MacroBounds, MacroRange,
-    MacroRatio, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
+    MacroRatio, NutritionBounds, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
 };
 use crate::domain::{Macros, UnitKind};
 use crate::shopping::pantry_quantity_for;
@@ -198,27 +198,55 @@ pub(super) fn solve_constrained(input: &GreedyInput<'_>, target: usize) -> Optio
     let used_days = target.div_ceil(mpd);
     let needs_partition = !input.bounds.per_day.is_empty() && used_days >= 2 && mpd >= 2;
 
-    let int_vars = if needs_partition { p * used_days } else { p };
-    if int_vars > MAX_ILP_INT_VARS {
-        return None;
-    }
-
-    // Canonical recipe order (title, id): the model — and thus the solution —
-    // is independent of the incoming pool order.
-    let mut order: Vec<usize> = (0..p).collect();
-    order.sort_by(|&a, &b| {
+    // Canonical recipe order (title, id): deterministic, pool-order independent.
+    let canonical = |a: usize, b: usize| {
         input.pool[a]
             .title
             .as_str()
             .cmp(input.pool[b].title.as_str())
             .then(input.pool[a].id.as_str().cmp(input.pool[b].id.as_str()))
-    });
+    };
+    let mut order: Vec<usize> = (0..p).collect();
+    order.sort_by(|&a, &b| canonical(a, b));
+
+    // The exact solver is only tractable for a few hundred binaries. Rather than
+    // drop a large pool to the nutrition-blind greedy planner, shortlist the
+    // recipes that best fit the bounds on their own (for a ratio target, the
+    // ones closest to the target split) and solve exactly over those. Re-sorting
+    // canonically keeps the model — and solution — pool-order independent.
+    let per_recipe_cap = if needs_partition {
+        MAX_ILP_INT_VARS / used_days
+    } else {
+        MAX_ILP_INT_VARS
+    };
+    if per_recipe_cap < target {
+        return None;
+    }
+    if order.len() > per_recipe_cap {
+        order.sort_by(|&a, &b| {
+            recipe_fit(input.bounds, &input.macros[a])
+                .partial_cmp(&recipe_fit(input.bounds, &input.macros[b]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| canonical(a, b))
+        });
+        order.truncate(per_recipe_cap);
+        order.sort_by(|&a, &b| canonical(a, b));
+    }
 
     if needs_partition {
         solve_partition(input, &order, target, mpd, used_days)
     } else {
         solve_flat(input, &order, target, used_days)
     }
+}
+
+/// How poorly a single recipe fits the bounds treated as one meal / day / plan.
+/// Used to shortlist candidates when the pool is too large for the exact solver;
+/// lower is better (0 = fits every configured scope on its own).
+fn recipe_fit(bounds: &NutritionBounds, m: &Macros) -> f64 {
+    recipe_violation(&bounds.per_meal, m)
+        + recipe_violation(&bounds.per_day, m)
+        + recipe_violation(&bounds.plan, m)
 }
 
 /// Non-partition model: one binary per recipe. Per-day bounds either collapse to

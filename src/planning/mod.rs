@@ -177,20 +177,25 @@ fn apply_recipe_to_coverage(
     new_count
 }
 
-/// True when a precomputed estimate exists and reports no calories.
-fn is_zero_kcal_meal(recipe_macros: &HashMap<RecipeId, Macros>, id: &RecipeId) -> bool {
-    recipe_macros
-        .get(id)
-        .is_some_and(|m| m.kcal <= 0.0 || !m.kcal.is_finite())
+/// True when a precomputed estimate exists but the recipe cannot serve as a
+/// macro-characterizable meal: it reports no calories, or calories with no
+/// protein/fat/carbs at all (e.g. an alcohol-only recipe, whose kcal come from
+/// ethanol). Such recipes are excluded so the planner cannot use them to
+/// trivially "satisfy" a macro-split ratio — a scope with zero total macro
+/// grams has no split to check, which the exact solver would otherwise exploit.
+fn is_non_meal_estimate(recipe_macros: &HashMap<RecipeId, Macros>, id: &RecipeId) -> bool {
+    recipe_macros.get(id).is_some_and(|m| {
+        !m.kcal.is_finite() || m.kcal <= 0.0 || m.protein_g + m.fat_g + m.carbs_g <= 0.0
+    })
 }
 
 /// Deduplicate by `recipe_id`, drop empty-ingredient recipes when any non-empty
-/// recipe exists, drop recipes whose precomputed estimate is zero kcal, then
-/// collapse by normalized title key (first wins among survivors). Empty
-/// filtering must run before title collapse so an empty stub cannot claim a
-/// title and block a fuller same-title recipe. Returns recipes paired with
-/// precomputed requirements and key sets, plus how many candidates were removed
-/// for zero estimated calories.
+/// recipe exists, drop recipes whose precomputed estimate cannot serve as a meal
+/// (no calories, or calories with no macro breakdown), then collapse by
+/// normalized title key (first wins among survivors). Empty filtering must run
+/// before title collapse so an empty stub cannot claim a title and block a
+/// fuller same-title recipe. Returns recipes paired with precomputed
+/// requirements and key sets, plus how many candidates were removed as non-meals.
 fn normalize_pool<'a>(
     pool: &'a [Recipe],
     recipe_macros: &HashMap<RecipeId, Macros>,
@@ -224,14 +229,14 @@ fn normalize_pool<'a>(
         }
     }
 
-    let mut dropped_zero_kcal = 0usize;
+    let mut dropped_non_meal = 0usize;
     let mut i = 0;
     while i < recipes.len() {
-        if is_zero_kcal_meal(recipe_macros, &recipes[i].id) {
+        if is_non_meal_estimate(recipe_macros, &recipes[i].id) {
             recipes.remove(i);
             reqs.remove(i);
             keys.remove(i);
-            dropped_zero_kcal += 1;
+            dropped_non_meal += 1;
         } else {
             i += 1;
         }
@@ -250,7 +255,7 @@ fn normalize_pool<'a>(
         out_reqs.push(r_reqs);
         out_keys.push(k);
     }
-    (out_recipes, out_reqs, out_keys, dropped_zero_kcal)
+    (out_recipes, out_reqs, out_keys, dropped_non_meal)
 }
 
 /// Full union size of ingredient keys for recipes at the given pool indices.
@@ -593,15 +598,15 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let pantry = &opts.pantry;
     let bounds = &opts.nutrition;
 
-    let (pool, reqs, keys, dropped_zero_kcal) = normalize_pool(pool, &opts.recipe_macros);
+    let (pool, reqs, keys, dropped_non_meal) = normalize_pool(pool, &opts.recipe_macros);
     let macros = align_macros(&pool, opts);
 
     if pool.is_empty() || slots == 0 {
         let rationale = if slots == 0 {
             "Empty pool or zero slots; no meals planned.".into()
-        } else if dropped_zero_kcal > 0 {
+        } else if dropped_non_meal > 0 {
             format!(
-                "No meals planned: all {dropped_zero_kcal} candidate recipe(s) had no estimated calories (kcal <= 0), so none qualify as meals."
+                "No meals planned: all {dropped_non_meal} candidate recipe(s) had no estimated calories or no macro breakdown, so none qualify as meals."
             )
         } else {
             "Empty pool or zero slots; no meals planned.".into()
@@ -679,9 +684,9 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         })
         .collect();
 
-    let zero_kcal_note = if dropped_zero_kcal > 0 {
+    let non_meal_note = if dropped_non_meal > 0 {
         format!(
-            " Excluded {dropped_zero_kcal} recipe(s) with no estimated calories (kcal <= 0; not treated as meals)."
+            " Excluded {dropped_non_meal} recipe(s) with no estimated calories or no macro breakdown (not treated as meals)."
         )
     } else {
         String::new()
@@ -722,7 +727,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         format!(
             "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
              Multi-start greedy selection minimizes distinct ingredient keys \
-             (no recipe repeats). {pantry_note}{zero_kcal_note}{nutrition_note}{partial_note}",
+             (no recipe repeats). {pantry_note}{non_meal_note}{nutrition_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
@@ -741,7 +746,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         };
         format!(
             "{lead}: {} meal(s) over {} day(s) from a pool of {} unique recipe(s). \
-             {method} (no recipe repeats). {pantry_note}{zero_kcal_note}{nutrition_note}{partial_note}",
+             {method} (no recipe repeats). {pantry_note}{non_meal_note}{nutrition_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
@@ -1466,6 +1471,51 @@ mod tests {
     }
 
     #[test]
+    fn calories_without_macros_excluded_from_pool() {
+        // An alcohol-only recipe carries kcal (from ethanol) but zero
+        // protein/fat/carbs, so a macro-split ratio has no split to evaluate.
+        // It must be excluded, or the exact solver would pick it to trivially
+        // "satisfy" a ratio (and it isn't a nutritional meal anyway).
+        let real = rec_with_id("real", "Chicken", &["200 g chicken"]);
+        let booze = rec_with_id("booze", "Cocktail", &["3 oz vodka"]);
+        let macros = macro_map(&[
+            (
+                "real",
+                Macros {
+                    kcal: 300.0,
+                    protein_g: 40.0,
+                    fat_g: 10.0,
+                    carbs_g: 5.0,
+                },
+            ),
+            (
+                "booze",
+                Macros {
+                    kcal: 196.0,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let plan = plan_meals(
+            &[real, booze],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                recipe_macros: macros,
+                ..Default::default()
+            },
+        );
+        // Only the real recipe qualifies; the calorie-only recipe is dropped.
+        assert_eq!(plan.meals.len(), 1);
+        assert_eq!(plan.meals[0].recipe_title, "Chicken");
+        assert!(
+            plan.rationale.to_lowercase().contains("no macro breakdown"),
+            "rationale should note the macro-less exclusion: {}",
+            plan.rationale
+        );
+    }
+
+    #[test]
     fn per_meal_min_filters_too_low_protein_recipe() {
         let low = rec_with_id("low", "Broth", &["1 cup broth"]);
         let high = rec_with_id("high", "Steak", &["200 g beef"]);
@@ -1790,32 +1840,45 @@ mod tests {
     }
 
     #[test]
-    fn ilp_size_guard_falls_back_to_greedy() {
-        // A pool past the integer-variable guard must fall back to the greedy
-        // planner and still return a valid, feasible plan.
+    fn large_pool_shortlists_for_exact_solver() {
+        // A pool larger than the exact-solver cap is shortlisted to the best-
+        // fitting candidates and still solved exactly (not dropped to greedy).
+        // Here one recipe hits the 40/30/30 split; the rest are carb-heavy, so
+        // the shortlist+ILP must find and pick the matching one.
         let mut pool = Vec::new();
         let mut macros = HashMap::new();
-        for i in 0..130u32 {
+        for i in 0..200u32 {
             let id = format!("r{i}");
             pool.push(rec_with_id(
                 &id,
                 &format!("R{i:03}"),
                 &[&format!("1 cup ing{i}")],
             ));
-            macros.insert(
-                RecipeId::from(id.as_str()),
+            // Carb-heavy filler except one balanced recipe.
+            let m = if i == 137 {
                 Macros {
-                    kcal: 200.0,
-                    protein_g: 10.0,
-                    ..Default::default()
-                },
-            );
+                    kcal: 400.0,
+                    protein_g: 40.0,
+                    fat_g: 30.0,
+                    carbs_g: 30.0,
+                }
+            } else {
+                Macros {
+                    kcal: 400.0,
+                    protein_g: 5.0,
+                    fat_g: 5.0,
+                    carbs_g: 90.0,
+                }
+            };
+            macros.insert(RecipeId::from(id.as_str()), m);
         }
         let nutrition = NutritionBounds {
             per_day: MacroBounds {
-                protein_g: MacroRange {
-                    min: Some(1.0),
-                    max: None,
+                ratio: MacroRatio {
+                    protein: Some(40.0),
+                    fat: Some(30.0),
+                    carb: Some(30.0),
+                    tolerance: None,
                 },
                 ..Default::default()
             },
@@ -1824,20 +1887,25 @@ mod tests {
         let plan = plan_meals(
             &pool,
             &PlanOptions {
-                days: 3,
+                days: 1,
                 meals_per_day: 1,
-                nutrition,
-                recipe_macros: macros,
+                nutrition: nutrition.clone(),
+                recipe_macros: macros.clone(),
                 ..Default::default()
             },
         );
-        assert_eq!(plan.meals.len(), 3);
-        assert_eq!(unique_recipe_ids(&plan), 3);
-        assert!(
-            plan.rationale.contains("Best-effort planner"),
-            "large pool should trigger greedy fallback: {}",
+        assert_eq!(plan.meals.len(), 1);
+        assert_eq!(
+            plan.meals[0].recipe_title, "R137",
+            "shortlist+ILP must find the one ratio-matching recipe: {}",
             plan.rationale
         );
+        assert!(
+            plan.rationale.contains("Exact ILP planner"),
+            "{}",
+            plan.rationale
+        );
+        assert!(plan_bound_violations(&pool, &plan, &nutrition, &macros).is_empty());
     }
 
     #[test]
