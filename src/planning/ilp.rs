@@ -2,7 +2,7 @@
 //!
 //! The greedy planner in [`super`] minimizes the distinct-ingredient union but
 //! only *steers* by nutrition. When bounds are configured we instead solve the
-//! selection exactly with a small MILP (via [`microlp`], pure Rust):
+//! selection exactly with a MILP (solved by HiGHS, a high-performance solver):
 //!
 //! * **Variables** — one binary `x` per candidate recipe (flat model) or per
 //!   `(recipe, day)` cell when a per-day bound must partition meals across days.
@@ -22,29 +22,145 @@
 //! integer; `y` and slacks are integral at the optimum on their own, which keeps
 //! the branch-and-bound tree small.
 //!
-//! Returns `None` (caller falls back to the greedy planner) when the model is
-//! too large, the solver errors, or it hits the time budget — so we never hang
-//! and never return a plan worse than today's.
+//! Returns `None` (caller falls back to the greedy planner) only when the exact
+//! model yields nothing usable — the problem is infeasible, or the time budget
+//! elapsed before any feasible plan was found. Otherwise it returns the proven
+//! optimum, or the best feasible plan found within the budget — so we never hang
+//! and never return a plan worse than today's. HiGHS handles the full pool, so
+//! every recipe is a candidate: no size cap, no shortlist.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use microlp::{ComparisonOp, OptimizationDirection, Problem, Solution, StopReason, Variable};
+use backend::{ComparisonOp, OptimizationDirection, Problem, Solution, Variable};
 
 use super::{
     evaluate_macros, weighted_magnitude, BoundScope, GreedyInput, MacroBounds, MacroRange,
-    MacroRatio, NutritionBounds, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
+    MacroRatio, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
 };
 use crate::domain::{Macros, UnitKind};
 use crate::shopping::pantry_quantity_for;
 
 /// Wall-clock backstop per solve so a pathological instance can't hang.
 const SOLVE_TIME_LIMIT: Duration = Duration::from_secs(5);
-/// Skip the exact solve above this many integer (selection) variables and let
-/// the caller fall back to the greedy planner.
-const MAX_ILP_INT_VARS: usize = 120;
 /// Slack allowed above the phase-1 optimum when minimizing the union in phase 2.
 const VIOLATION_EPS: f64 = 1e-6;
+
+/// Thin adapter over the HiGHS MILP solver presenting the small building-block
+/// API the models below use (binary/continuous columns, linear rows, a solve
+/// that succeeds whenever a feasible primal is available). Keeping it local means
+/// the model code reads the same regardless of backend, and a future solver swap
+/// touches only this module.
+mod backend {
+    use std::borrow::Borrow;
+    use std::ops::Index;
+
+    use highs::{Col, HighsSolutionStatus, RowProblem, Sense};
+
+    /// Objective direction. Only minimization is used, but kept as an enum so the
+    /// call sites read like a conventional solver API.
+    pub enum OptimizationDirection {
+        Minimize,
+    }
+
+    /// A linear constraint's comparison against its right-hand side.
+    #[derive(Clone, Copy)]
+    pub enum ComparisonOp {
+        Eq,
+        Le,
+        Ge,
+    }
+
+    /// A decision-variable handle (a HiGHS column).
+    pub type Variable = Col;
+
+    /// A model under construction.
+    pub struct Problem {
+        inner: RowProblem,
+    }
+
+    impl Problem {
+        pub fn new(_direction: OptimizationDirection) -> Self {
+            Problem {
+                inner: RowProblem::default(),
+            }
+        }
+
+        /// Add a binary (0/1 integer) variable with the given objective coefficient.
+        pub fn add_binary_var(&mut self, objective: f64) -> Variable {
+            self.inner.add_integer_column(objective, 0..=1)
+        }
+
+        /// Add a continuous variable bounded to `[lo, hi]` with the given
+        /// objective coefficient.
+        pub fn add_var(&mut self, objective: f64, (lo, hi): (f64, f64)) -> Variable {
+            self.inner.add_column(objective, lo..=hi)
+        }
+
+        /// Add the linear constraint `Σ coef·var  {=,≤,≥}  rhs`.
+        pub fn add_constraint<I>(&mut self, terms: I, op: ComparisonOp, rhs: f64)
+        where
+            I: IntoIterator,
+            I::Item: Borrow<(Variable, f64)>,
+        {
+            let factors = terms.into_iter().map(|t| *t.borrow());
+            match op {
+                ComparisonOp::Eq => self.inner.add_row(rhs..=rhs, factors),
+                ComparisonOp::Le => self.inner.add_row(f64::NEG_INFINITY..=rhs, factors),
+                ComparisonOp::Ge => self.inner.add_row(rhs..=f64::INFINITY, factors),
+            }
+        }
+
+        /// Solve within `time_limit_secs`. Returns a [`Solution`] whenever the
+        /// solver has a feasible primal — a proven optimum, or the best incumbent
+        /// found so far if it hit the time limit first. Only genuine infeasibility
+        /// (or no incumbent yet) yields `None`, so the caller falls back to greedy
+        /// exactly when the exact model gives us nothing usable.
+        ///
+        /// The default MIP gap (1e-4) is left in place: our objectives are
+        /// integer-dominated (a distinct-ingredient count, plus a violation
+        /// magnitude that is zero for any feasible plan), so that gap resolves to
+        /// the exact optimum while letting HiGHS stop as soon as it finds it
+        /// rather than exhaustively proving it — the difference between a
+        /// sub-second solve and a timeout on the larger partition models. The
+        /// seed is fixed so tie-breaking is reproducible.
+        pub fn solve(self, time_limit_secs: f64) -> Option<Solution> {
+            let mut model = self.inner.optimise(Sense::Minimise);
+            model.make_quiet();
+            model.set_option("time_limit", time_limit_secs);
+            model.set_option("random_seed", 0);
+            let solved = model.solve();
+            if solved.primal_solution_status() != HighsSolutionStatus::Feasible {
+                return None;
+            }
+            Some(Solution {
+                objective: solved.objective_value(),
+                columns: solved.get_solution().columns().to_vec(),
+            })
+        }
+    }
+
+    /// A solved model's result — the objective value plus each variable's value,
+    /// indexable by its [`Variable`] handle. Optimal when the solve proved it,
+    /// otherwise the best feasible incumbent found within the time budget.
+    pub struct Solution {
+        objective: f64,
+        columns: Vec<f64>,
+    }
+
+    impl Solution {
+        pub fn objective(&self) -> f64 {
+            self.objective
+        }
+    }
+
+    impl Index<Variable> for Solution {
+        type Output = f64;
+        fn index(&self, var: Variable) -> &f64 {
+            &self.columns[var.index()]
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Phase {
@@ -178,12 +294,8 @@ fn add_ratio_slacks(
     }
 }
 
-fn solve_checked(mut prob: Problem) -> Option<Solution> {
-    prob.set_time_limit(SOLVE_TIME_LIMIT);
-    match prob.solve() {
-        Ok(sol) if *sol.stop_reason() == StopReason::Finished => Some(sol),
-        _ => None,
-    }
+fn solve_checked(prob: Problem) -> Option<Solution> {
+    prob.solve(SOLVE_TIME_LIMIT.as_secs_f64())
 }
 
 /// Exactly select `target` recipes from `input.pool` to satisfy the configured
@@ -191,7 +303,8 @@ fn solve_checked(mut prob: Problem) -> Option<Solution> {
 /// plan (row-major) order. `None` means the caller should fall back to greedy.
 pub(super) fn solve_constrained(input: &GreedyInput<'_>, target: usize) -> Option<Vec<usize>> {
     let p = input.pool.len();
-    if target == 0 || p == 0 {
+    // Nothing to solve, or more meals requested than distinct recipes exist.
+    if target == 0 || p == 0 || target > p {
         return None;
     }
     let mpd = input.meals_per_day.max(1) as usize;
@@ -206,47 +319,15 @@ pub(super) fn solve_constrained(input: &GreedyInput<'_>, target: usize) -> Optio
             .cmp(input.pool[b].title.as_str())
             .then(input.pool[a].id.as_str().cmp(input.pool[b].id.as_str()))
     };
+    // Every recipe is a candidate — HiGHS solves the full pool exactly.
     let mut order: Vec<usize> = (0..p).collect();
     order.sort_by(|&a, &b| canonical(a, b));
-
-    // The exact solver is only tractable for a few hundred binaries. Rather than
-    // drop a large pool to the nutrition-blind greedy planner, shortlist the
-    // recipes that best fit the bounds on their own (for a ratio target, the
-    // ones closest to the target split) and solve exactly over those. Re-sorting
-    // canonically keeps the model — and solution — pool-order independent.
-    let per_recipe_cap = if needs_partition {
-        MAX_ILP_INT_VARS / used_days
-    } else {
-        MAX_ILP_INT_VARS
-    };
-    if per_recipe_cap < target {
-        return None;
-    }
-    if order.len() > per_recipe_cap {
-        order.sort_by(|&a, &b| {
-            recipe_fit(input.bounds, &input.macros[a])
-                .partial_cmp(&recipe_fit(input.bounds, &input.macros[b]))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| canonical(a, b))
-        });
-        order.truncate(per_recipe_cap);
-        order.sort_by(|&a, &b| canonical(a, b));
-    }
 
     if needs_partition {
         solve_partition(input, &order, target, mpd, used_days)
     } else {
         solve_flat(input, &order, target, used_days)
     }
-}
-
-/// How poorly a single recipe fits the bounds treated as one meal / day / plan.
-/// Used to shortlist candidates when the pool is too large for the exact solver;
-/// lower is better (0 = fits every configured scope on its own).
-fn recipe_fit(bounds: &NutritionBounds, m: &Macros) -> f64 {
-    recipe_violation(&bounds.per_meal, m)
-        + recipe_violation(&bounds.per_day, m)
-        + recipe_violation(&bounds.plan, m)
 }
 
 /// Non-partition model: one binary per recipe. Per-day bounds either collapse to

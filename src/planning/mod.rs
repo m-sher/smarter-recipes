@@ -1840,11 +1840,10 @@ mod tests {
     }
 
     #[test]
-    fn large_pool_shortlists_for_exact_solver() {
-        // A pool larger than the exact-solver cap is shortlisted to the best-
-        // fitting candidates and still solved exactly (not dropped to greedy).
-        // Here one recipe hits the 40/30/30 split; the rest are carb-heavy, so
-        // the shortlist+ILP must find and pick the matching one.
+    fn large_pool_solved_exactly() {
+        // A large pool is solved exactly in full (no size cap, no shortlist, no
+        // greedy fallback). Here one recipe hits the 40/30/30 split; the rest are
+        // carb-heavy, so the exact solver must find and pick the matching one.
         let mut pool = Vec::new();
         let mut macros = HashMap::new();
         for i in 0..200u32 {
@@ -1897,7 +1896,7 @@ mod tests {
         assert_eq!(plan.meals.len(), 1);
         assert_eq!(
             plan.meals[0].recipe_title, "R137",
-            "shortlist+ILP must find the one ratio-matching recipe: {}",
+            "the exact solver must find the one ratio-matching recipe: {}",
             plan.rationale
         );
         assert!(

@@ -10,13 +10,19 @@ CLI tool that ingests recipes from multiple sources, stores them in a local SQLi
 | **Normalization** | Free-text ingredient lines → name, quantity, unit; units converted to canonical g / ml / ea for aggregation |
 | **Storage** | Embedded SQLite; ingredients deduplicated by `(name, unit kind)`; pantry stock by same identity |
 | **Pantry** | Track on-hand ingredients; mark shopping results as purchased; plan and shop net of stock |
-| **Planning** | Min-union scheduler (exact ILP under nutrition constraints), no recipe repeats; pantry stock with quantity-aware binary shortfall; optional per-scope min/max **and macro-split ratio** bounds from TOML (per-day min/max also via CLI flags) (documented in `src/planning/mod.rs`) |
+| **Planning** | Min-union scheduler (exact ILP via HiGHS over the full pool under nutrition constraints), no recipe repeats; pantry stock with quantity-aware binary shortfall; optional per-scope min/max **and macro-split ratio** bounds from TOML (per-day min/max also via CLI flags) (documented in `src/planning/mod.rs`) |
 | **Shopping** | Package multiset optimization: **cost first**, then **minimum leftover**; requirements reduced by pantry (documented in `src/shopping/mod.rs`) |
 | **Extensibility** | New ingest sources implement `RecipeSourceIngest`; custom package catalogs via JSON overlay |
 
 ## Requirements
 
 - **Rust** 1.74+ (edition 2021)
+- **A C++ compiler, [CMake](https://cmake.org/), and libclang** — the nutrition-constrained
+  planner solves an exact integer program with [HiGHS](https://highs.dev/), which is built
+  from source on first compile. On Debian/Ubuntu: `sudo apt install cmake g++ libclang-dev`
+  (macOS: `brew install cmake` — the toolchain ships Clang; other platforms need the
+  equivalent). If libclang is installed somewhere non-standard, point bindgen at it with
+  `export LIBCLANG_PATH=/path/to/dir/containing/libclang`.
 - **Optional:** [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for image import (`tesseract` on `PATH`)
 - Network access only for `import url …` (core logic runs fully offline)
 
@@ -197,9 +203,9 @@ src/
 
 ### Planning algorithm (summary)
 
-**Unconstrained:** multi-start greedy — for each possible first recipe, repeatedly append the unused candidate that adds the fewest new **to-buy** keys after quantity-aware pantry consumption (shared with shopping’s stock ledger); keep the schedule with the smallest net to-buy count. Partial stock does not fully exempt a key. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. Recipes whose estimated whole-recipe energy is `kcal <= 0` are dropped from the pool (not treated as meals).
+**Unconstrained:** multi-start greedy — for each possible first recipe, repeatedly append the unused candidate that adds the fewest new **to-buy** keys after quantity-aware pantry consumption (shared with shopping’s stock ledger); keep the schedule with the smallest net to-buy count. Partial stock does not fully exempt a key. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. Recipes whose estimate reports no calories, or calories with no protein/fat/carbs at all (e.g. an alcohol-only recipe), are dropped from the pool (not treated as meals).
 
-**With nutrition bounds:** the selection is solved exactly as a small integer program (pure-Rust `microlp`) with a two-phase lexicographic objective — first minimize total bound-violation magnitude (so a feasible plan is returned whenever one exists), then minimize the net to-buy count. Falls back to the greedy scheduler if the model is too large or the solver declines. See module docs in `src/planning/mod.rs` and `src/planning/ilp.rs`.
+**With nutrition bounds:** the selection is solved as an integer program over the **whole recipe pool** (no candidate cap) by [HiGHS](https://highs.dev/), with a two-phase lexicographic objective — first minimize total bound-violation magnitude (so a feasible plan is returned whenever one exists), then minimize the net to-buy count. When a solve can't be proven optimal within its time budget, the best feasible plan found so far is used; the greedy scheduler is the fallback only if the solver returns nothing usable. See module docs in `src/planning/mod.rs` and `src/planning/ilp.rs`.
 
 ### Nutrition bounds TOML
 
