@@ -110,6 +110,17 @@ pub enum Commands {
     },
     /// Delete a recipe by id
     Delete { id: String },
+    /// Remove non-meal pages (roundups, how-to guides, index/extraction junk).
+    /// Dry-run by default; re-run with --apply to delete. Never removes a recipe
+    /// that carries usable published nutrition.
+    Prune {
+        /// Actually delete the listed recipes (default is a dry-run preview).
+        #[arg(long)]
+        apply: bool,
+        /// Comma-separated recipe ids to keep regardless of the check.
+        #[arg(long)]
+        keep: Option<String>,
+    },
     /// Generate a meal plan minimizing distinct ingredients (no recipe repeats)
     Plan {
         /// Number of days
@@ -313,6 +324,12 @@ pub fn run(cli: Cli) -> Result<()> {
                     "Skipped: already have a recipe with this source URL ({})",
                     recipe.title
                 );
+            } else if !crate::ingest::is_cookable(&recipe) {
+                println!(
+                    "Skipped: not a cookable recipe — {} ingredient line(s), too few carry amounts ({})",
+                    recipe.ingredients.len(),
+                    recipe.title
+                );
             } else {
                 store.save_recipe(&recipe)?;
                 println!("Saved recipe {} to {}", recipe.id, store.path().display());
@@ -391,6 +408,50 @@ pub fn run(cli: Cli) -> Result<()> {
             let recipe = resolve_recipe(&store, &id)?;
             store.delete_recipe(recipe.id.as_str())?;
             println!("Deleted {}", recipe.id);
+        }
+        Commands::Prune { apply, keep } => {
+            let keep: std::collections::HashSet<String> = keep
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            let recipes = store.list_recipes(None)?;
+            // Purge a recipe only if it is NOT a cookable meal AND carries no
+            // usable source nutrition. The nutrition guard is load-bearing: the
+            // source-macro bypass admits amount-sparse recipes that publish
+            // macros, so deleting them here would undo that rescue.
+            let candidates: Vec<&Recipe> = recipes
+                .iter()
+                .filter(|r| !keep.contains(r.id.as_str()) && prunable(r))
+                .collect();
+            if candidates.is_empty() {
+                println!("No non-meals to prune.");
+            } else if apply {
+                let mut deleted = 0usize;
+                for r in &candidates {
+                    if store.delete_recipe(r.id.as_str())? {
+                        deleted += 1;
+                    }
+                }
+                println!("Pruned {deleted} non-meal recipe(s).");
+            } else {
+                println!(
+                    "{} non-meal recipe(s) would be pruned (dry run — re-run with --apply to delete):\n",
+                    candidates.len()
+                );
+                for r in &candidates {
+                    println!(
+                        "  {}  {:<48}  {} ingredient line(s)",
+                        short_id(r.id.as_str()),
+                        r.title.chars().take(48).collect::<String>(),
+                        r.ingredients.len(),
+                    );
+                }
+                println!("\nWhitelist any genuine recipes with --keep <id,id,…>, then re-run with --apply.");
+            }
         }
         Commands::Plan {
             days,
@@ -849,11 +910,17 @@ fn scrape_progress_printer(event: ScrapeEvent) {
 
 fn apply_scrape_outcome(store: &Store, outcome: &ScrapeOutcome, dry_run: bool) -> Result<()> {
     let mut skipped_dup = 0usize;
+    let mut skipped_noncookable = 0usize;
     let mut saved = 0usize;
     for recipe in &outcome.recipes {
         let source = recipe_source_url(recipe);
         if store.is_duplicate(source.as_deref())? {
             skipped_dup += 1;
+            continue;
+        }
+        // Keep roundups / index pages / how-to guides out of the catalog.
+        if !crate::ingest::is_cookable(recipe) {
+            skipped_noncookable += 1;
             continue;
         }
         if !dry_run {
@@ -872,19 +939,21 @@ fn apply_scrape_outcome(store: &Store, outcome: &ScrapeOutcome, dry_run: bool) -
 
     if dry_run {
         println!(
-            "(dry run) {} new recipe(s), {} nav (not recipe), {} fetch failed, {} skipped known URL, {} would skip URL/title dup — nothing saved",
+            "(dry run) {} new recipe(s), {} nav (not recipe), {} non-cookable (roundup/guide), {} fetch failed, {} skipped known URL, {} would skip URL/title dup — nothing saved",
             saved,
             outcome.not_recipe.len(),
+            skipped_noncookable,
             outcome.failed.len(),
             outcome.skipped_existing,
             skipped_dup
         );
     } else {
         println!(
-            "Imported {} new recipe(s) to {} ({} nav, {} fetch failed, {} skipped known URL, {} skipped URL/title dup)",
+            "Imported {} new recipe(s) to {} ({} nav, {} non-cookable, {} fetch failed, {} skipped known URL, {} skipped URL/title dup)",
             saved,
             store.path().display(),
             outcome.not_recipe.len(),
+            skipped_noncookable,
             outcome.failed.len(),
             outcome.skipped_existing,
             skipped_dup
@@ -904,10 +973,14 @@ fn nutrition_extra(
         .collect())
 }
 
-/// Whole-recipe macro estimates, plus the set of recipes whose estimable
-/// ingredients are covered below [`crate::planning::MIN_INGREDIENT_COVERAGE`].
-/// The planner drops the latter when nutrition bounds are configured — an
-/// understated estimate can't be trusted against a constraint.
+/// Whole-recipe macros for each recipe, plus the set whose data can't be trusted
+/// against a nutrition bound (the planner drops those when bounds are set).
+///
+/// Prefers the source page's published macros when present and plausible — they
+/// are authoritative and complete. Otherwise falls back to the ingredient
+/// estimate, and flags a recipe low-coverage when fewer than
+/// [`crate::planning::MIN_INGREDIENT_COVERAGE`] of its estimable ingredients
+/// resolve (an understated estimate can't be checked against a constraint).
 fn recipe_macros_for_pool(
     recipes: &[Recipe],
     extra: &std::collections::HashMap<String, crate::domain::Macros>,
@@ -922,15 +995,46 @@ fn recipe_macros_for_pool(
         // Coverage over estimable (quantity-bearing) ingredients only; a recipe
         // with none (all "to taste") is left to the zero-kcal/no-macro filter.
         let estimable = n.covered.len() + n.uncovered.len();
-        if estimable > 0 {
-            let coverage = n.covered.len() as f64 / estimable as f64;
-            if coverage < crate::planning::MIN_INGREDIENT_COVERAGE {
+        let coverage = if estimable > 0 {
+            n.covered.len() as f64 / estimable as f64
+        } else {
+            0.0
+        };
+
+        // Prefer authoritative source macros when they pass a coverage-gated
+        // cross-check. The estimate is systematically understated (unconvertible
+        // units), so only cross-check it against the source where the estimate is
+        // meaningful (>=50% covered, non-trivial kcal): un-bias by coverage and
+        // require the source to land within ~2.5x. Below that, the estimate is
+        // too unreliable to judge — accept the (already sanity-checked) source.
+        let source_ok = crate::nutrition::source_recipe_macros(r).filter(|src| {
+            if coverage >= 0.5 && n.macros.kcal >= 50.0 {
+                let full_est = n.macros.kcal / coverage;
+                let ratio = src.kcal / full_est;
+                (0.4..=2.5).contains(&ratio)
+            } else {
+                true
+            }
+        });
+
+        if let Some(src) = source_ok {
+            macros.insert(r.id.clone(), src); // authoritative; never low-coverage
+        } else {
+            if estimable > 0 && coverage < crate::planning::MIN_INGREDIENT_COVERAGE {
                 low_coverage.insert(r.id.clone());
             }
+            macros.insert(r.id.clone(), n.macros);
         }
-        macros.insert(r.id.clone(), n.macros);
     }
     (macros, low_coverage)
+}
+
+/// True when a recipe should be pruned as a non-meal: it is not structurally
+/// cookable AND carries no usable source nutrition. The second clause is the
+/// sequencing guard — the source-macro bypass admits amount-sparse recipes that
+/// publish macros, so this must never delete them.
+fn prunable(recipe: &Recipe) -> bool {
+    !crate::ingest::is_cookable(recipe) && crate::nutrition::source_recipe_macros(recipe).is_none()
 }
 
 fn print_plan_constraints(violations: &[crate::planning::BoundViolation]) {
@@ -1289,6 +1393,66 @@ mod tests {
         assert!(!low.contains(&RecipeId::from("ninety")));
         // 1/2 = 50% → excluded.
         assert!(low.contains(&RecipeId::from("half")));
+    }
+
+    #[test]
+    fn recipe_macros_for_pool_prefers_source_nutrition() {
+        use crate::domain::{Nutrition, RecipeId};
+        // All-nonsense ingredients → near-zero estimate coverage; but the source
+        // page carries published macros, so the recipe is trusted, not excluded.
+        let mut r = Recipe::new("Mystery Stew");
+        r.id = RecipeId::from("stew");
+        r.ingredients = ["2 cups chopped zaa", "1 clove zbb", "3 blorps zcc"]
+            .iter()
+            .map(|l| normalize_line(l))
+            .collect();
+        r.servings = Some(4.0);
+        r.meta.nutrition = Some(Nutrition {
+            kcal: Some(300.0),
+            protein_g: Some(20.0),
+            fat_g: Some(10.0),
+            carbs_g: Some(30.0),
+        });
+        let (macros, low) = recipe_macros_for_pool(&[r], &std::collections::HashMap::new());
+        let id = RecipeId::from("stew");
+        assert!(
+            !low.contains(&id),
+            "a source-backed recipe must not be flagged low-coverage"
+        );
+        // Whole-recipe macros = per-serving × servings (300 × 4).
+        assert!(
+            (macros[&id].kcal - 1200.0).abs() < 1e-6,
+            "{}",
+            macros[&id].kcal
+        );
+    }
+
+    #[test]
+    fn prune_guard_spares_source_backed_and_real_recipes() {
+        use crate::domain::Nutrition;
+        // A how-to page: one ingredient → not cookable, no source → prunable.
+        let mut guide = Recipe::new("How to Roast Peppers");
+        guide.ingredients = vec![normalize_line("2 red bell peppers")];
+        assert!(prunable(&guide));
+        // Same page, but it publishes nutrition → spared (sequencing guard).
+        guide.servings = Some(2.0);
+        guide.meta.nutrition = Some(Nutrition {
+            kcal: Some(50.0),
+            protein_g: Some(2.0),
+            fat_g: Some(0.0),
+            carbs_g: Some(10.0),
+        });
+        assert!(
+            !prunable(&guide),
+            "a recipe with usable source nutrition must never be pruned"
+        );
+        // A normal recipe is never prunable.
+        let mut chili = Recipe::new("Chili");
+        chili.ingredients = ["2 cans beans", "1 lb beef", "1 onion"]
+            .iter()
+            .map(|l| normalize_line(l))
+            .collect();
+        assert!(!prunable(&chili));
     }
 
     #[test]

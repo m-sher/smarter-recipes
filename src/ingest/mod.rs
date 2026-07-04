@@ -7,6 +7,7 @@ mod crawl;
 mod file;
 mod manual;
 mod ocr;
+mod quality;
 mod search;
 mod url;
 
@@ -17,6 +18,7 @@ pub use crawl::{
 pub use file::FileSource;
 pub use manual::read_manual_recipe;
 pub use ocr::ImageOcrSource;
+pub use quality::is_cookable;
 pub use search::{
     duckduckgo_search_url, parse_duckduckgo_results, search_result_urls, search_scrape_recipes,
     unwrap_ddg_redirect,

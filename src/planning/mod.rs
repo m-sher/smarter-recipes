@@ -95,7 +95,7 @@ const EPS: f64 = 1e-9;
 /// Minimum fraction of a recipe's estimable ingredients that must have a resolved
 /// macro profile for the recipe to be usable under nutrition bounds. Below this,
 /// the estimate understates reality by too much to trust against a constraint.
-pub const MIN_INGREDIENT_COVERAGE: f64 = 0.90;
+pub const MIN_INGREDIENT_COVERAGE: f64 = 0.75;
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
@@ -642,7 +642,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
             )
         } else if dropped_low_coverage > 0 {
             format!(
-                "No meals planned: all {dropped_low_coverage} candidate recipe(s) fall below the {coverage_pct}% ingredient-coverage threshold. Run `nutrition fetch` to cover more ingredients, or relax the nutrition bounds."
+                "No meals planned: all {dropped_low_coverage} candidate recipe(s) fall below the {coverage_pct}% ingredient-coverage threshold (units that can't be converted to grams, and no usable published nutrition). Relax the nutrition bounds, or add recipes that carry source nutrition."
             )
         } else {
             "Empty pool or zero slots; no meals planned.".into()
@@ -730,7 +730,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
 
     let low_coverage_note = if dropped_low_coverage > 0 {
         format!(
-            " Excluded {dropped_low_coverage} recipe(s) below the {coverage_pct}% ingredient-coverage threshold; run `nutrition fetch` to cover more."
+            " Excluded {dropped_low_coverage} recipe(s) below the {coverage_pct}% ingredient-coverage threshold (unconvertible units, no usable source nutrition)."
         )
     } else {
         String::new()

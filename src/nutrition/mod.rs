@@ -539,6 +539,45 @@ pub fn recipe_nutrition(recipe: &Recipe, extra: &HashMap<String, Macros>) -> Rec
     out
 }
 
+/// Whole-recipe macros from the source page's published **per-serving** nutrition
+/// (`meta.nutrition`), scaled by `servings` — or `None` when the data is
+/// incomplete or fails a sanity/consistency check.
+///
+/// Preferred over the ingredient estimate when present: it is authoritative and
+/// complete, whereas the estimate silently understates any ingredient whose unit
+/// can't be converted to grams. Returns **whole-recipe** totals (the meal pool
+/// uses whole-recipe macros, not per-serving) — the `× servings` is load-bearing.
+pub fn source_recipe_macros(recipe: &Recipe) -> Option<Macros> {
+    let n = recipe.meta.nutrition.as_ref()?;
+    let (kcal, protein, fat, carbs) = (n.kcal?, n.protein_g?, n.fat_g?, n.carbs_g?);
+    let servings = recipe.servings?;
+    // Everything finite and in a sane per-serving range.
+    let sane = [kcal, protein, fat, carbs, servings]
+        .iter()
+        .all(|v| v.is_finite())
+        && (0.0..=100.0).contains(&servings)
+        && (0.0..=3000.0).contains(&kcal)
+        && (0.0..=400.0).contains(&protein)
+        && (0.0..=400.0).contains(&fat)
+        && (0.0..=600.0).contains(&carbs);
+    if !sane || servings <= 0.0 || kcal <= 0.0 {
+        return None;
+    }
+    // Atwater cross-check: kcal ≈ 4P + 9F + 4C. Rejects source data that is
+    // garbled or mislabeled (per-100g values, wrong fields) — the primary guard
+    // against trusting bad published numbers.
+    let atwater = 4.0 * protein + 9.0 * fat + 4.0 * carbs;
+    if (kcal - atwater).abs() > (0.30 * kcal).max(60.0) {
+        return None;
+    }
+    Some(Macros {
+        kcal: kcal * servings,
+        protein_g: protein * servings,
+        fat_g: fat * servings,
+        carbs_g: carbs * servings,
+    })
+}
+
 /// Per-day and total macro estimates for a plan, with coverage.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlanNutrition {
@@ -604,6 +643,56 @@ mod tests {
         let mut r = Recipe::new(title);
         r.ingredients = ings.iter().map(|l| normalize_line(l)).collect();
         r
+    }
+
+    fn nutri(kcal: f64, p: f64, f: f64, c: f64) -> crate::domain::Nutrition {
+        crate::domain::Nutrition {
+            kcal: Some(kcal),
+            protein_g: Some(p),
+            fat_g: Some(f),
+            carbs_g: Some(c),
+        }
+    }
+
+    #[test]
+    fn source_macros_scale_per_serving_by_servings() {
+        let mut r = rec("Soup", &["1 onion"]);
+        r.servings = Some(4.0);
+        r.meta.nutrition = Some(nutri(160.0, 5.0, 4.0, 28.0)); // atwater ~168, ok
+        let m = source_recipe_macros(&r).expect("usable source macros");
+        assert!((m.kcal - 640.0).abs() < 1e-6, "{}", m.kcal); // per-serving x 4
+        assert!((m.protein_g - 20.0).abs() < 1e-6);
+        assert!((m.carbs_g - 112.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn source_macros_reject_incomplete_or_implausible() {
+        let build = |n: Option<crate::domain::Nutrition>, s: Option<f64>| {
+            let mut r = rec("X", &["1 onion"]);
+            r.servings = s;
+            r.meta.nutrition = n;
+            source_recipe_macros(&r)
+        };
+        assert!(build(None, Some(4.0)).is_none(), "no source nutrition");
+        assert!(
+            build(Some(nutri(160.0, 5.0, 4.0, 28.0)), None).is_none(),
+            "missing servings"
+        );
+        assert!(
+            build(Some(nutri(160.0, 5.0, 4.0, 28.0)), Some(0.0)).is_none(),
+            "zero servings"
+        );
+        let mut partial = nutri(160.0, 5.0, 4.0, 28.0);
+        partial.fat_g = None;
+        assert!(build(Some(partial), Some(4.0)).is_none(), "missing a macro");
+        assert!(
+            build(Some(nutri(900.0, 5.0, 4.0, 28.0)), Some(4.0)).is_none(),
+            "kcal inconsistent with macros (Atwater)"
+        );
+        assert!(
+            build(Some(nutri(4000.0, 5.0, 4.0, 28.0)), Some(4.0)).is_none(),
+            "per-serving kcal out of range"
+        );
     }
 
     #[test]
