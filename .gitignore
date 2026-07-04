@@ -4,3 +4,4 @@
 *.db-journal
 .DS_Store
 /data/*.db
+.env

@@ -14,6 +14,7 @@
 
 pub mod cli;
 pub mod domain;
+pub mod dotenv;
 pub mod ingest;
 pub mod net;
 pub mod normalize;
