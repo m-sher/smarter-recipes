@@ -286,8 +286,58 @@ fn taste_phrase_start(s: &str, phrases: &[&str]) -> Option<usize> {
     })
 }
 
+/// Remove every parenthetical group `(…)` and collapse the whitespace it leaves.
+/// In ingredient lines these are sizes or clarifications — `(12 ounces)`,
+/// `(such as pop rocks)`, `(cut into chunks)` — never part of the ingredient
+/// identity, and a *leading* one (`(.85 oz) old el paso…`) is what `split_note`
+/// can't catch. Depth-counted so nested/unbalanced parens don't leak fragments.
+fn strip_parentheticals(s: &str) -> String {
+    if !s.contains(['(', ')']) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Strip a leading `+ <qty> <unit>` addend left when a compound quantity like
+/// `1 cup + 3 tablespoons beef broth` is only partly consumed — the name is the
+/// ingredient (`beef broth`), not the trailing addend.
+fn strip_leading_addend(s: &str) -> String {
+    let Some(rest) = s.trim().strip_prefix('+') else {
+        return s.to_string();
+    };
+    let rest = rest.trim();
+    if let Some((_, _, end)) = parse_quantity_prefix(rest) {
+        let after_qty = rest[end..].trim();
+        let mut parts = after_qty.splitn(2, char::is_whitespace);
+        let first = parts.next().unwrap_or("");
+        if lookup_unit(first).is_some() {
+            return parts.next().unwrap_or("").trim().to_string();
+        }
+        return after_qty.to_string();
+    }
+    rest.to_string()
+}
+
 fn clean_name(name: &str) -> String {
-    let mut s = name.trim().to_string();
+    let without_parens = strip_parentheticals(name);
+    let addend_stripped = strip_leading_addend(&without_parens);
+    // A real ingredient name starts with a letter or digit; drop leading stray
+    // punctuation left by mangled quantities (". frozen cranberries",
+    // "/3 cups …", "+ …"). Keeps digits so "5 spice powder" is untouched.
+    let mut s = addend_stripped
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim()
+        .to_string();
     // Strip leading "of "
     if let Some(stripped) = s.strip_prefix("of ") {
         s = stripped.trim().to_string();
@@ -301,7 +351,11 @@ fn clean_name(name: &str) -> String {
 
 /// Parse a single free-text ingredient line.
 pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
-    let line = line.trim();
+    // Decode HTML entities and fold curly punctuation first, so scraped text like
+    // "&#8531; cup" (an ⅓ that would otherwise be lost) and "jalapeño&#8217;s"
+    // parse the same as their clean forms, whatever the ingest path.
+    let sanitized = crate::text::sanitize(line);
+    let line = sanitized.trim();
     if line.is_empty() {
         return ParsedIngredient {
             name: String::new(),
@@ -780,5 +834,53 @@ mod tests {
             assert!(p.quantity.is_none());
             assert!(!p.name.contains("to taste") && !p.name.contains("as needed"));
         }
+    }
+
+    #[test]
+    fn leading_parenthetical_size_does_not_leak_into_name() {
+        // A word-unit before the clarifier: "1 packet (.85 oz) …".
+        let (q, _, n) = qty_unit("1 packet (.85 oz) Old El Paso Chicken Taco Seasoning Mix");
+        assert_eq!(q, Some(1.0));
+        assert_eq!(n, "Old El Paso Chicken Taco Seasoning Mix");
+        // A real unit before the clarifier: the name is just the ingredient.
+        let (q, k, n) = qty_unit("3 tablespoons (1 1/2 ounces) dry vermouth");
+        assert_eq!((q, k), (Some(3.0), Some(UnitKind::Volume)));
+        assert_eq!(n, "dry vermouth");
+        // A non-quantity parenthetical ("(1 inch)") that isn't a package size.
+        let (_, _, n) = qty_unit("1 (1 inch) piece fresh ginger");
+        assert!(!n.contains('('), "name still had a paren: {n}");
+        // Trailing clarifier is stripped too.
+        let (_, _, n) = qty_unit("3 (0.33-ounce) packets red popping candy (such as pop rocks)");
+        assert!(!n.contains('(') && !n.contains(')'), "{n}");
+    }
+
+    #[test]
+    fn compound_plus_quantity_drops_the_addend_from_name() {
+        let (q, k, n) = qty_unit("1 cup + 3 tablespoons beef broth (divided)");
+        assert_eq!((q, k), (Some(1.0), Some(UnitKind::Volume)));
+        assert_eq!(n, "beef broth");
+        let (_, _, n) = qty_unit("1 + 1/2 cups unsweetened pineapple chunks, drained");
+        assert_eq!(n, "unsweetened pineapple chunks");
+    }
+
+    #[test]
+    fn leading_stray_punctuation_is_trimmed() {
+        // Mangled quantities leave a leading ". " or similar: drop it so the
+        // name is the ingredient, not punctuation.
+        assert_eq!(qty_unit(". frozen cranberries").2, "frozen cranberries");
+        assert_eq!(qty_unit("- ice cubes").2, "ice cubes");
+    }
+
+    #[test]
+    fn html_entity_fraction_becomes_a_quantity() {
+        // "&#8531;" is ⅓ — decoding it lets the parser see the quantity instead
+        // of swallowing "⅓ cup" into the name.
+        let (q, k, n) = qty_unit("&#8531; cup chopped fresh cilantro");
+        assert_eq!(q, Some(1.0 / 3.0));
+        assert_eq!(k, Some(UnitKind::Volume));
+        assert_eq!(n, "chopped fresh cilantro");
+        // Entity apostrophe folds to ASCII in the name.
+        let (_, _, n) = qty_unit("2 cups jalape\u{00f1}o&#8217;s");
+        assert_eq!(n, "jalape\u{00f1}o's");
     }
 }

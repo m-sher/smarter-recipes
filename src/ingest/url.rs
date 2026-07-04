@@ -130,7 +130,7 @@ fn find_recipe_objects(v: &Value, out: &mut Vec<Value>) {
 fn json_ld_string_list(v: &Value) -> Vec<String> {
     raw_json_ld_string_list(v)
         .into_iter()
-        .map(|s| crate::net::decode_html_entities(&s))
+        .map(|s| crate::text::sanitize(&s))
         .collect()
 }
 
@@ -267,7 +267,7 @@ fn nutrition_from_json_ld(v: &Value) -> Option<crate::domain::Nutrition> {
 }
 
 fn recipe_from_json_ld(obj: &Value) -> Option<Recipe> {
-    let title = obj.get("name").and_then(|n| n.as_str())?.to_string();
+    let title = crate::text::sanitize(obj.get("name").and_then(|n| n.as_str())?);
 
     let mut recipe = Recipe::new(title);
     recipe.servings = obj.get("recipeYield").and_then(parse_servings);
@@ -377,7 +377,7 @@ fn extract_heuristic(html: &str) -> Result<Recipe> {
     let title = document
         .select(&title_sel)
         .next()
-        .map(|e| e.text().collect::<String>().trim().to_string())
+        .map(|e| crate::text::sanitize(e.text().collect::<String>().trim()))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Untitled recipe".into());
 

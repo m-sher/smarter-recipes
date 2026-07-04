@@ -211,7 +211,7 @@ impl FdcSource {
     /// caller can stop rather than burn the remaining quota. HTML entities in the
     /// stored name are decoded so junk like `salt&amp;pepper` still queries well.
     fn fetch_body(&self, ingredient: &str) -> Result<String> {
-        let query = crate::net::decode_html_entities(ingredient);
+        let query = crate::text::decode_html_entities(ingredient);
         let url = format!(
             "{}/fdc/v1/foods/search?api_key={}&query={}&dataType=Foundation,SR%20Legacy&pageSize=25",
             self.base_url.trim_end_matches('/'),

@@ -23,5 +23,6 @@ pub mod planning;
 pub mod pricing;
 pub mod shopping;
 pub mod storage;
+pub mod text;
 
 pub use domain::{IngredientLine, MealPlan, Recipe, UnitKind};

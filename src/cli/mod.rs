@@ -295,13 +295,16 @@ pub fn run(cli: Cli) -> Result<()> {
         } => {
             let interactive = matches!(source.to_lowercase().as_str(), "manual" | "interactive")
                 && input.as_deref().is_none_or(|s| s.is_empty() || s == "-");
-            let recipe = if interactive {
+            let mut recipe = if interactive {
                 read_manual_recipe(&mut std::io::stdin().lock(), &mut std::io::stderr())?
             } else {
                 let input = input
                     .ok_or_else(|| anyhow::anyhow!("input is required for source '{source}'"))?;
                 ingest_from(&source, &input)?
             };
+            // Clean scraped title text (entities, curly punctuation); ingredient
+            // names are already sanitized by the parser.
+            recipe.title = crate::text::sanitize(&recipe.title);
             print_recipe_summary(&recipe);
             if dry_run {
                 println!("{}", serde_json::to_string_pretty(&recipe)?);
@@ -970,6 +973,9 @@ fn print_plan_nutrition(pn: &crate::nutrition::PlanNutrition) {
 
 /// Re-normalize every ingredient line from its stored original text.
 fn reparse_recipe(recipe: &mut Recipe) {
+    // The title doesn't pass through the ingredient parser, so clean it directly
+    // (fixes entity/curly artifacts like "S&#8217;mores Fudge").
+    recipe.title = crate::text::sanitize(&recipe.title);
     for line in &mut recipe.ingredients {
         *line = crate::normalize::normalize_line(&line.original);
     }
