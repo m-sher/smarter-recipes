@@ -616,6 +616,10 @@ pub struct PlanNutrition {
     /// profile exists yet (as opposed to a profile that cannot be converted to
     /// grams, which fetching cannot fix).
     pub fetchable: BTreeSet<String>,
+    /// How many meals used the source's published macros (via
+    /// [`source_recipe_macros`]) instead of the ingredient estimate. Their
+    /// ingredients don't appear in `covered`/`uncovered`.
+    pub source_backed: usize,
 }
 
 /// Estimate nutrition for every meal in a plan (whole recipes per day).
@@ -629,15 +633,25 @@ pub fn plan_nutrition(
     let mut total = Macros::default();
     let mut covered = BTreeSet::new();
     let mut uncovered_raw = BTreeSet::new();
+    let mut source_backed = 0usize;
     for meal in &plan.meals {
         let recipe = store
             .get_recipe(meal.recipe_id.as_str())?
             .with_context(|| format!("recipe {} missing", meal.recipe_id))?;
-        let rn = recipe_nutrition(&recipe, extra);
-        by_day.entry(meal.day as usize).or_default().add(&rn.macros);
-        total.add(&rn.macros);
-        covered.extend(rn.covered);
-        uncovered_raw.extend(rn.uncovered);
+        // Prefer the source's published macros — the same value the planner's
+        // bounds are checked against — so the displayed totals match the
+        // constraint. Fall back to the ingredient estimate (with its coverage).
+        if let Some(m) = source_recipe_macros(&recipe) {
+            by_day.entry(meal.day as usize).or_default().add(&m);
+            total.add(&m);
+            source_backed += 1;
+        } else {
+            let rn = recipe_nutrition(&recipe, extra);
+            by_day.entry(meal.day as usize).or_default().add(&rn.macros);
+            total.add(&rn.macros);
+            covered.extend(rn.covered);
+            uncovered_raw.extend(rn.uncovered);
+        }
     }
     // A name covered in any recipe counts as covered overall, so the two sets
     // are disjoint and the coverage denominator does not double-count.
@@ -653,6 +667,7 @@ pub fn plan_nutrition(
         covered,
         uncovered,
         fetchable,
+        source_backed,
     })
 }
 
@@ -1103,6 +1118,43 @@ mod tests {
         assert!(pn.uncovered.contains("dragonfruit"));
         // No profile for dragonfruit -> fetchable.
         assert!(pn.fetchable.contains("dragonfruit"));
+        assert_eq!(pn.source_backed, 0);
+    }
+
+    #[test]
+    fn plan_nutrition_prefers_source_macros() {
+        use crate::domain::{MealPlan, Nutrition, PlannedMeal, RecipeId};
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        // Ingredients can't be estimated, but the recipe publishes per-serving
+        // macros: the display must show the source totals (matching the planner's
+        // bounds), not the empty estimate, and count the meal source-backed.
+        let mut r = rec("Published", &["1 pinch mystery"]);
+        r.id = RecipeId::from("pub");
+        r.servings = Some(4.0);
+        r.meta.nutrition = Some(Nutrition {
+            kcal: Some(300.0),
+            protein_g: Some(20.0),
+            fat_g: Some(10.0),
+            carbs_g: Some(30.0),
+        });
+        store.save_recipe(&r).unwrap();
+        let plan = MealPlan {
+            id: "p".into(),
+            days: 1,
+            meals_per_day: 1,
+            rationale: String::new(),
+            meals: vec![PlannedMeal {
+                day: 0,
+                meal: 0,
+                recipe_id: RecipeId::from("pub"),
+                recipe_title: "Published".into(),
+            }],
+        };
+        let pn = plan_nutrition(&store, &plan, &HashMap::new()).unwrap();
+        assert_eq!(pn.source_backed, 1);
+        assert!((pn.total.kcal - 1200.0).abs() < 1e-6, "{}", pn.total.kcal); // 300 × 4
+        assert!(pn.covered.is_empty() && pn.uncovered.is_empty());
     }
 
     #[test]

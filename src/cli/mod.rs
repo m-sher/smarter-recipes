@@ -1044,44 +1044,59 @@ fn print_plan_constraints(violations: &[crate::planning::BoundViolation]) {
 }
 
 fn print_plan_nutrition(pn: &crate::nutrition::PlanNutrition) {
-    // covered and uncovered are disjoint, so their sum is the distinct count.
-    let counted = pn.covered.len() + pn.uncovered.len();
-    if counted == 0 {
+    if pn.per_day.is_empty() {
         return;
     }
-    if !pn.covered.is_empty() {
-        println!("\nEstimated nutrition (whole recipes, per day):");
-        for (day, m) in &pn.per_day {
-            println!(
-                "  Day {}: {:.0} kcal | protein {:.0} g | fat {:.0} g | carbs {:.0} g",
-                day + 1,
-                m.kcal,
-                m.protein_g,
-                m.fat_g,
-                m.carbs_g
-            );
-        }
+    // Totals match the planner's bounds: published source macros where available,
+    // the ingredient estimate otherwise.
+    println!("\nNutrition (whole recipes, per day):");
+    for (day, m) in &pn.per_day {
+        println!(
+            "  Day {}: {:.0} kcal | protein {:.0} g | fat {:.0} g | carbs {:.0} g",
+            day + 1,
+            m.kcal,
+            m.protein_g,
+            m.fat_g,
+            m.carbs_g
+        );
     }
-    let mut line = format!("  Coverage: {}/{} ingredients", pn.covered.len(), counted);
-    if !pn.uncovered.is_empty() {
-        let sample: Vec<&str> = pn.uncovered.iter().map(String::as_str).take(4).collect();
-        let more = pn.uncovered.len().saturating_sub(sample.len());
-        line.push_str(&format!(
-            " (uncovered: {}{})",
-            sample.join(", "),
-            if more > 0 {
-                format!(", +{more} more")
-            } else {
-                String::new()
-            }
+
+    // Provenance note: how many meals used the source's published nutrition, and
+    // the ingredient-estimate coverage for the rest.
+    let counted = pn.covered.len() + pn.uncovered.len();
+    let mut notes: Vec<String> = Vec::new();
+    if pn.source_backed > 0 {
+        notes.push(format!(
+            "{} recipe(s) use the source's published nutrition",
+            pn.source_backed
         ));
-        // Only suggest fetching for names a fetch could actually resolve
-        // (missing profile) — not those uncovered for lack of a gram conversion.
+    }
+    if counted > 0 {
+        let mut c = format!("{}/{} ingredients estimated", pn.covered.len(), counted);
+        if !pn.uncovered.is_empty() {
+            let sample: Vec<&str> = pn.uncovered.iter().map(String::as_str).take(4).collect();
+            let more = pn.uncovered.len().saturating_sub(sample.len());
+            c.push_str(&format!(
+                " (uncovered: {}{})",
+                sample.join(", "),
+                if more > 0 {
+                    format!(", +{more} more")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        notes.push(c);
+    }
+    if !notes.is_empty() {
+        let mut line = format!("  {}", notes.join("; "));
+        // Only suggest fetching for names a fetch could actually resolve (missing
+        // profile) — not those uncovered for lack of a gram conversion.
         if !pn.fetchable.is_empty() {
             line.push_str("; run `nutrition fetch` to resolve missing profiles");
         }
+        println!("{line}");
     }
-    println!("{line}");
 }
 
 /// Re-normalize every ingredient line from its stored original text.
