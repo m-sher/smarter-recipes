@@ -696,17 +696,27 @@ pub fn run(cli: Cli) -> Result<()> {
                     println!("All uncovered ingredient names have been looked up already.");
                     return Ok(());
                 }
-                let source: Box<dyn crate::nutrition::NutritionSource> = match &fixture {
-                    Some(path) => {
-                        Box::new(crate::nutrition::FixtureNutritionSource::from_path(path)?)
-                    }
-                    None => Box::new(crate::nutrition::FdcSource::default()),
-                };
+                let (source, source_label): (Box<dyn crate::nutrition::NutritionSource>, String) =
+                    match &fixture {
+                        Some(path) => (
+                            Box::new(crate::nutrition::FixtureNutritionSource::from_path(path)?),
+                            "fixture".to_string(),
+                        ),
+                        // Chain providers so FoodData Central's DEMO_KEY limit
+                        // doesn't block us: fall back to keyless Open Food Facts.
+                        None => {
+                            let chain = crate::nutrition::ChainedNutritionSource::new(vec![
+                                Box::new(crate::nutrition::FdcSource::default()),
+                                Box::new(crate::nutrition::OpenFoodFactsNutritionSource::default()),
+                            ]);
+                            let label = chain.source_names();
+                            (Box::new(chain), label)
+                        }
+                    };
                 eprintln!(
-                    "Resolving {} of {} uncovered ingredient name(s) via {} …",
+                    "Resolving {} of {} uncovered ingredient name(s) via {source_label} …",
                     names.len().min(limit),
                     names.len(),
-                    source.name()
                 );
                 let mut found = 0usize;
                 let mut missed = 0usize;
