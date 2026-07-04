@@ -425,14 +425,14 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let nutrition = load_nutrition_bounds(nutrition_config.as_deref(), &cli_nutrition)?;
             let extra = nutrition_extra(&store)?;
-            let (recipe_macros, recipe_uncovered) = recipe_macros_for_pool(&recipes, &extra);
+            let (recipe_macros, recipe_low_coverage) = recipe_macros_for_pool(&recipes, &extra);
             let opts = PlanOptions {
                 days,
                 meals_per_day: per_day,
                 pantry,
                 nutrition: nutrition.clone(),
                 recipe_macros: recipe_macros.clone(),
-                recipe_uncovered,
+                recipe_low_coverage,
             };
             let plan = plan_meals(&recipes, &opts);
             if json {
@@ -904,10 +904,10 @@ fn nutrition_extra(
         .collect())
 }
 
-/// Whole-recipe macro estimates, plus the set of recipes whose estimate is
-/// incomplete (at least one ingredient couldn't be estimated). The planner drops
-/// the latter when nutrition bounds are configured — an understated estimate
-/// can't be trusted against a constraint.
+/// Whole-recipe macro estimates, plus the set of recipes whose estimable
+/// ingredients are covered below [`crate::planning::MIN_INGREDIENT_COVERAGE`].
+/// The planner drops the latter when nutrition bounds are configured — an
+/// understated estimate can't be trusted against a constraint.
 fn recipe_macros_for_pool(
     recipes: &[Recipe],
     extra: &std::collections::HashMap<String, crate::domain::Macros>,
@@ -916,15 +916,21 @@ fn recipe_macros_for_pool(
     std::collections::HashSet<crate::domain::RecipeId>,
 ) {
     let mut macros = std::collections::HashMap::new();
-    let mut uncovered = std::collections::HashSet::new();
+    let mut low_coverage = std::collections::HashSet::new();
     for r in recipes {
         let n = crate::nutrition::recipe_nutrition(r, extra);
-        if !n.uncovered.is_empty() {
-            uncovered.insert(r.id.clone());
+        // Coverage over estimable (quantity-bearing) ingredients only; a recipe
+        // with none (all "to taste") is left to the zero-kcal/no-macro filter.
+        let estimable = n.covered.len() + n.uncovered.len();
+        if estimable > 0 {
+            let coverage = n.covered.len() as f64 / estimable as f64;
+            if coverage < crate::planning::MIN_INGREDIENT_COVERAGE {
+                low_coverage.insert(r.id.clone());
+            }
         }
         macros.insert(r.id.clone(), n.macros);
     }
-    (macros, uncovered)
+    (macros, low_coverage)
 }
 
 fn print_plan_constraints(violations: &[crate::planning::BoundViolation]) {
@@ -1235,6 +1241,55 @@ fn print_shopping_list(list: &crate::domain::ShoppingList) {
 mod tests {
     use super::*;
     use crate::domain::IngredientLine;
+
+    #[test]
+    fn recipe_macros_for_pool_gates_on_coverage_ratio() {
+        use crate::domain::{Macros, RecipeId};
+        let profile = Macros {
+            kcal: 100.0,
+            protein_g: 5.0,
+            fat_g: 2.0,
+            carbs_g: 10.0,
+        };
+        let mk = |id: &str, ings: &[&str]| {
+            let mut r = Recipe::new(id);
+            r.id = RecipeId::from(id);
+            r.ingredients = ings.iter().map(|l| normalize_line(l)).collect();
+            r
+        };
+        // Nonsense ingredient names so only `extra` decides coverage; mass
+        // quantities so gram conversion resolves.
+        let recipes = vec![
+            mk(
+                "ninety",
+                &[
+                    "100 g zaa",
+                    "100 g zab",
+                    "100 g zac",
+                    "100 g zad",
+                    "100 g zae",
+                    "100 g zaf",
+                    "100 g zag",
+                    "100 g zah",
+                    "100 g zai",
+                    "100 g zzz",
+                ],
+            ),
+            mk("half", &["100 g zaa", "100 g zzz"]),
+        ];
+        let extra: std::collections::HashMap<String, Macros> = [
+            "zaa", "zab", "zac", "zad", "zae", "zaf", "zag", "zah", "zai",
+        ]
+        .iter()
+        .map(|n| (n.to_string(), profile))
+        .collect();
+
+        let (_macros, low) = recipe_macros_for_pool(&recipes, &extra);
+        // 9/10 = 90% meets the threshold → kept.
+        assert!(!low.contains(&RecipeId::from("ninety")));
+        // 1/2 = 50% → excluded.
+        assert!(low.contains(&RecipeId::from("half")));
+    }
 
     #[test]
     fn reparse_renormalizes_from_original() {
