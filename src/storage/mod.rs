@@ -364,10 +364,16 @@ impl Store {
         Ok(out)
     }
 
+    /// Delete a recipe by id, also removing it from any saved plans. `plan_meals`
+    /// references `recipes(id)` without `ON DELETE CASCADE`, so a bare delete of a
+    /// planned recipe fails the foreign-key check; we clear those references first,
+    /// in one transaction, so the delete can't fail on a reference or half-apply.
+    /// `recipe_ingredients` cascade on their own. Returns whether a row existed.
     pub fn delete_recipe(&self, id: &str) -> Result<bool> {
-        let n = self
-            .conn
-            .execute("DELETE FROM recipes WHERE id = ?1", params![id])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM plan_meals WHERE recipe_id = ?1", params![id])?;
+        let n = tx.execute("DELETE FROM recipes WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -808,6 +814,41 @@ mod tests {
             .unwrap();
         let legacy = store.get_recipe(&id).unwrap().unwrap();
         assert_eq!(legacy.meta.nutrition.unwrap().kcal, Some(100.0));
+    }
+
+    #[test]
+    fn delete_recipe_removes_it_from_saved_plans() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let r = sample_recipe("Junk Roundup", &["Dish One", "Dish Two"]);
+        let id = r.id.as_str().to_string();
+        store.save_recipe(&r).unwrap();
+        // A saved plan references the recipe; plan_meals has no ON DELETE CASCADE,
+        // so a naive delete would fail the foreign-key check.
+        let plan = MealPlan {
+            id: "p1".into(),
+            days: 1,
+            meals_per_day: 1,
+            rationale: String::new(),
+            meals: vec![PlannedMeal {
+                day: 0,
+                meal: 0,
+                recipe_id: r.id.clone(),
+                recipe_title: "Junk Roundup".into(),
+            }],
+        };
+        store.save_plan(&plan).unwrap();
+        assert!(store.delete_recipe(&id).unwrap());
+        assert!(store.get_recipe(&id).unwrap().is_none());
+        let refs: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM plan_meals WHERE recipe_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refs, 0, "plan reference should be cleared");
     }
 
     #[test]
