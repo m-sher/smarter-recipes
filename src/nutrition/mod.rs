@@ -17,14 +17,48 @@ use crate::domain::{name_candidates, IngredientKey, Macros, MealPlan, Recipe};
 use crate::pricing::volume_ml_to_mass_g;
 use crate::storage::Store;
 use anyhow::{bail, Context, Result};
-use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-/// Looks up a per-100 g macro profile for an ingredient name.
-pub trait NutritionSource {
+/// Looks up a per-100 g macro profile for an ingredient name. `Sync` so one
+/// source can be shared across the parallel `nutrition fetch` workers.
+pub trait NutritionSource: Sync {
     fn name(&self) -> &'static str;
     fn lookup(&self, ingredient: &str) -> Result<Option<Macros>>;
+}
+
+/// Minimum-interval gate shared across threads so a source's request rate stays
+/// capped no matter how many fetch workers run concurrently. Holding the lock
+/// across the sleep serializes request dispatch to one per `min_interval`.
+pub(crate) struct RateGate {
+    min_interval: Duration,
+    last: Mutex<Option<Instant>>,
+}
+
+impl RateGate {
+    pub(crate) fn new(min_interval: Duration) -> Self {
+        Self {
+            min_interval,
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Block until at least `min_interval` has elapsed since the previous call.
+    pub(crate) fn wait(&self) {
+        if self.min_interval.is_zero() {
+            return;
+        }
+        let mut last = self.last.lock().unwrap();
+        if let Some(prev) = *last {
+            let elapsed = prev.elapsed();
+            if elapsed < self.min_interval {
+                std::thread::sleep(self.min_interval - elapsed);
+            }
+        }
+        *last = Some(Instant::now());
+    }
 }
 
 /// Tries several [`NutritionSource`]s in order, returning the first hit. When a
@@ -34,17 +68,14 @@ pub trait NutritionSource {
 /// once **every** source is exhausted.
 pub struct ChainedNutritionSource {
     sources: Vec<Box<dyn NutritionSource>>,
-    /// Per-source "rate-limited this run" flags (single-threaded fetch loop).
-    exhausted: RefCell<Vec<bool>>,
+    /// Per-source "rate-limited this run" flags (shared across fetch workers).
+    exhausted: Vec<AtomicBool>,
 }
 
 impl ChainedNutritionSource {
     pub fn new(sources: Vec<Box<dyn NutritionSource>>) -> Self {
-        let n = sources.len();
-        Self {
-            sources,
-            exhausted: RefCell::new(vec![false; n]),
-        }
+        let exhausted = sources.iter().map(|_| AtomicBool::new(false)).collect();
+        Self { sources, exhausted }
     }
 
     /// Human-readable ordered source list, e.g. `"fdc → openfoodfacts"`.
@@ -63,21 +94,22 @@ impl NutritionSource for ChainedNutritionSource {
     }
 
     fn lookup(&self, ingredient: &str) -> Result<Option<Macros>> {
-        let mut exhausted = self.exhausted.borrow_mut();
         let mut last_err: Option<anyhow::Error> = None;
         for (i, src) in self.sources.iter().enumerate() {
-            if exhausted[i] {
+            if self.exhausted[i].load(Ordering::Relaxed) {
                 continue;
             }
             match src.lookup(ingredient) {
                 Ok(Some(m)) => return Ok(Some(m)),
                 Ok(None) => {}
-                Err(e) if e.downcast_ref::<RateLimited>().is_some() => exhausted[i] = true,
+                Err(e) if e.downcast_ref::<RateLimited>().is_some() => {
+                    self.exhausted[i].store(true, Ordering::Relaxed);
+                }
                 Err(e) => last_err = Some(e),
             }
         }
         // No source produced a hit.
-        if exhausted.iter().all(|&e| e) {
+        if self.exhausted.iter().all(|e| e.load(Ordering::Relaxed)) {
             // Every source is rate-limited — signal the caller to stop.
             return Err(anyhow::Error::new(RateLimited {
                 using_demo_key: std::env::var("SMARTER_RECIPES_FDC_KEY").is_err(),
@@ -130,8 +162,8 @@ pub struct FdcSource {
     client: reqwest::blocking::Client,
     api_key: String,
     pub base_url: String,
-    /// Delay applied before each network request (0 to disable).
-    pub request_delay: Duration,
+    /// Shared dispatch gate so concurrent workers don't exceed the request rate.
+    gate: RateGate,
     /// Canned response body for offline tests.
     pub offline_body: Option<String>,
 }
@@ -147,7 +179,7 @@ impl Default for FdcSource {
             client,
             api_key: std::env::var("SMARTER_RECIPES_FDC_KEY").unwrap_or_else(|_| "DEMO_KEY".into()),
             base_url: "https://api.nal.usda.gov".into(),
-            request_delay: FDC_REQUEST_DELAY,
+            gate: RateGate::new(FDC_REQUEST_DELAY),
             offline_body: None,
         }
     }
@@ -186,9 +218,7 @@ impl FdcSource {
             self.api_key,
             crate::net::encode_query(&query)
         );
-        if self.request_delay > Duration::ZERO {
-            std::thread::sleep(self.request_delay);
-        }
+        self.gate.wait();
         let mut attempt = 0u32;
         loop {
             let resp = self
@@ -789,8 +819,8 @@ mod tests {
         assert!(!is_probable_junk_name("(1 oz) taco seasoning"));
     }
 
-    use std::cell::Cell;
-    use std::rc::Rc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
     enum Beh {
         Hit(f64),
@@ -801,12 +831,12 @@ mod tests {
     struct Mock {
         label: &'static str,
         beh: Beh,
-        calls: Rc<Cell<usize>>,
+        calls: Arc<AtomicUsize>,
     }
 
     impl Mock {
-        fn new(label: &'static str, beh: Beh) -> (Box<Self>, Rc<Cell<usize>>) {
-            let calls = Rc::new(Cell::new(0));
+        fn new(label: &'static str, beh: Beh) -> (Box<Self>, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
             (
                 Box::new(Self {
                     label,
@@ -823,7 +853,7 @@ mod tests {
             self.label
         }
         fn lookup(&self, _: &str) -> Result<Option<Macros>> {
-            self.calls.set(self.calls.get() + 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             match self.beh {
                 Beh::Hit(kcal) => Ok(Some(Macros {
                     kcal,
@@ -843,8 +873,8 @@ mod tests {
         let (b, cb) = Mock::new("b", Beh::Hit(200.0));
         let chain = ChainedNutritionSource::new(vec![a, b]);
         assert_eq!(chain.lookup("x").unwrap().unwrap().kcal, 100.0);
-        assert_eq!(ca.get(), 1);
-        assert_eq!(cb.get(), 0);
+        assert_eq!(ca.load(Ordering::Relaxed), 1);
+        assert_eq!(cb.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -853,7 +883,7 @@ mod tests {
         let (b, cb) = Mock::new("b", Beh::Hit(89.0));
         let chain = ChainedNutritionSource::new(vec![a, b]);
         assert_eq!(chain.lookup("x").unwrap().unwrap().kcal, 89.0);
-        assert_eq!(cb.get(), 1);
+        assert_eq!(cb.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -865,8 +895,12 @@ mod tests {
         assert_eq!(chain.lookup("x").unwrap().unwrap().kcal, 50.0);
         // Second name: a is now exhausted (skipped), only b is called.
         assert_eq!(chain.lookup("y").unwrap().unwrap().kcal, 50.0);
-        assert_eq!(ca.get(), 1, "rate-limited source must not be retried");
-        assert_eq!(cb.get(), 2);
+        assert_eq!(
+            ca.load(Ordering::Relaxed),
+            1,
+            "rate-limited source must not be retried"
+        );
+        assert_eq!(cb.load(Ordering::Relaxed), 2);
     }
 
     #[test]

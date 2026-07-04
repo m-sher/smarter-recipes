@@ -8,7 +8,7 @@
 //! quotas are independent of FDC, keeping `nutrition fetch` making progress
 //! after the FDC DEMO_KEY limit is hit.
 
-use super::{NutritionSource, RateLimited};
+use super::{NutritionSource, RateGate, RateLimited};
 use crate::domain::Macros;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -24,8 +24,8 @@ const OFF_MAX_RETRIES: u32 = 2;
 pub struct OpenFoodFactsNutritionSource {
     client: reqwest::blocking::Client,
     pub base_url: String,
-    /// Delay applied before each network request (0 to disable).
-    pub request_delay: Duration,
+    /// Shared dispatch gate so concurrent workers don't exceed the request rate.
+    gate: RateGate,
     /// Canned response body for offline tests.
     pub offline_body: Option<String>,
 }
@@ -44,7 +44,7 @@ impl Default for OpenFoodFactsNutritionSource {
         Self {
             client,
             base_url: OFF_SEARCH_URL.into(),
-            request_delay: OFF_REQUEST_DELAY,
+            gate: RateGate::new(OFF_REQUEST_DELAY),
             offline_body: None,
         }
     }
@@ -72,9 +72,7 @@ impl OpenFoodFactsNutritionSource {
             self.base_url.trim_end_matches('/'),
             crate::net::encode_query(query)
         );
-        if self.request_delay > Duration::ZERO {
-            std::thread::sleep(self.request_delay);
-        }
+        self.gate.wait();
         let mut attempt = 0u32;
         loop {
             let resp = match self.client.get(&url).send() {

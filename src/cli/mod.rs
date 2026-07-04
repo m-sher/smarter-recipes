@@ -222,6 +222,10 @@ pub enum NutritionCmd {
         /// Max lookups this run
         #[arg(long, default_value_t = 25)]
         limit: usize,
+        /// Concurrent lookups (a shared per-source rate gate still caps the
+        /// request rate, so this overlaps latency without hammering the APIs)
+        #[arg(long, default_value_t = 6)]
+        jobs: usize,
     },
     /// Clear the cached nutrition lookups (positive and negative), forcing a
     /// re-fetch on the next `nutrition fetch`
@@ -667,7 +671,12 @@ pub fn run(cli: Cli) -> Result<()> {
             (false, None) => bail!("provide a recipe id or --all"),
         },
         Commands::Nutrition { action } => match action {
-            NutritionCmd::Fetch { fixture, limit } => {
+            NutritionCmd::Fetch {
+                fixture,
+                limit,
+                jobs,
+            } => {
+                let jobs = jobs.max(1);
                 let extra = nutrition_extra(&store)?;
                 let cache = store.nutrition_cache_all()?;
                 // Distinct ingredient names with no macro profile yet.
@@ -722,33 +731,62 @@ pub fn run(cli: Cli) -> Result<()> {
                 let mut missed = 0usize;
                 let mut errored = 0usize;
                 let mut rate_limited = false;
-                let total = names.len().min(limit);
-                for (i, name) in names.iter().take(limit).enumerate() {
-                    let n = i + 1;
-                    match source.lookup(name) {
-                        Ok(Some(profile)) => {
-                            store.nutrition_cache_put(name, Some(&profile))?;
-                            eprintln!("  [{n}/{total}] + {name}  ({:.0} kcal/100g)", profile.kcal);
-                            found += 1;
+                let selected: Vec<&String> = names.iter().take(limit).collect();
+                let total = selected.len();
+                let source_ref: &dyn crate::nutrition::NutritionSource = &*source;
+                let mut done = 0usize;
+                'batches: for batch in selected.chunks(jobs) {
+                    // Look up this batch concurrently. Store writes and progress
+                    // stay on the main thread; the sources' shared rate gate keeps
+                    // the real request rate in check regardless of `jobs`.
+                    type Row = (usize, Result<Option<crate::domain::Macros>>);
+                    let results: std::sync::Mutex<Vec<Row>> =
+                        std::sync::Mutex::new(Vec::with_capacity(batch.len()));
+                    std::thread::scope(|scope| {
+                        for (bi, &name) in batch.iter().enumerate() {
+                            let results = &results;
+                            scope.spawn(move || {
+                                let r = source_ref.lookup(name);
+                                results.lock().unwrap().push((bi, r));
+                            });
                         }
-                        Ok(None) => {
-                            if from_network {
-                                store.nutrition_cache_put(name, None)?;
+                    });
+                    let mut rows = results.into_inner().unwrap();
+                    rows.sort_by_key(|(bi, _)| *bi);
+                    for (bi, r) in rows {
+                        let name = batch[bi];
+                        done += 1;
+                        match r {
+                            Ok(Some(profile)) => {
+                                store.nutrition_cache_put(name, Some(&profile))?;
+                                eprintln!(
+                                    "  [{done}/{total}] + {name}  ({:.0} kcal/100g)",
+                                    profile.kcal
+                                );
+                                found += 1;
                             }
-                            eprintln!("  [{n}/{total}] - {name}  (no match)");
-                            missed += 1;
-                        }
-                        Err(e) => {
-                            // A persistent rate limit means every further request
-                            // will also fail — stop so we don't burn the quota.
-                            if let Some(rl) = e.downcast_ref::<crate::nutrition::RateLimited>() {
-                                eprintln!("  [{n}/{total}] ! stopping: {rl}");
-                                rate_limited = true;
-                                break;
+                            Ok(None) => {
+                                if from_network {
+                                    store.nutrition_cache_put(name, None)?;
+                                }
+                                eprintln!("  [{done}/{total}] - {name}  (no match)");
+                                missed += 1;
                             }
-                            eprintln!("  [{n}/{total}] ! {name}  ({e:#})");
-                            errored += 1;
+                            Err(e) => {
+                                // Rate limit means every source is spent — finish
+                                // this batch's good results, then stop.
+                                if e.downcast_ref::<crate::nutrition::RateLimited>().is_some() {
+                                    eprintln!("  [{done}/{total}] ! stopping: {e:#}");
+                                    rate_limited = true;
+                                    continue;
+                                }
+                                eprintln!("  [{done}/{total}] ! {name}  ({e:#})");
+                                errored += 1;
+                            }
                         }
+                    }
+                    if rate_limited {
+                        break 'batches;
                     }
                 }
                 // Remaining = names never resolved: those past the limit plus
