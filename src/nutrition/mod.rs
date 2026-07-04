@@ -539,43 +539,65 @@ pub fn recipe_nutrition(recipe: &Recipe, extra: &HashMap<String, Macros>) -> Rec
     out
 }
 
-/// Whole-recipe macros from the source page's published **per-serving** nutrition
-/// (`meta.nutrition`), scaled by `servings` — or `None` when the data is
-/// incomplete or fails a sanity/consistency check.
+/// Whole-recipe macros from the source page's published nutrition
+/// (`meta.nutrition`) — or `None` when the data is incomplete or implausible.
 ///
 /// Preferred over the ingredient estimate when present: it is authoritative and
 /// complete, whereas the estimate silently understates any ingredient whose unit
 /// can't be converted to grams. Returns **whole-recipe** totals (the meal pool
-/// uses whole-recipe macros, not per-serving) — the `× servings` is load-bearing.
+/// uses whole-recipe macros, not per-serving).
+///
+/// `NutritionInformation` is *meant* to be per-serving, so we normally scale by
+/// `servings`. But some sources put the whole-recipe total in that field; scaling
+/// then inflates it N×. We detect that case — a "per-serving" figure that is
+/// large yet divides into a sane per-serving is the whole-recipe total — and use
+/// it directly. Atwater consistency and absolute ceilings on the result guard
+/// against garbled data; the ingredient estimate is *not* used to cross-check
+/// because it is itself unreliable in both directions.
 pub fn source_recipe_macros(recipe: &Recipe) -> Option<Macros> {
     let n = recipe.meta.nutrition.as_ref()?;
     let (kcal, protein, fat, carbs) = (n.kcal?, n.protein_g?, n.fat_g?, n.carbs_g?);
     let servings = recipe.servings?;
-    // Everything finite and in a sane per-serving range.
-    let sane = [kcal, protein, fat, carbs, servings]
+    let all_finite = [kcal, protein, fat, carbs, servings]
         .iter()
-        .all(|v| v.is_finite())
-        && (0.0..=100.0).contains(&servings)
-        && (0.0..=3000.0).contains(&kcal)
-        && (0.0..=400.0).contains(&protein)
-        && (0.0..=400.0).contains(&fat)
-        && (0.0..=600.0).contains(&carbs);
-    if !sane || servings <= 0.0 || kcal <= 0.0 {
+        .all(|v| v.is_finite());
+    if !all_finite
+        || servings <= 0.0
+        || servings > 100.0
+        || kcal <= 0.0
+        || protein < 0.0
+        || fat < 0.0
+        || carbs < 0.0
+    {
         return None;
     }
-    // Atwater cross-check: kcal ≈ 4P + 9F + 4C. Rejects source data that is
-    // garbled or mislabeled (per-100g values, wrong fields) — the primary guard
-    // against trusting bad published numbers.
-    let atwater = 4.0 * protein + 9.0 * fat + 4.0 * carbs;
-    if (kcal - atwater).abs() > (0.30 * kcal).max(60.0) {
+
+    // Whole-recipe total mislabeled as per-serving: a large "per-serving" kcal
+    // that divides into a normal per-serving is really the whole-recipe total, so
+    // use it directly (factor 1) instead of multiplying by servings.
+    let looks_whole =
+        servings > 1.0 && kcal > 1200.0 && (40.0..=1200.0).contains(&(kcal / servings));
+    let factor = if looks_whole { 1.0 } else { servings };
+    let whole = Macros {
+        kcal: kcal * factor,
+        protein_g: protein * factor,
+        fat_g: fat * factor,
+        carbs_g: carbs * factor,
+    };
+
+    // Absolute plausibility on the whole-recipe result and its implied per-serving.
+    let per_serving_kcal = whole.kcal / servings;
+    if whole.kcal > 12_000.0 || !(0.0..=1600.0).contains(&per_serving_kcal) {
         return None;
     }
-    Some(Macros {
-        kcal: kcal * servings,
-        protein_g: protein * servings,
-        fat_g: fat * servings,
-        carbs_g: carbs * servings,
-    })
+    // Atwater consistency on the whole-recipe totals (scale-invariant, so it only
+    // catches internally garbled macros, not uniform scale errors — which the
+    // detection above handles).
+    let atwater = 4.0 * whole.protein_g + 9.0 * whole.fat_g + 4.0 * whole.carbs_g;
+    if (whole.kcal - atwater).abs() > (0.30 * whole.kcal).max(60.0) {
+        return None;
+    }
+    Some(whole)
 }
 
 /// Per-day and total macro estimates for a plan, with coverage.
@@ -693,6 +715,23 @@ mod tests {
             build(Some(nutri(4000.0, 5.0, 4.0, 28.0)), Some(4.0)).is_none(),
             "per-serving kcal out of range"
         );
+    }
+
+    #[test]
+    fn source_macros_detect_whole_recipe_total_mislabeled_as_per_serving() {
+        // Real DB case: a soup stores the WHOLE-recipe total (2545 kcal) in the
+        // per-serving field with servings=12. 2545/12 ≈ 212 is a sane bowl, so we
+        // must use 2545 directly, not 2545 × 12 = 30,540.
+        let mut r = rec("Curried Squash Soup", &["1 onion"]);
+        r.servings = Some(12.0);
+        r.meta.nutrition = Some(nutri(2545.0, 62.0, 120.0, 332.0));
+        let m = source_recipe_macros(&r).expect("usable");
+        assert!(
+            (m.kcal - 2545.0).abs() < 1.0,
+            "expected ~2545, got {}",
+            m.kcal
+        );
+        assert!((m.protein_g - 62.0).abs() < 1.0);
     }
 
     #[test]

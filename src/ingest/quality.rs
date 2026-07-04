@@ -4,6 +4,8 @@
 //! recipe's structure, never its title text.
 
 use crate::domain::Recipe;
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 /// Unicode vulgar fractions the ingest normalizer understands (mirrors
 /// `normalize::parse`), so a line like "½ cup sugar" counts as carrying an amount.
@@ -11,25 +13,37 @@ const VULGAR_FRACTIONS: &[char] = &[
     '½', '¼', '¾', '⅓', '⅔', '⅕', '⅖', '⅗', '⅘', '⅙', '⅚', '⅛', '⅜', '⅝', '⅞',
 ];
 
-/// Whether an ingredient line carries an **amount**: a parsed quantity, or a
-/// digit / vulgar fraction anywhere in the raw text (which catches amounts the
-/// leading-quantity parser misses, e.g. "cauliflower florets (12 ounces)").
+/// A standalone numeric amount: a digit run (optionally with `.`, `,`, `/`)
+/// bounded by a non-alphanumeric edge — matches "8 scallops", "1/2 cup",
+/// "(12 ounces)", "serves 4"; rejects title-embedded digits like "30-Minute",
+/// "2% milk", "7-Up", "5-Ingredient".
+static RE_STANDALONE_NUMBER: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:^|[\s(\[])\d[\d.,/]*(?:[\s)\],]|$)").expect("number re"));
+/// A number glued to a common unit abbreviation, e.g. "500g", "2tbsp".
+static RE_GLUED_UNIT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\b\d[\d.,/]*(?:g|kg|mg|ml|oz|lb|tsp|tbsp)\b").expect("glued re"));
+
+/// Whether an ingredient line carries a real numeric amount. Reads the raw text
+/// rather than the parser's `quantity`, because the parser also treats a leading
+/// article ("a"/"one") and a title-embedded number ("30-Minute") as a quantity —
+/// which would let numeric-title roundups pass the very gate meant to reject them.
 fn line_has_amount(line: &crate::domain::IngredientLine) -> bool {
-    line.quantity.is_some()
-        || line
-            .original
-            .chars()
-            .any(|c| c.is_ascii_digit() || VULGAR_FRACTIONS.contains(&c))
+    let o = &line.original;
+    o.chars().any(|c| VULGAR_FRACTIONS.contains(&c))
+        || RE_STANDALONE_NUMBER.is_match(o)
+        || RE_GLUED_UNIT.is_match(o)
 }
 
 /// True when a recipe looks like a real, cookable dish rather than a roundup,
 /// index page, how-to guide, or extraction failure.
 ///
-/// The load-bearing signal is how many ingredient lines actually carry an
-/// amount. Real recipes quantify their ingredients; roundups and index pages
-/// list dish *titles* as "ingredients" and carry almost none. The `>= 2` floor
-/// keeps valid two-ingredient condiments (miso butter, chili crisp mayo); the
-/// `>= 0.25 * ingredients` ratio rejects amount-sparse lists regardless of size.
+/// Real recipes quantify their ingredients; roundups and index pages list dish
+/// *titles* as "ingredients" and carry almost no amounts. The rule: at least two
+/// ingredient lines, at least one carrying an amount, and amounts at least a fifth
+/// of the lines. This keeps minimalist real recipes (one quantified main
+/// ingredient plus "to taste" extras, or a two-ingredient condiment) while
+/// rejecting single-ingredient guides (`ing < 2`) and long title lists (few or no
+/// amounts across many lines).
 pub fn is_cookable(recipe: &Recipe) -> bool {
     let ing = recipe.ingredients.len();
     let amt = recipe
@@ -37,7 +51,7 @@ pub fn is_cookable(recipe: &Recipe) -> bool {
         .iter()
         .filter(|l| line_has_amount(l))
         .count();
-    amt >= 2 && (amt as f64) >= 0.25 * (ing as f64)
+    ing >= 2 && amt >= 1 && (amt as f64) >= 0.2 * (ing as f64)
 }
 
 #[cfg(test)]
@@ -52,31 +66,75 @@ mod tests {
     }
 
     #[test]
-    fn keeps_real_recipes_and_two_ingredient_condiments() {
+    fn keeps_real_recipes_including_sparse_and_condiments() {
         assert!(is_cookable(&rec(&[
             "2 cups flour",
             "1 egg",
             "1/2 cup sugar",
             "salt to taste"
         ])));
-        // A valid condiment: only two ingredients, both with amounts.
+        // Two-ingredient condiment.
         assert!(is_cookable(&rec(&["2 tbsp white miso", "3 tbsp butter"])));
-        // Amount only expressed as a unicode fraction.
+        // Amount only as a unicode fraction.
         assert!(is_cookable(&rec(&[
             "½ cup soy sauce",
             "¼ cup rice vinegar"
         ])));
+        // Minimalist real recipes: one quantified ingredient + unquantified extras
+        // (these were false-rejected by the earlier amt>=2 rule).
+        assert!(is_cookable(&rec(&[
+            "1½ cups cooked chickpeas",
+            "extra-virgin olive oil",
+            "sea salt",
+            "paprika or other spices"
+        ]))); // Crispy Roasted Chickpeas
+        assert!(is_cookable(&rec(&[
+            "8 scallops",
+            "salt to taste",
+            "cracked black pepper",
+            "cooking spray",
+            "lemon wedges"
+        ]))); // Air Fryer Scallops
     }
 
     #[test]
     fn rejects_roundups_guides_and_failures() {
-        // Roundup: 16 dish titles, only 3 carrying a number → 3 < 0.25*16.
-        let mut ings = vec!["Creamy Tuscan Chicken"; 13];
-        ings.extend(["30 Minute Chicken", "5 Bean Chili", "1 Pot Pasta"]);
-        assert!(!is_cookable(&rec(&ings)));
+        // Roundup: dish titles as "ingredients", no amounts.
+        assert!(!is_cookable(&rec(&[
+            "Fluffy Quinoa",
+            "Cherry Pistachio Quinoa Salad",
+            "Kale and Quinoa Salad",
+            "Quinoa Stuffed Peppers",
+            "Black Bean and Quinoa Bake",
+        ])));
         // How-to / single-ingredient prep.
         assert!(!is_cookable(&rec(&["1 large onion"])));
         // Extraction failure with no ingredients.
         assert!(!is_cookable(&rec(&[])));
+    }
+
+    #[test]
+    fn title_embedded_digits_do_not_count_as_amounts() {
+        // Digits inside names/titles must NOT register as amounts, or numeric
+        // listicles would slip through.
+        for line in [
+            "30-Minute Garlic Chicken",
+            "2% milk",
+            "7-Up",
+            "5-Ingredient Pasta",
+        ] {
+            assert!(
+                !line_has_amount(&normalize_line(line)),
+                "{line} wrongly counted as an amount"
+            );
+        }
+        // A roundup whose titles all carry embedded (non-amount) numbers is still
+        // rejected.
+        assert!(!is_cookable(&rec(&[
+            "30-Minute Chicken",
+            "20-Minute Shrimp",
+            "15-Minute Pasta",
+            "5-Ingredient Chili",
+        ])));
     }
 }

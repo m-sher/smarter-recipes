@@ -324,9 +324,9 @@ pub fn run(cli: Cli) -> Result<()> {
                     "Skipped: already have a recipe with this source URL ({})",
                     recipe.title
                 );
-            } else if !crate::ingest::is_cookable(&recipe) {
+            } else if prunable(&recipe) {
                 println!(
-                    "Skipped: not a cookable recipe — {} ingredient line(s), too few carry amounts ({})",
+                    "Skipped: not a cookable recipe and no published nutrition — {} ingredient line(s), too few carry amounts ({})",
                     recipe.ingredients.len(),
                     recipe.title
                 );
@@ -425,7 +425,9 @@ pub fn run(cli: Cli) -> Result<()> {
             // macros, so deleting them here would undo that rescue.
             let candidates: Vec<&Recipe> = recipes
                 .iter()
-                .filter(|r| !keep.contains(r.id.as_str()) && prunable(r))
+                // Prefix match so the 8-char id shown in the preview works,
+                // consistent with every other id argument (resolve_recipe).
+                .filter(|r| !keep.iter().any(|k| r.id.as_str().starts_with(k)) && prunable(r))
                 .collect();
             if candidates.is_empty() {
                 println!("No non-meals to prune.");
@@ -918,8 +920,10 @@ fn apply_scrape_outcome(store: &Store, outcome: &ScrapeOutcome, dry_run: bool) -
             skipped_dup += 1;
             continue;
         }
-        // Keep roundups / index pages / how-to guides out of the catalog.
-        if !crate::ingest::is_cookable(recipe) {
+        // Keep roundups / index pages / how-to guides out of the catalog — but
+        // admit an amount-sparse page that publishes usable nutrition (mirrors
+        // `prunable`, so ingest and the retroactive prune agree).
+        if prunable(recipe) {
             skipped_noncookable += 1;
             continue;
         }
@@ -1001,23 +1005,13 @@ fn recipe_macros_for_pool(
             0.0
         };
 
-        // Prefer authoritative source macros when they pass a coverage-gated
-        // cross-check. The estimate is systematically understated (unconvertible
-        // units), so only cross-check it against the source where the estimate is
-        // meaningful (>=50% covered, non-trivial kcal): un-bias by coverage and
-        // require the source to land within ~2.5x. Below that, the estimate is
-        // too unreliable to judge — accept the (already sanity-checked) source.
-        let source_ok = crate::nutrition::source_recipe_macros(r).filter(|src| {
-            if coverage >= 0.5 && n.macros.kcal >= 50.0 {
-                let full_est = n.macros.kcal / coverage;
-                let ratio = src.kcal / full_est;
-                (0.4..=2.5).contains(&ratio)
-            } else {
-                true
-            }
-        });
-
-        if let Some(src) = source_ok {
+        // Prefer authoritative source macros when present and internally plausible
+        // (validated inside source_recipe_macros: whole-recipe detection, absolute
+        // ceilings, Atwater consistency). We deliberately do NOT cross-check against
+        // the ingredient estimate — it is unreliable in both directions (uncovered
+        // units understate it; mis-converted units can inflate it), so it can
+        // neither confirm nor refute the source.
+        if let Some(src) = crate::nutrition::source_recipe_macros(r) {
             macros.insert(r.id.clone(), src); // authoritative; never low-coverage
         } else {
             if estimable > 0 && coverage < crate::planning::MIN_INGREDIENT_COVERAGE {
