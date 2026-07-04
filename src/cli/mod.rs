@@ -722,29 +722,31 @@ pub fn run(cli: Cli) -> Result<()> {
                 let mut missed = 0usize;
                 let mut errored = 0usize;
                 let mut rate_limited = false;
-                for name in names.iter().take(limit) {
+                let total = names.len().min(limit);
+                for (i, name) in names.iter().take(limit).enumerate() {
+                    let n = i + 1;
                     match source.lookup(name) {
                         Ok(Some(profile)) => {
                             store.nutrition_cache_put(name, Some(&profile))?;
-                            eprintln!("  + {name}  ({:.0} kcal/100g)", profile.kcal);
+                            eprintln!("  [{n}/{total}] + {name}  ({:.0} kcal/100g)", profile.kcal);
                             found += 1;
                         }
                         Ok(None) => {
                             if from_network {
                                 store.nutrition_cache_put(name, None)?;
                             }
-                            eprintln!("  - {name}  (no match)");
+                            eprintln!("  [{n}/{total}] - {name}  (no match)");
                             missed += 1;
                         }
                         Err(e) => {
                             // A persistent rate limit means every further request
                             // will also fail — stop so we don't burn the quota.
                             if let Some(rl) = e.downcast_ref::<crate::nutrition::RateLimited>() {
-                                eprintln!("  ! stopping: {rl}");
+                                eprintln!("  [{n}/{total}] ! stopping: {rl}");
                                 rate_limited = true;
                                 break;
                             }
-                            eprintln!("  ! {name}  ({e:#})");
+                            eprintln!("  [{n}/{total}] ! {name}  ({e:#})");
                             errored += 1;
                         }
                     }
