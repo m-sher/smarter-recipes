@@ -126,11 +126,9 @@ pub enum Commands {
         /// Number of days
         #[arg(long, default_value_t = 7)]
         days: u32,
-        /// Meals per day: a fixed count ("3") or a range ("2-4"). For a range the
-        /// planner chooses the count that best satisfies the constraints (least
-        /// nutrition violation, then fewest distinct ingredients).
-        #[arg(long, default_value = "1")]
-        per_day: String,
+        /// Meals per day
+        #[arg(long, default_value_t = 1)]
+        per_day: u32,
         /// Restrict pool to these recipe ids (comma-separated); default: all
         #[arg(long)]
         pool: Option<String>,
@@ -491,11 +489,9 @@ pub fn run(cli: Cli) -> Result<()> {
             let nutrition = load_nutrition_bounds(nutrition_config.as_deref(), &cli_nutrition)?;
             let extra = nutrition_extra(&store)?;
             let (recipe_macros, recipe_low_coverage) = recipe_macros_for_pool(&recipes, &extra);
-            let (min_per_day, max_per_day) = parse_meals_per_day(&per_day)?;
             let opts = PlanOptions {
                 days,
-                meals_per_day: min_per_day,
-                meals_per_day_max: max_per_day,
+                meals_per_day: per_day,
                 pantry,
                 nutrition: nutrition.clone(),
                 recipe_macros: recipe_macros.clone(),
@@ -1027,34 +1023,6 @@ fn recipe_macros_for_pool(
     (macros, low_coverage)
 }
 
-/// Parse a `--per-day` argument: a fixed count `"N"` or a range `"MIN-MAX"` the
-/// planner chooses within. Returns `(min, optional max)`.
-fn parse_meals_per_day(s: &str) -> Result<(u32, Option<u32>)> {
-    let s = s.trim();
-    if let Some((lo, hi)) = s.split_once('-') {
-        let lo: u32 = lo
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid --per-day min in '{s}'"))?;
-        let hi: u32 = hi
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid --per-day max in '{s}'"))?;
-        if lo == 0 || hi < lo {
-            bail!("--per-day range must be MIN-MAX with 1 <= MIN <= MAX (got '{s}')");
-        }
-        Ok((lo, (hi > lo).then_some(hi)))
-    } else {
-        let n: u32 = s
-            .parse()
-            .with_context(|| format!("invalid --per-day value '{s}'"))?;
-        if n == 0 {
-            bail!("--per-day must be >= 1");
-        }
-        Ok((n, None))
-    }
-}
-
 /// True when a recipe should be pruned as a non-meal: it is not structurally
 /// cookable AND carries no usable source nutrition. The second clause is the
 /// sequencing guard — the source-macro bypass admits amount-sparse recipes that
@@ -1386,17 +1354,6 @@ fn print_shopping_list(list: &crate::domain::ShoppingList) {
 mod tests {
     use super::*;
     use crate::domain::IngredientLine;
-
-    #[test]
-    fn parse_meals_per_day_handles_fixed_and_range() {
-        assert_eq!(parse_meals_per_day("3").unwrap(), (3, None));
-        assert_eq!(parse_meals_per_day("2-4").unwrap(), (2, Some(4)));
-        // A degenerate range collapses to a fixed count.
-        assert_eq!(parse_meals_per_day("3-3").unwrap(), (3, None));
-        assert!(parse_meals_per_day("0").is_err());
-        assert!(parse_meals_per_day("4-2").is_err());
-        assert!(parse_meals_per_day("x").is_err());
-    }
 
     #[test]
     fn recipe_macros_for_pool_gates_on_coverage_ratio() {

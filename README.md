@@ -109,12 +109,6 @@ smarter-recipes plan --days 3 --pool <id1>,<id2>,<id3>
 # Feasible plans are preferred; if none exist, the least-violation plan is kept
 # with warnings. Estimates are trusted as-is; coverage is always printed.
 smarter-recipes plan --days 5 --per-day 2 --min-protein-g 50 --max-kcal 3000
-
-# `--per-day` also takes a range: the planner picks the count in it that best
-# satisfies the constraints (fewest meals that still meet the bounds, then fewest
-# distinct ingredients). The chosen count is reported in the rationale.
-smarter-recipes plan --days 5 --per-day 2-4 --nutrition-config examples/nutrition_bounds.toml
-
 smarter-recipes plan --days 5 --nutrition-config examples/nutrition_bounds.toml
 smarter-recipes plan --days 5 --nutrition-config examples/nutrition_bounds.toml --min-protein-g 60
 

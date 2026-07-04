@@ -95,19 +95,12 @@ const EPS: f64 = 1e-9;
 /// Minimum fraction of a recipe's estimable ingredients that must have a resolved
 /// macro profile for the recipe to be usable under nutrition bounds. Below this,
 /// the estimate understates reality by too much to trust against a constraint.
-pub const MIN_INGREDIENT_COVERAGE: f64 = 0.5;
+pub const MIN_INGREDIENT_COVERAGE: f64 = 0.75;
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
     pub days: u32,
-    /// Meals per day. When [`meals_per_day_max`](Self::meals_per_day_max) is set,
-    /// this is the lower bound of an allowed range and the planner chooses the
-    /// count in `[meals_per_day, meals_per_day_max]` that best satisfies the
-    /// constraints (least nutrition violation, then fewest distinct ingredients).
     pub meals_per_day: u32,
-    /// Optional upper bound for a meals-per-day *range*. `None` fixes the count at
-    /// [`meals_per_day`](Self::meals_per_day).
-    pub meals_per_day_max: Option<u32>,
     /// On-hand stock in canonical units; consumed virtually while scoring.
     pub pantry: Vec<PantryItem>,
     /// Optional macro min/max constraints. Empty keeps legacy min-union behavior.
@@ -126,7 +119,6 @@ impl Default for PlanOptions {
         Self {
             days: 7,
             meals_per_day: 1,
-            meals_per_day_max: None,
             pantry: Vec::new(),
             nutrition: NutritionBounds::default(),
             recipe_macros: HashMap::new(),
@@ -623,55 +615,15 @@ pub fn plan_bound_violations(
 /// macro min/max bounds (estimated whole-recipe macros in `opts.recipe_macros`).
 /// If no feasible schedule exists, the least-violation plan is returned and
 /// the rationale notes the violation count (details via [`plan_bound_violations`]).
-/// Plan the best schedule for a fixed `target` count at `input.meals_per_day`:
-/// the exact ILP under bounds (greedy fallback when it declines), or the greedy
-/// min-union search when unconstrained. Returns the scored schedule and whether
-/// the exact solver produced it (for the rationale lead).
-fn plan_one(input: &GreedyInput<'_>, target: usize) -> (ScoredSchedule, bool) {
-    let mpd = input.meals_per_day;
-    let score = |indices: Vec<usize>| {
-        score_schedule(
-            input.pool,
-            input.reqs,
-            input.macros,
-            indices,
-            input.pantry,
-            input.bounds,
-            mpd,
-        )
-    };
-    if target == input.pool.len() && input.bounds.is_empty() {
-        (score(order_full_pool(input)), false)
-    } else if input.bounds.is_empty() {
-        let mut best: Option<(Vec<usize>, usize)> = None;
-        for seed in 0..input.pool.len() {
-            let candidate = greedy_from_seed(input, seed, target);
-            let ua = net_shortfall_count(input.reqs, &candidate, input.pantry);
-            let take = match &best {
-                None => true,
-                Some((b, ub)) => better_schedule(input.pool, &candidate, ua, b, *ub),
-            };
-            if take {
-                best = Some((candidate, ua));
-            }
-        }
-        (score(best.map(|(s, _)| s).unwrap_or_default()), false)
-    } else {
-        match ilp::solve_constrained(input, target) {
-            Some(indices) => (score(indices), true),
-            None => (greedy_constrained_scored(input, target), false),
-        }
-    }
-}
-
 pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
+    let slots = opts
+        .days
+        .checked_mul(opts.meals_per_day)
+        .map(|n| n as usize)
+        .unwrap_or(0);
     let plan_id = uuid::Uuid::new_v4().to_string();
     let pantry = &opts.pantry;
     let bounds = &opts.nutrition;
-    // Meals-per-day range: fixed when no max is set. The planner picks the count
-    // in [min_mpd, max_mpd] that best satisfies the constraints.
-    let min_mpd = opts.meals_per_day.max(1);
-    let max_mpd = opts.meals_per_day_max.unwrap_or(min_mpd).max(min_mpd);
 
     // Recipes below the ingredient-coverage threshold are only dropped when
     // bounds are configured — an unconstrained plan doesn't care about macros.
@@ -681,8 +633,8 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let macros = align_macros(&pool, opts);
     let coverage_pct = (MIN_INGREDIENT_COVERAGE * 100.0).round() as u32;
 
-    if pool.is_empty() || opts.days == 0 {
-        let rationale = if opts.days == 0 {
+    if pool.is_empty() || slots == 0 {
+        let rationale = if slots == 0 {
             "Empty pool or zero slots; no meals planned.".into()
         } else if dropped_non_meal > 0 {
             format!(
@@ -698,58 +650,56 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         return MealPlan {
             id: plan_id,
             days: opts.days,
-            meals_per_day: min_mpd,
+            meals_per_day: opts.meals_per_day,
             meals: vec![],
             rationale,
         };
     }
 
-    // Choose the meals-per-day count that best satisfies the constraints. When
-    // unconstrained, more meals never reduce the ingredient union and there are no
-    // bounds to satisfy, so the minimum count is provably optimal — skip the
-    // search. Under bounds, plan for each count and keep the best-scoring one
-    // (feasible-first, then least violation, then fewest distinct ingredients).
-    let candidates: Vec<u32> = if bounds.is_empty() {
-        vec![min_mpd]
+    let target = slots.min(pool.len());
+    let mpd = opts.meals_per_day.max(1);
+    let input = GreedyInput {
+        pool: &pool,
+        reqs: &reqs,
+        keys: &keys,
+        macros: &macros,
+        pantry,
+        bounds,
+        meals_per_day: mpd,
+    };
+
+    // Track whether the exact solver produced the constrained plan (for the
+    // rationale lead); the greedy fallback labels itself best-effort.
+    let mut planner_ilp = false;
+    let scored = if target == pool.len() && bounds.is_empty() {
+        let indices = order_full_pool(&input);
+        score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd)
+    } else if bounds.is_empty() {
+        let mut best: Option<(Vec<usize>, usize)> = None;
+        for seed in 0..pool.len() {
+            let candidate = greedy_from_seed(&input, seed, target);
+            let ua = net_shortfall_count(&reqs, &candidate, pantry);
+            let take = match &best {
+                None => true,
+                Some((b, ub)) => better_schedule(&pool, &candidate, ua, b, *ub),
+            };
+            if take {
+                best = Some((candidate, ua));
+            }
+        }
+        let indices = best.map(|(s, _)| s).unwrap_or_default();
+        score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd)
     } else {
-        (min_mpd..=max_mpd).collect()
-    };
-    let mut best: Option<(ScoredSchedule, u32, bool)> = None;
-    for cand in candidates {
-        let target = (opts.days as usize)
-            .saturating_mul(cand as usize)
-            .min(pool.len());
-        if target == 0 {
-            continue;
+        // Non-empty bounds: solve the selection exactly, falling back to the
+        // greedy planner when the solver declines.
+        match ilp::solve_constrained(&input, target) {
+            Some(indices) => {
+                planner_ilp = true;
+                score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd)
+            }
+            None => greedy_constrained_scored(&input, target),
         }
-        let input = GreedyInput {
-            pool: &pool,
-            reqs: &reqs,
-            keys: &keys,
-            macros: &macros,
-            pantry,
-            bounds,
-            meals_per_day: cand,
-        };
-        let (scored, ilp) = plan_one(&input, target);
-        let take = match &best {
-            None => true,
-            Some((b, _, _)) => better_scored(&pool, &scored, b),
-        };
-        if take {
-            best = Some((scored, cand, ilp));
-        }
-    }
-    let Some((scored, mpd, planner_ilp)) = best else {
-        return MealPlan {
-            id: plan_id,
-            days: opts.days,
-            meals_per_day: min_mpd,
-            meals: vec![],
-            rationale: "Empty pool or zero slots; no meals planned.".into(),
-        };
     };
-    let slots = (opts.days as usize) * (mpd as usize);
 
     let selected = &scored.indices;
     let total_unique = union_size(&keys, selected);
@@ -817,16 +767,10 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         )
     };
 
-    let range_note = if max_mpd > min_mpd {
-        format!(" Chose {mpd} meal(s)/day from the requested {min_mpd}–{max_mpd} range.")
-    } else {
-        String::new()
-    };
-
     let rationale = if bounds.is_empty() {
         format!(
             "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
-             no recipe repeats. {pantry_note}{non_meal_note}{nutrition_note}{range_note}{partial_note}",
+             no recipe repeats. {pantry_note}{non_meal_note}{nutrition_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
@@ -839,7 +783,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         };
         format!(
             "{lead}: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
-             no recipe repeats. {pantry_note}{non_meal_note}{low_coverage_note}{nutrition_note}{range_note}{partial_note}",
+             no recipe repeats. {pantry_note}{non_meal_note}{low_coverage_note}{nutrition_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
@@ -849,7 +793,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     MealPlan {
         id: plan_id,
         days: opts.days,
-        meals_per_day: mpd,
+        meals_per_day: opts.meals_per_day,
         meals,
         rationale,
     }
@@ -1019,9 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn absurd_slot_count_uses_whole_pool_without_overflow() {
-        // A slot count far larger than the pool yields a partial plan of every
-        // available recipe — no overflow panic, no silent empty plan.
+    fn overflow_slots_treated_as_empty() {
         let a = rec("A", &["1 cup water"]);
         let plan = plan_meals(
             &[a],
@@ -1031,68 +973,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(plan.meals.len(), 1);
-    }
-
-    #[test]
-    fn meals_per_day_range_unconstrained_picks_minimum() {
-        // No bounds: more meals never reduce the ingredient union, so a 1–3 range
-        // must choose the minimum (1 meal/day).
-        let pool: Vec<Recipe> = (0..6)
-            .map(|i| rec_with_id(&format!("r{i}"), &format!("R{i}"), &["1 cup water"]))
-            .collect();
-        let plan = plan_meals(
-            &pool,
-            &PlanOptions {
-                days: 2,
-                meals_per_day: 1,
-                meals_per_day_max: Some(3),
-                ..Default::default()
-            },
-        );
-        assert_eq!(plan.meals_per_day, 1);
-        assert_eq!(plan.meals.len(), 2); // 2 days × 1 meal
-    }
-
-    #[test]
-    fn meals_per_day_range_constrained_picks_count_that_satisfies_bounds() {
-        // Each recipe has 50 g protein; a per-day minimum of 90 g can't be met by
-        // one meal but can by two, so a 1–2 range must choose 2.
-        let recipes = vec![
-            rec_with_id("r0", "R0", &["1 cup water"]),
-            rec_with_id("r1", "R1", &["1 cup water"]),
-        ];
-        let m = Macros {
-            kcal: 400.0,
-            protein_g: 50.0,
-            fat_g: 10.0,
-            carbs_g: 20.0,
-        };
-        let macros = macro_map(&[("r0", m), ("r1", m)]);
-        let bounds = NutritionBounds {
-            per_day: MacroBounds {
-                protein_g: MacroRange {
-                    min: Some(90.0),
-                    max: None,
-                },
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let plan = plan_meals(
-            &recipes,
-            &PlanOptions {
-                days: 1,
-                meals_per_day: 1,
-                meals_per_day_max: Some(2),
-                nutrition: bounds,
-                recipe_macros: macros,
-                ..Default::default()
-            },
-        );
-        assert_eq!(plan.meals_per_day, 2, "{}", plan.rationale);
-        assert_eq!(plan.meals.len(), 2);
-        assert!(plan.rationale.contains("satisfied"));
+        assert!(plan.meals.is_empty());
     }
 
     #[test]
