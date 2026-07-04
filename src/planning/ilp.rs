@@ -9,16 +9,18 @@
 //!   Continuous `y[k] ∈ [0,1]` per non-pantry ingredient key, and continuous
 //!   slacks that measure how far each scope total sits outside its min/max.
 //! * **Objective** — a two-phase lexicographic solve: phase 1 minimizes the
-//!   total nutrition-violation magnitude (so a feasible plan is returned
-//!   whenever one exists); phase 2 fixes that optimum (`V ≤ V* + ε`) and
-//!   minimizes the net ingredient union `Σ y`. This mirrors the ranking
-//!   contract in [`super::better_scored`] (feasible-first, then min violation,
-//!   then min union).
+//!   total **weighted** violation magnitude (calories and the macro-split ratio
+//!   are prioritized ~5×, see [`super::weighted_magnitude`]), so a feasible plan
+//!   is returned whenever one exists; phase 2 fixes that optimum (`V ≤ V* + ε`)
+//!   and minimizes the net ingredient union `Σ y`. This mirrors the ranking
+//!   contract in [`super::better_scored`] (feasible-first, then min weighted
+//!   violation, then min union).
 //!
-//! The violation objective reproduces [`super::violation_magnitude`] exactly:
+//! The violation objective reproduces [`super::weighted_magnitude`] exactly:
 //! per-meal bounds are a per-recipe constant, per-day/plan bounds are slacks on
-//! the relevant totals. Only `x` is integer; `y` and slacks are integral at the
-//! optimum on their own, which keeps the branch-and-bound tree small.
+//! the relevant totals (each scaled by its constraint weight). Only `x` is
+//! integer; `y` and slacks are integral at the optimum on their own, which keeps
+//! the branch-and-bound tree small.
 //!
 //! Returns `None` (caller falls back to the greedy planner) when the model is
 //! too large, the solver errors, or it hits the time budget — so we never hang
@@ -30,8 +32,8 @@ use std::time::Duration;
 use microlp::{ComparisonOp, OptimizationDirection, Problem, Solution, StopReason, Variable};
 
 use super::{
-    evaluate_macros, violation_magnitude, BoundScope, GreedyInput, MacroBounds, MacroRange,
-    MacroRatio,
+    evaluate_macros, weighted_magnitude, BoundScope, GreedyInput, MacroBounds, MacroRange,
+    MacroRatio, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
 };
 use crate::domain::{Macros, UnitKind};
 use crate::shopping::pantry_quantity_for;
@@ -79,13 +81,15 @@ fn kind_rank(kind: UnitKind) -> u8 {
     }
 }
 
-/// Sum of magnitudes by which `m` alone sits outside `bounds` (a per-recipe
-/// constant; the scope label is irrelevant to the magnitude).
+/// Weighted (calories + ratio prioritized) magnitude by which `m` alone sits
+/// outside `bounds` — a per-recipe constant matching [`super::weighted_magnitude`]
+/// so the ILP objective agrees with the greedy ranking. Scope label is
+/// irrelevant to the magnitude.
 fn recipe_violation(bounds: &MacroBounds, m: &Macros) -> f64 {
     if bounds.is_empty() {
         return 0.0;
     }
-    violation_magnitude(&evaluate_macros(
+    weighted_magnitude(&evaluate_macros(
         bounds,
         m,
         BoundScope::PerMeal { day: 0, meal: 0 },
@@ -93,28 +97,39 @@ fn recipe_violation(bounds: &MacroBounds, m: &Macros) -> f64 {
 }
 
 /// Add min/max slacks for one nutrient on a scope total expressed as `terms`
-/// (`(var, nutrient_value)`), pushing each slack into `viol` with coefficient 1
-/// so the caller can build the violation objective/cap.
+/// (`(var, nutrient_value)`). `weight` is the ranking weight for this nutrient
+/// (`KCAL_WEIGHT` vs `MACRO_WEIGHT`), applied to both the objective and the
+/// phase-2 cap so the ILP minimizes the same weighted magnitude as the scorer.
 fn add_range_slacks(
     prob: &mut Problem,
     terms: &[(Variable, f64)],
     range: &MacroRange,
     slack_obj: f64,
+    weight: f64,
     viol: &mut Vec<(Variable, f64)>,
 ) {
     if let Some(min) = range.min {
-        let s = prob.add_var(slack_obj, (0.0, f64::INFINITY));
+        let s = prob.add_var(slack_obj * weight, (0.0, f64::INFINITY));
         let mut expr = terms.to_vec();
         expr.push((s, 1.0)); // total + s_below >= min
         prob.add_constraint(&expr, ComparisonOp::Ge, min);
-        viol.push((s, 1.0));
+        viol.push((s, weight));
     }
     if let Some(max) = range.max {
-        let s = prob.add_var(slack_obj, (0.0, f64::INFINITY));
+        let s = prob.add_var(slack_obj * weight, (0.0, f64::INFINITY));
         let mut expr = terms.to_vec();
         expr.push((s, -1.0)); // total - s_above <= max
         prob.add_constraint(&expr, ComparisonOp::Le, max);
-        viol.push((s, 1.0));
+        viol.push((s, weight));
+    }
+}
+
+/// Weight for a min/max slack on nutrient index `i` (0 = kcal).
+fn range_weight(i: usize) -> f64 {
+    if i == 0 {
+        KCAL_WEIGHT
+    } else {
+        MACRO_WEIGHT
     }
 }
 
@@ -139,7 +154,8 @@ fn add_ratio_slacks(
             continue;
         };
         let t = target_pct / 100.0;
-        let s = prob.add_var(slack_obj, (0.0, f64::INFINITY));
+        // Ratio is a headline constraint: weight the slack like the scorer.
+        let s = prob.add_var(slack_obj * RATIO_WEIGHT, (0.0, f64::INFINITY));
         // above: s - actual + (t + tol)*base >= 0
         // below: s + actual + (tol - t)*base >= 0
         let mut above: Vec<(Variable, f64)> = Vec::with_capacity(macro_terms.len() + 1);
@@ -158,7 +174,7 @@ fn add_ratio_slacks(
         }
         prob.add_constraint(&above, ComparisonOp::Ge, 0.0);
         prob.add_constraint(&below, ComparisonOp::Ge, 0.0);
-        viol.push((s, 1.0));
+        viol.push((s, RATIO_WEIGHT));
     }
 }
 
@@ -266,10 +282,24 @@ fn solve_flat(
                 .map(|j| (xs[j], nutrient_val(&macros[order[j]], i)))
                 .collect();
             if need_plan {
-                add_range_slacks(&mut prob, &terms, &plan_range, slack_obj, &mut viol);
+                add_range_slacks(
+                    &mut prob,
+                    &terms,
+                    &plan_range,
+                    slack_obj,
+                    range_weight(i),
+                    &mut viol,
+                );
             }
             if need_day {
-                add_range_slacks(&mut prob, &terms, &day_range, slack_obj, &mut viol);
+                add_range_slacks(
+                    &mut prob,
+                    &terms,
+                    &day_range,
+                    slack_obj,
+                    range_weight(i),
+                    &mut viol,
+                );
             }
         }
 
@@ -400,7 +430,14 @@ fn solve_partition(
                     }
                 }
                 for terms in &day_terms {
-                    add_range_slacks(&mut prob, terms, &day_range, slack_obj, &mut viol);
+                    add_range_slacks(
+                        &mut prob,
+                        terms,
+                        &day_range,
+                        slack_obj,
+                        range_weight(i),
+                        &mut viol,
+                    );
                 }
             }
             // Plan slacks on the total over all cells.
@@ -413,7 +450,14 @@ fn solve_partition(
                         terms.push((v, val));
                     }
                 }
-                add_range_slacks(&mut prob, &terms, &plan_range, slack_obj, &mut viol);
+                add_range_slacks(
+                    &mut prob,
+                    &terms,
+                    &plan_range,
+                    slack_obj,
+                    range_weight(i),
+                    &mut viol,
+                );
             }
         }
 

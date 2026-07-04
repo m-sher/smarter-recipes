@@ -434,6 +434,50 @@ pub fn violation_magnitude(violations: &[BoundViolation]) -> f64 {
     violations.iter().map(|v| v.magnitude).sum()
 }
 
+// --- Constraint weighting for plan ranking --------------------------------
+//
+// Raw violation magnitudes are in mixed units (kcal, grams, grams-beyond-band),
+// so a flat sum lets calories dominate by scale while ratio (small grams) is
+// nearly ignored. For *ranking* we instead normalize each violation to a
+// comparable scale (÷ a reference so a "meaningful" miss ≈ 1.0) and weight
+// calories and the macro-split ratio as the headline constraints. Raw
+// magnitudes are unchanged for the reported violation list.
+
+/// Reference size of a "meaningful" violation, per kind (normalizes units).
+const KCAL_REF: f64 = 100.0; // kcal
+const GRAM_REF: f64 = 15.0; // grams (protein/fat/carb min/max)
+const RATIO_GRAM_REF: f64 = 15.0; // grams beyond the ratio band
+
+/// Priority multipliers: calories and ratio are ~5× a comparable macro miss.
+const KCAL_PRIORITY: f64 = 5.0;
+const RATIO_PRIORITY: f64 = 5.0;
+const MACRO_PRIORITY: f64 = 1.0;
+
+/// Per-unit ranking weight for a calorie min/max violation.
+pub const KCAL_WEIGHT: f64 = KCAL_PRIORITY / KCAL_REF;
+/// Per-unit ranking weight for a protein/fat/carb min/max violation.
+pub const MACRO_WEIGHT: f64 = MACRO_PRIORITY / GRAM_REF;
+/// Per-unit ranking weight for a macro-split ratio violation.
+pub const RATIO_WEIGHT: f64 = RATIO_PRIORITY / RATIO_GRAM_REF;
+
+fn weighted_one(v: &BoundViolation) -> f64 {
+    let w = match v.kind {
+        ViolationKind::RatioBelowTarget | ViolationKind::RatioAboveTarget => RATIO_WEIGHT,
+        ViolationKind::BelowMin | ViolationKind::AboveMax => match v.nutrient {
+            NutrientKind::Kcal => KCAL_WEIGHT,
+            _ => MACRO_WEIGHT,
+        },
+    };
+    w * v.magnitude
+}
+
+/// Weighted, unit-normalized total used to *rank* infeasible plans (calories +
+/// ratio prioritized). Zero exactly when there are no violations, so the
+/// feasible/infeasible split is unchanged.
+pub fn weighted_magnitude(violations: &[BoundViolation]) -> f64 {
+    violations.iter().map(weighted_one).sum()
+}
+
 /// How far `totals` still are below configured mins (0 if met or unset).
 pub fn min_deficit(bounds: &MacroBounds, totals: &Macros) -> f64 {
     let mut d = 0.0;
@@ -854,5 +898,32 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, ViolationKind::RatioAboveTarget);
         assert!((v[0].magnitude - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn weighting_prioritizes_calories_and_ratio() {
+        let viol = |nutrient, kind, magnitude| BoundViolation {
+            scope: BoundScope::Plan,
+            nutrient,
+            kind,
+            actual: 0.0,
+            bound: 0.0,
+            magnitude,
+        };
+        // A 100 kcal miss, a 15 g protein-min miss, and a 15 g ratio miss.
+        let kcal = weighted_magnitude(&[viol(NutrientKind::Kcal, ViolationKind::AboveMax, 100.0)]);
+        let protein =
+            weighted_magnitude(&[viol(NutrientKind::ProteinG, ViolationKind::BelowMin, 15.0)]);
+        let ratio = weighted_magnitude(&[viol(
+            NutrientKind::FatG,
+            ViolationKind::RatioAboveTarget,
+            15.0,
+        )]);
+        assert!((protein - 1.0).abs() < 1e-9, "macro baseline: {protein}");
+        assert!((kcal - 5.0).abs() < 1e-9, "calories ~5x: {kcal}");
+        assert!((ratio - 5.0).abs() < 1e-9, "ratio ~5x: {ratio}");
+        assert!(kcal > protein && ratio > protein);
+        // No violations still scores 0 (feasible/infeasible split unchanged).
+        assert_eq!(weighted_magnitude(&[]), 0.0);
     }
 }

@@ -78,8 +78,9 @@ mod nutrition_bounds;
 
 pub use nutrition_bounds::{
     evaluate_macros, evaluate_schedule, exceeds_max, load_nutrition_bounds, min_deficit,
-    violates_per_meal, violation_magnitude, BoundScope, BoundViolation, CliPerDayNutrition,
-    MacroBounds, MacroRange, MacroRatio, NutrientKind, NutritionBounds, ViolationKind,
+    violates_per_meal, violation_magnitude, weighted_magnitude, BoundScope, BoundViolation,
+    CliPerDayNutrition, MacroBounds, MacroRange, MacroRatio, NutrientKind, NutritionBounds,
+    ViolationKind, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
 };
 
 use crate::domain::{
@@ -456,7 +457,9 @@ fn score_schedule(
     } else {
         schedule_violations(macros, &indices, bounds, meals_per_day)
     };
-    let magnitude = violation_magnitude(&violations);
+    // Rank by the weighted (calories + ratio prioritized) magnitude; the raw
+    // violation list is still reported verbatim.
+    let magnitude = weighted_magnitude(&violations);
     ScoredSchedule {
         indices,
         net_union,
@@ -1926,6 +1929,80 @@ mod tests {
             "expected a ratio violation, got {v:?}"
         );
         assert!(plan.rationale.to_lowercase().contains("best effort"));
+    }
+
+    #[test]
+    fn weighting_prefers_ratio_over_protein_min() {
+        // "Protein Skew" meets the protein min but wrecks the split; "Balanced"
+        // nails the split but misses the protein min. Raw grams would pick the
+        // skewed one (smaller magnitude), but ratio is weighted ~5x, so the
+        // planner keeps the split and sacrifices the protein min.
+        let pool = vec![
+            rec_with_id("skew", "Protein Skew", &["100 g whey"]),
+            rec_with_id("bal", "Balanced", &["100 g mix"]),
+        ];
+        let macros = macro_map(&[
+            (
+                "skew",
+                Macros {
+                    kcal: 500.0,
+                    protein_g: 50.0,
+                    fat_g: 5.0,
+                    carbs_g: 5.0,
+                },
+            ),
+            (
+                "bal",
+                Macros {
+                    kcal: 500.0,
+                    protein_g: 20.0,
+                    fat_g: 20.0,
+                    carbs_g: 20.0,
+                },
+            ),
+        ]);
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(50.0),
+                    max: None,
+                },
+                ratio: MacroRatio {
+                    protein: Some(33.0),
+                    fat: None,
+                    carb: None,
+                    tolerance: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 1,
+            nutrition: nutrition.clone(),
+            recipe_macros: macros.clone(),
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(
+            titles(&plan),
+            vec!["Balanced"],
+            "ratio (weighted) should win over the protein min"
+        );
+        let v = plan_bound_violations(&pool, &plan, &nutrition, &macros);
+        assert!(
+            v.iter()
+                .any(|x| x.kind == ViolationKind::BelowMin && x.nutrient == NutrientKind::ProteinG),
+            "chosen plan should miss the protein min: {v:?}"
+        );
+        assert!(
+            !v.iter().any(|x| matches!(
+                x.kind,
+                ViolationKind::RatioBelowTarget | ViolationKind::RatioAboveTarget
+            )),
+            "chosen plan should satisfy the ratio: {v:?}"
+        );
     }
 
     fn ratio_partition_pool() -> (Vec<Recipe>, HashMap<RecipeId, Macros>) {
