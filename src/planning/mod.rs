@@ -102,6 +102,11 @@ pub struct PlanOptions {
     pub nutrition: NutritionBounds,
     /// Precomputed whole-recipe estimated macros (missing ids treat as zero).
     pub recipe_macros: HashMap<RecipeId, Macros>,
+    /// Recipes with at least one ingredient whose macros couldn't be estimated,
+    /// so their totals understate reality. Excluded from the pool only when
+    /// nutrition bounds are configured (an incomplete estimate can't be trusted
+    /// against a constraint); ignored for unconstrained min-union planning.
+    pub recipe_uncovered: HashSet<RecipeId>,
 }
 
 impl Default for PlanOptions {
@@ -112,6 +117,7 @@ impl Default for PlanOptions {
             pantry: Vec::new(),
             nutrition: NutritionBounds::default(),
             recipe_macros: HashMap::new(),
+            recipe_uncovered: HashSet::new(),
         }
     }
 }
@@ -121,6 +127,8 @@ type NormalizedPool<'a> = (
     Vec<&'a Recipe>,
     Vec<RecipeReq>,
     Vec<HashSet<IngredientKey>>,
+    // (dropped as non-meals, dropped for incomplete nutrition estimates)
+    usize,
     usize,
 );
 
@@ -191,14 +199,17 @@ fn is_non_meal_estimate(recipe_macros: &HashMap<RecipeId, Macros>, id: &RecipeId
 
 /// Deduplicate by `recipe_id`, drop empty-ingredient recipes when any non-empty
 /// recipe exists, drop recipes whose precomputed estimate cannot serve as a meal
-/// (no calories, or calories with no macro breakdown), then collapse by
-/// normalized title key (first wins among survivors). Empty filtering must run
-/// before title collapse so an empty stub cannot claim a title and block a
-/// fuller same-title recipe. Returns recipes paired with precomputed
-/// requirements and key sets, plus how many candidates were removed as non-meals.
+/// (no calories, or calories with no macro breakdown), drop recipes in
+/// `exclude_uncovered` (incomplete nutrition estimate; `Some` only when bounds
+/// are configured), then collapse by normalized title key (first wins among
+/// survivors). Empty filtering must run before title collapse so an empty stub
+/// cannot claim a title and block a fuller same-title recipe. Returns recipes
+/// paired with precomputed requirements and key sets, plus how many candidates
+/// were removed as non-meals and how many for an incomplete estimate.
 fn normalize_pool<'a>(
     pool: &'a [Recipe],
     recipe_macros: &HashMap<RecipeId, Macros>,
+    exclude_uncovered: Option<&HashSet<RecipeId>>,
 ) -> NormalizedPool<'a> {
     let mut seen_ids = HashSet::new();
     let mut recipes: Vec<&Recipe> = Vec::new();
@@ -230,16 +241,21 @@ fn normalize_pool<'a>(
     }
 
     let mut dropped_non_meal = 0usize;
+    let mut dropped_uncovered = 0usize;
     let mut i = 0;
     while i < recipes.len() {
-        if is_non_meal_estimate(recipe_macros, &recipes[i].id) {
-            recipes.remove(i);
-            reqs.remove(i);
-            keys.remove(i);
+        let id = &recipes[i].id;
+        if is_non_meal_estimate(recipe_macros, id) {
             dropped_non_meal += 1;
+        } else if exclude_uncovered.is_some_and(|set| set.contains(id)) {
+            dropped_uncovered += 1;
         } else {
             i += 1;
+            continue;
         }
+        recipes.remove(i);
+        reqs.remove(i);
+        keys.remove(i);
     }
 
     let mut seen_titles = HashSet::new();
@@ -255,7 +271,13 @@ fn normalize_pool<'a>(
         out_reqs.push(r_reqs);
         out_keys.push(k);
     }
-    (out_recipes, out_reqs, out_keys, dropped_non_meal)
+    (
+        out_recipes,
+        out_reqs,
+        out_keys,
+        dropped_non_meal,
+        dropped_uncovered,
+    )
 }
 
 /// Full union size of ingredient keys for recipes at the given pool indices.
@@ -598,7 +620,11 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let pantry = &opts.pantry;
     let bounds = &opts.nutrition;
 
-    let (pool, reqs, keys, dropped_non_meal) = normalize_pool(pool, &opts.recipe_macros);
+    // Recipes with an incomplete nutrition estimate are only dropped when bounds
+    // are configured — an unconstrained plan doesn't care about macros.
+    let exclude_uncovered = (!bounds.is_empty()).then_some(&opts.recipe_uncovered);
+    let (pool, reqs, keys, dropped_non_meal, dropped_uncovered) =
+        normalize_pool(pool, &opts.recipe_macros, exclude_uncovered);
     let macros = align_macros(&pool, opts);
 
     if pool.is_empty() || slots == 0 {
@@ -607,6 +633,10 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         } else if dropped_non_meal > 0 {
             format!(
                 "No meals planned: all {dropped_non_meal} candidate recipe(s) had no estimated calories or no macro breakdown, so none qualify as meals."
+            )
+        } else if dropped_uncovered > 0 {
+            format!(
+                "No meals planned: all {dropped_uncovered} candidate recipe(s) have an incomplete nutrition estimate (uncovered ingredients). Run `nutrition fetch` to cover more ingredients, or relax the nutrition bounds."
             )
         } else {
             "Empty pool or zero slots; no meals planned.".into()
@@ -692,6 +722,14 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         String::new()
     };
 
+    let uncovered_note = if dropped_uncovered > 0 {
+        format!(
+            " Excluded {dropped_uncovered} recipe(s) with an incomplete nutrition estimate (uncovered ingredients); run `nutrition fetch` to include them."
+        )
+    } else {
+        String::new()
+    };
+
     let partial_note = if meals.len() < slots {
         format!(
             " Pool has only {} unique non-empty recipe(s); requested {} slot(s), so the plan is partial (repeats are never used).",
@@ -739,7 +777,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         };
         format!(
             "{lead}: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
-             no recipe repeats. {pantry_note}{non_meal_note}{nutrition_note}{partial_note}",
+             no recipe repeats. {pantry_note}{non_meal_note}{uncovered_note}{nutrition_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
@@ -1506,6 +1544,67 @@ mod tests {
             "rationale should note the macro-less exclusion: {}",
             plan.rationale
         );
+    }
+
+    #[test]
+    fn uncovered_recipes_excluded_only_under_nutrition_bounds() {
+        let covered = rec_with_id("cov", "Steak", &["200 g beef"]);
+        let partial = rec_with_id("unc", "Mystery Stew", &["200 g beef", "1 dash unobtainium"]);
+        let full = Macros {
+            kcal: 400.0,
+            protein_g: 40.0,
+            fat_g: 20.0,
+            carbs_g: 5.0,
+        };
+        let macros = macro_map(&[("cov", full), ("unc", full)]);
+        let uncovered: HashSet<RecipeId> = [RecipeId::from("unc")].into_iter().collect();
+        let bounds = NutritionBounds {
+            per_day: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(1.0),
+                    max: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // With bounds, the recipe with an incomplete estimate is dropped.
+        let bounded = plan_meals(
+            &[covered.clone(), partial.clone()],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                nutrition: bounds,
+                recipe_macros: macros.clone(),
+                recipe_uncovered: uncovered.clone(),
+                ..Default::default()
+            },
+        );
+        let titles: Vec<_> = bounded
+            .meals
+            .iter()
+            .map(|m| m.recipe_title.as_str())
+            .collect();
+        assert!(
+            titles.contains(&"Steak") && !titles.contains(&"Mystery Stew"),
+            "{titles:?} / {}",
+            bounded.rationale
+        );
+        assert!(bounded.rationale.contains("incomplete nutrition estimate"));
+
+        // Without bounds, coverage is irrelevant — both recipes stay candidates.
+        let unbounded = plan_meals(
+            &[covered, partial],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                recipe_macros: macros,
+                recipe_uncovered: uncovered,
+                ..Default::default()
+            },
+        );
+        assert_eq!(unbounded.meals.len(), 2);
     }
 
     #[test]

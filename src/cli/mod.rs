@@ -425,13 +425,14 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             let nutrition = load_nutrition_bounds(nutrition_config.as_deref(), &cli_nutrition)?;
             let extra = nutrition_extra(&store)?;
-            let recipe_macros = recipe_macros_for_pool(&recipes, &extra);
+            let (recipe_macros, recipe_uncovered) = recipe_macros_for_pool(&recipes, &extra);
             let opts = PlanOptions {
                 days,
                 meals_per_day: per_day,
                 pantry,
                 nutrition: nutrition.clone(),
                 recipe_macros: recipe_macros.clone(),
+                recipe_uncovered,
             };
             let plan = plan_meals(&recipes, &opts);
             if json {
@@ -903,19 +904,27 @@ fn nutrition_extra(
         .collect())
 }
 
+/// Whole-recipe macro estimates, plus the set of recipes whose estimate is
+/// incomplete (at least one ingredient couldn't be estimated). The planner drops
+/// the latter when nutrition bounds are configured — an understated estimate
+/// can't be trusted against a constraint.
 fn recipe_macros_for_pool(
     recipes: &[Recipe],
     extra: &std::collections::HashMap<String, crate::domain::Macros>,
-) -> std::collections::HashMap<crate::domain::RecipeId, crate::domain::Macros> {
-    recipes
-        .iter()
-        .map(|r| {
-            (
-                r.id.clone(),
-                crate::nutrition::recipe_nutrition(r, extra).macros,
-            )
-        })
-        .collect()
+) -> (
+    std::collections::HashMap<crate::domain::RecipeId, crate::domain::Macros>,
+    std::collections::HashSet<crate::domain::RecipeId>,
+) {
+    let mut macros = std::collections::HashMap::new();
+    let mut uncovered = std::collections::HashSet::new();
+    for r in recipes {
+        let n = crate::nutrition::recipe_nutrition(r, extra);
+        if !n.uncovered.is_empty() {
+            uncovered.insert(r.id.clone());
+        }
+        macros.insert(r.id.clone(), n.macros);
+    }
+    (macros, uncovered)
 }
 
 fn print_plan_constraints(violations: &[crate::planning::BoundViolation]) {
