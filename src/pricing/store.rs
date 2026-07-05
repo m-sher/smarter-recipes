@@ -118,7 +118,7 @@ fn off_to_package(
     Some(Package {
         label: format!("{label} ({qty_label})"),
         size_canonical: size,
-        price_cents: None, // OFF rarely has reliable prices
+        price_cents: None,
         kind,
     })
 }

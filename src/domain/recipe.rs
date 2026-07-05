@@ -42,7 +42,7 @@ impl From<&str> for RecipeId {
     }
 }
 
-/// Where a recipe came from (for provenance / re-import).
+/// Where a recipe came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum RecipeSource {
@@ -58,9 +58,7 @@ pub struct RecipeMeta {
     pub author: Option<String>,
     pub cuisine: Option<String>,
     /// schema.org `recipeCategory` — the publisher's own classification
-    /// ("Main Course", "Sauce", "Dessert", …). Used to tell standalone meals
-    /// from components (sauces, dressings, condiments). Joined when the source
-    /// lists several.
+    /// ("Main Course", "Sauce", "Dessert", …). Joined when the source lists several.
     #[serde(default)]
     pub category: Option<String>,
     pub tags: Vec<String>,
@@ -73,7 +71,7 @@ pub struct RecipeMeta {
     pub nutrition: Option<super::nutrition::Nutrition>,
 }
 
-/// Normalized recipe used throughout the system.
+/// Normalized recipe.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Recipe {
     pub id: RecipeId,

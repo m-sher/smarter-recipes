@@ -2,16 +2,14 @@
 //!
 //! # Behavior
 //!
-//! 1. Fetch the seed URL and collect **same-host** `http(s)` links (not limited to
-//!    path descendants of the seed — category pages often link to site-root posts).
+//! 1. Fetch the seed URL and collect **same-host** `http(s)` links.
 //! 2. BFS-fetch candidates up to `--depth` / `max_depth`, scanning each fetched
 //!    page for more same-host links when depth allows.
 //! 3. Try to parse each non-seed page as a recipe. Pages that are not recipes are
 //!    **navigation** (category/index): they expand the frontier but are **not**
-//!    recorded as scrape failures, so re-runs can still traverse them to find
-//!    newly published recipes.
-//! 4. Only **hard** failures (network / HTTP errors) go in [`ScrapeOutcome::failed`]
-//!    for persistence. A small deny-list skips obvious non-content paths and assets.
+//!    recorded as scrape failures.
+//! 4. Only **hard** failures (network / HTTP errors) go in [`ScrapeOutcome::failed`].
+//!    A small deny-list skips obvious non-content paths and assets.
 //!
 //! Candidates are fetched concurrently per BFS frontier batch and deduplicated by
 //! normalized URL.
@@ -26,8 +24,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use url::Url;
 
-/// Fetches page HTML for a URL. Abstracted so scraping is testable offline.
-/// Implementations must be `Sync` so candidates can be fetched concurrently.
+/// Fetches page HTML for a URL.
 pub trait HtmlFetcher: Sync {
     fn fetch(&self, url: &str) -> Result<String>;
 }
@@ -62,8 +59,8 @@ impl HtmlFetcher for HttpFetcher {
     }
 }
 
-/// Progress emitted during a scrape. Handlers run on worker threads, so they must
-/// be cheap and thread-safe (e.g. line-buffered `eprintln!`).
+/// Progress emitted during a scrape. Handlers run on worker threads; must be
+/// cheap and thread-safe.
 #[derive(Debug, Clone)]
 pub enum ScrapeEvent {
     /// Emitted after the seed page is scanned (and when recursion expands the plan).
@@ -76,7 +73,7 @@ pub enum ScrapeEvent {
     Imported { url: String, title: String },
     /// Page fetched OK but is not a recipe (category / nav). Not a persistent failure.
     NotRecipe { url: String, reason: String },
-    /// Hard fetch/network failure (safe to persist for future skip).
+    /// Hard fetch/network failure.
     Failed { url: String, reason: String },
 }
 
@@ -108,7 +105,7 @@ pub fn recipe_source_url(r: &Recipe) -> Option<String> {
     }
 }
 
-/// Path segments that are almost never recipe content (budget protection).
+/// Path segments that are almost never recipe content.
 const DENY_SEGMENTS: &[&str] = &[
     "about",
     "author",
@@ -133,9 +130,7 @@ const DENY_SEGMENTS: &[&str] = &[
     "comment",
     "comments",
     "cdn-cgi",
-    // Site chrome / non-recipe sections (search-scrape yield protection).
-    // Prefer specific segments over broad ones (e.g. food-news not bare "news")
-    // so site `scrape` does not drop legit recipes under generic paths.
+    // Site chrome / non-recipe sections.
     "videos",
     "video",
     "newsletter",
@@ -176,8 +171,7 @@ pub fn is_denied_url(u: &str) -> bool {
 }
 
 /// True when the URL is a category/tag/pagination/index page that must not
-/// be stored as a recipe (JSON-LD on those pages is usually a featured recipe).
-/// Still allowed as a BFS node for link discovery.
+/// be stored as a recipe. Allowed as a BFS node for link discovery.
 pub fn is_listing_url(u: &str) -> bool {
     let Ok(url) = Url::parse(u) else {
         return true;
@@ -187,8 +181,6 @@ pub fn is_listing_url(u: &str) -> bool {
     if segments.is_empty() {
         return true;
     }
-    // Keep this set stable for site `scrape` import policy (search-scrape must not
-    // silently change which paths count as listings on existing scrapes).
     const LISTING_SEGMENTS: &[&str] =
         &["category", "categories", "tag", "tags", "author", "authors"];
     if segments.iter().any(|s| LISTING_SEGMENTS.contains(s)) {
@@ -260,11 +252,11 @@ pub struct ScrapeOutcome {
     pub recipes: Vec<Recipe>,
     /// Total unique same-host links discovered during the crawl (all depths).
     pub candidates: usize,
-    /// Links skipped because their URL was already known (imported or hard-failed).
+    /// Links skipped as already known (imported or hard-failed).
     pub skipped_existing: usize,
-    /// Hard fetch/network failures — safe to persist for skip on future runs.
+    /// Hard fetch/network failures.
     pub failed: Vec<(String, String)>,
-    /// Pages that fetched OK but are not recipes (nav/category). **Not** for persistence.
+    /// Pages that fetched OK but are not recipes (nav/category).
     pub not_recipe: Vec<(String, String)>,
 }
 
@@ -277,7 +269,7 @@ pub struct ScrapeParams {
     pub jobs: usize,
     /// BFS depth (1 = seeds / seed-links only).
     pub max_depth: usize,
-    /// Sleep between site-page fetch batches (politeness). Zero in unit tests.
+    /// Sleep between site-page fetch batches. Zero in unit tests.
     pub request_delay: Duration,
 }
 
@@ -287,13 +279,12 @@ impl ScrapeParams {
             limit,
             jobs: jobs.max(1),
             max_depth: max_depth.max(1),
-            // Small inter-batch pause; keeps multi-host runs polite without
-            // serializing every request.
+            // Small inter-batch pause.
             request_delay: Duration::from_millis(150),
         }
     }
 
-    /// Same as [`Self::new`] but with no delay (offline tests).
+    /// Same as [`Self::new`] but with no delay.
     pub fn new_fast(limit: usize, jobs: usize, max_depth: usize) -> Self {
         Self {
             request_delay: Duration::ZERO,
@@ -302,8 +293,8 @@ impl ScrapeParams {
     }
 }
 
-/// Dual FIFO queues: non-listing (content) drained before listings, but both
-/// are strict FIFO so later seeds are not starved by earlier expansions.
+/// Dual FIFO queues: non-listing (content) drained before listings; both
+/// strict FIFO.
 struct CandidateQueues {
     content: VecDeque<(String, usize)>,
     listings: VecDeque<(String, usize)>,
@@ -343,8 +334,8 @@ impl CandidateQueues {
     }
 
     /// Prefer non-listing children of a nav/roundup page over remaining unfetched
-    /// seeds (still FIFO among those children). Used only when the parent page
-    /// was not a recipe — keeps same-depth recipe seeds BFS-fair (#1 regression).
+    /// seeds (FIFO among those children). Used only when the parent page was not
+    /// a recipe.
     fn enqueue_batch_prefer_content(&mut self, links: Vec<(String, usize)>) {
         let mut content = Vec::new();
         let mut listings = Vec::new();
@@ -355,7 +346,7 @@ impl CandidateQueues {
                 content.push((link, depth));
             }
         }
-        // push_front reverses; feed in reverse so pop_front yields discovery order.
+        // push_front reverses; feeding in reverse restores discovery order on pop_front.
         for item in content.into_iter().rev() {
             self.content.push_front(item);
         }
@@ -399,7 +390,7 @@ pub fn scrape_new_recipes(
         .with_context(|| format!("fetching index page {base_url}"))?;
 
     let links = discover_scoped_links(base_url, &seed_html, base_url);
-    // Index URL is not a fetch target; mark it seen so we don't loop back to it.
+    // Index URL is not a fetch target; mark it seen.
     let mut bootstrap_seen = HashSet::new();
     bootstrap_seen.insert(normalize_url(base_url));
     scrape_from_seeds(
@@ -414,9 +405,8 @@ pub fn scrape_new_recipes(
 
 /// BFS-fetch `seeds` (each is a page fetch target) up to `params.limit` fetches.
 ///
-/// Unlike [`scrape_new_recipes`], seeds themselves are fetched and may be imported
-/// as recipes. Link expansion is **same-host as the page being scanned** so multi-host
-/// search results each open their own host frontier under a shared budget.
+/// Seeds themselves are fetched and may be imported as recipes. Link expansion is
+/// **same-host as the page being scanned**.
 ///
 /// - Depth `1`: fetch seeds only (no expansion).
 /// - Depth `N`: expand same-host links from fetched pages while `depth < N`.
@@ -541,10 +531,8 @@ pub fn scrape_from_seeds(
 
         for (_bi, url, depth, html, fetch_ok, ingest) in batch_results {
             fetches_used += 1;
-            // Prefer children of nav/roundup pages over further unfetched seeds so
-            // listicle-heavy search SERPs still reach individual recipes under a
-            // modest --limit. Successful recipe pages keep normal BFS enqueue so
-            // same-depth siblings are not starved (see bfs_does_not_starve_*).
+            // Prefer children of nav/roundup pages over further unfetched seeds.
+            // Successful recipe pages keep normal BFS enqueue.
             let prefer_children = match (fetch_ok, ingest) {
                 (true, Ok(recipe)) => {
                     recipes.push(recipe);
@@ -561,7 +549,7 @@ pub fn scrape_from_seeds(
                 (false, Ok(_)) => unreachable!("fetch failed cannot produce recipe"),
             };
 
-            // Host-scope expansion to the page's own host (supports multi-host seeds).
+            // Host-scope expansion to the page's own host.
             if depth < max_depth && !html.is_empty() {
                 let mut batch_links: Vec<(String, usize)> = Vec::new();
                 for link in discover_scoped_links(&url, &html, &url) {
@@ -736,7 +724,7 @@ mod tests {
                 .map(|r| r.title.clone())
                 .collect::<Vec<_>>()
         );
-        // Real recipe page should still be reachable via BFS.
+        // Real recipe page reachable via BFS.
         assert!(
             out.recipes.iter().any(|r| r.title == "Grilled S'mores"),
             "expected real recipe via expanded link, got {:?}",
@@ -1128,8 +1116,7 @@ mod tests {
         assert!(!titles.contains("Soup"));
     }
 
-    /// Regression: expansions must not jump ahead of later same-depth seeds.
-    /// With jobs=1 and limit=3, DFS/push_front would import R1,R1a,R1b.
+    /// Expansions must not jump ahead of later same-depth seeds.
     #[test]
     fn bfs_does_not_starve_later_seed_siblings() {
         let mut pages = HashMap::new();
@@ -1174,8 +1161,6 @@ mod tests {
 
     #[test]
     fn topics_and_collection_paths_are_not_forced_listing() {
-        // Expanded listing segments were reverted so site `scrape` import policy
-        // for these paths stays unchanged.
         assert!(!is_listing_url("https://site.com/topics/one-pan-chicken"));
         assert!(!is_listing_url("https://site.com/collection/summer-pies"));
     }
@@ -1189,7 +1174,7 @@ mod tests {
         assert!(is_denied_url("https://www.realsimple.com/about-us-5546943"));
         assert!(is_denied_url("https://www.realsimple.com/sweepstakes"));
         assert!(!is_denied_url("https://site.com/recipes/chicken-soup"));
-        // Broad bare segments intentionally not denied:
+        // Broad bare segments not denied:
         assert!(!is_denied_url("https://site.com/news/recipe-trends"));
         assert!(!is_denied_url("https://site.com/menu/weeknight-dinners"));
     }
@@ -1224,7 +1209,6 @@ mod tests {
             "https://b.com/roundup2".to_string(),
             "https://c.com/roundup3".to_string(),
         ];
-        // Without prefer-children: would fetch 3 roundups under limit 3 → 0 recipes.
         let out = scrape_from_seeds(
             &f,
             &seeds,

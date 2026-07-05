@@ -5,7 +5,7 @@
 //! the density table, defaulting to 1 g/ml for density-unknown liquids that
 //! have a macro profile; count via per-item weights), then scale the per-100 g
 //! profile. Ingredients that cannot be converted or have no profile are
-//! reported as uncovered rather than silently guessed.
+//! reported as uncovered.
 
 mod openfoodfacts;
 mod table;
@@ -22,16 +22,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Looks up a per-100 g macro profile for an ingredient name. `Sync` so one
-/// source can be shared across the parallel `nutrition fetch` workers.
+/// Looks up a per-100 g macro profile for an ingredient name.
 pub trait NutritionSource: Sync {
     fn name(&self) -> &'static str;
     fn lookup(&self, ingredient: &str) -> Result<Option<Macros>>;
 }
 
-/// Minimum-interval gate shared across threads so a source's request rate stays
-/// capped no matter how many fetch workers run concurrently. Holding the lock
-/// across the sleep serializes request dispatch to one per `min_interval`.
+/// Minimum-interval gate shared across threads. Holding the lock across the
+/// sleep serializes request dispatch to one per `min_interval`.
 pub(crate) struct RateGate {
     min_interval: Duration,
     last: Mutex<Option<Instant>>,
@@ -62,10 +60,9 @@ impl RateGate {
 }
 
 /// Tries several [`NutritionSource`]s in order, returning the first hit. When a
-/// source reports [`RateLimited`], it is skipped for the rest of the run (its
-/// quota is spent) and the next source is tried — so one provider's limit no
-/// longer blocks the whole `nutrition fetch`. [`RateLimited`] is only surfaced
-/// once **every** source is exhausted.
+/// source reports [`RateLimited`], it is skipped for the rest of the run and the
+/// next source is tried. [`RateLimited`] is only surfaced once **every** source
+/// is exhausted.
 pub struct ChainedNutritionSource {
     sources: Vec<Box<dyn NutritionSource>>,
     /// Per-source "rate-limited this run" flags (shared across fetch workers).
@@ -108,9 +105,7 @@ impl NutritionSource for ChainedNutritionSource {
                 Err(e) => last_err = Some(e),
             }
         }
-        // No source produced a hit.
         if self.exhausted.iter().all(|e| e.load(Ordering::Relaxed)) {
-            // Every source is rate-limited — signal the caller to stop.
             return Err(anyhow::Error::new(RateLimited {
                 using_demo_key: std::env::var("SMARTER_RECIPES_FDC_KEY").is_err(),
             }));
@@ -118,20 +113,17 @@ impl NutritionSource for ChainedNutritionSource {
         if let Some(e) = last_err {
             return Err(e);
         }
-        // At least one source responded and cleanly missed (a comprehensive
-        // fallback like Open Food Facts missing is a decent genuine-miss signal;
-        // a name only FDC has may be cached as a miss while FDC is limited).
+        // At least one source responded and cleanly missed.
         Ok(None)
     }
 }
 
-/// Throttle between FoodData Central requests to avoid tripping burst limits.
+/// Throttle between FoodData Central requests.
 const FDC_REQUEST_DELAY: Duration = Duration::from_millis(250);
 /// How many times to retry a single request that returns HTTP 429.
 const FDC_MAX_RETRIES: u32 = 3;
 
-/// Returned when FoodData Central keeps replying HTTP 429 after retries, so the
-/// caller can stop the batch instead of burning the remaining quota.
+/// Returned when FoodData Central keeps replying HTTP 429 after retries.
 #[derive(Debug)]
 pub struct RateLimited {
     pub using_demo_key: bool,
@@ -157,12 +149,12 @@ impl std::fmt::Display for RateLimited {
 impl std::error::Error for RateLimited {}
 
 /// USDA FoodData Central search API. Uses `SMARTER_RECIPES_FDC_KEY` when set,
-/// else the public `DEMO_KEY` (rate-limited; fine for occasional fetches).
+/// else the public `DEMO_KEY` (rate-limited).
 pub struct FdcSource {
     client: reqwest::blocking::Client,
     api_key: String,
     pub base_url: String,
-    /// Shared dispatch gate so concurrent workers don't exceed the request rate.
+    /// Shared dispatch gate.
     gate: RateGate,
     /// Canned response body for offline tests.
     pub offline_body: Option<String>,
@@ -197,8 +189,7 @@ impl NutritionSource for FdcSource {
             self.fetch_body(ingredient)?
         };
         // A 2xx body that is not FDC JSON (captive portal, gateway HTML) is an
-        // error, not a definitive "no match" — otherwise the caller would
-        // negative-cache a transient failure.
+        // error, not a definitive "no match".
         let v: serde_json::Value =
             serde_json::from_str(&body).context("FoodData Central response was not JSON")?;
         Ok(parse_fdc_search(&v))
@@ -207,9 +198,8 @@ impl NutritionSource for FdcSource {
 
 impl FdcSource {
     /// Perform one search request, throttled and retrying HTTP 429 with backoff.
-    /// A 429 that survives [`FDC_MAX_RETRIES`] surfaces as [`RateLimited`] so the
-    /// caller can stop rather than burn the remaining quota. HTML entities in the
-    /// stored name are decoded so junk like `salt&amp;pepper` still queries well.
+    /// A 429 that survives [`FDC_MAX_RETRIES`] surfaces as [`RateLimited`]. HTML
+    /// entities in the stored name are decoded before querying.
     fn fetch_body(&self, ingredient: &str) -> Result<String> {
         let query = crate::text::decode_html_entities(ingredient);
         let url = format!(
@@ -263,7 +253,7 @@ fn backoff(attempt: u32) -> Duration {
 }
 
 /// True for names not worth an FDC lookup: empty, or HTML-entity leftovers
-/// (e.g. `&nbsp`) that slipped past ingest cleaning in already-stored recipes.
+/// (e.g. `&nbsp`).
 pub fn is_probable_junk_name(name: &str) -> bool {
     let t = name.trim();
     t.is_empty() || t.starts_with('&') || !t.chars().any(|c| c.is_alphabetic())
@@ -271,9 +261,7 @@ pub fn is_probable_junk_name(name: &str) -> bool {
 
 /// Extract per-100 g macros from an FDC search response, preferring the food
 /// whose description best matches how recipes measure ingredients: raw for
-/// produce/meat, dry for grains/pasta/legumes. Without this, FDC's relevance
-/// order often returns a cooked/canned entry (e.g. cooked quinoa at ~120
-/// kcal/100 g vs ~368 dry), understating totals several-fold.
+/// produce/meat, dry for grains/pasta/legumes.
 fn parse_fdc_search(v: &serde_json::Value) -> Option<Macros> {
     let foods = v.get("foods").and_then(|f| f.as_array())?;
     let mut best: Option<(i32, Macros)> = None;
@@ -419,8 +407,7 @@ impl NutritionSource for FixtureNutritionSource {
 }
 
 /// Per-100 g profile for `name`, most-specific candidate first. For each
-/// candidate the cache/overlay is consulted before the embedded table, so a
-/// specific full-name table entry is never shadowed by a cached generic token.
+/// candidate the cache/overlay is consulted before the embedded table.
 pub fn resolve_profile(name: &str, extra: &HashMap<String, Macros>) -> Option<Macros> {
     for cand in name_candidates(name) {
         if let Some(m) = extra.get(&cand) {
@@ -434,9 +421,8 @@ pub fn resolve_profile(name: &str, extra: &HashMap<String, Macros>) -> Option<Ma
 }
 
 /// Words that mark a Count as a container or whole unit of unknown size
-/// ("2 cans tomatoes", "1 head garlic"), where multiplying a per-item weight
-/// would be meaningless. Excludes portion words the per-item table is keyed on
-/// (clove, stalk), so those still convert.
+/// ("2 cans tomatoes", "1 head garlic"). Excludes portion words the per-item
+/// table is keyed on (clove, stalk).
 const CONTAINER_WORDS: &[&str] = &[
     "can",
     "cans",
@@ -469,8 +455,7 @@ const CONTAINER_WORDS: &[&str] = &[
 ];
 
 /// Keywords marking an ingredient as a liquid, for which a density-unknown
-/// volume can be estimated at ≈1 g/ml. Solids are intentionally excluded so
-/// they are reported uncovered rather than silently mis-weighed.
+/// volume can be estimated at ≈1 g/ml.
 const LIQUID_KEYWORDS: &[&str] = &[
     "water", "milk", "cream", "broth", "stock", "juice", "wine", "beer", "vinegar", "sauce", "oil",
     "syrup", "extract", "soda", "tea", "coffee", "liqueur", "brandy", "rum", "sherry", "mirin",
@@ -540,20 +525,13 @@ pub fn recipe_nutrition(recipe: &Recipe, extra: &HashMap<String, Macros>) -> Rec
 }
 
 /// Whole-recipe macros from the source page's published nutrition
-/// (`meta.nutrition`) — or `None` when the data is incomplete or implausible.
+/// (`meta.nutrition`), or `None` when the data is incomplete or implausible.
+/// Returns **whole-recipe** totals.
 ///
-/// Preferred over the ingredient estimate when present: it is authoritative and
-/// complete, whereas the estimate silently understates any ingredient whose unit
-/// can't be converted to grams. Returns **whole-recipe** totals (the meal pool
-/// uses whole-recipe macros, not per-serving).
-///
-/// `NutritionInformation` is *meant* to be per-serving, so we normally scale by
-/// `servings`. But some sources put the whole-recipe total in that field; scaling
-/// then inflates it N×. We detect that case — a "per-serving" figure that is
-/// large yet divides into a sane per-serving is the whole-recipe total — and use
-/// it directly. Atwater consistency and absolute ceilings on the result guard
-/// against garbled data; the ingredient estimate is *not* used to cross-check
-/// because it is itself unreliable in both directions.
+/// `NutritionInformation` is per-serving and normally scaled by `servings`. A
+/// large "per-serving" figure that divides into a sane per-serving is treated as
+/// a whole-recipe total and used directly. Atwater consistency and absolute
+/// ceilings on the result guard against garbled data.
 pub fn source_recipe_macros(recipe: &Recipe) -> Option<Macros> {
     let n = recipe.meta.nutrition.as_ref()?;
     let (kcal, protein, fat, carbs) = (n.kcal?, n.protein_g?, n.fat_g?, n.carbs_g?);
@@ -572,9 +550,8 @@ pub fn source_recipe_macros(recipe: &Recipe) -> Option<Macros> {
         return None;
     }
 
-    // Whole-recipe total mislabeled as per-serving: a large "per-serving" kcal
-    // that divides into a normal per-serving is really the whole-recipe total, so
-    // use it directly (factor 1) instead of multiplying by servings.
+    // Treat a large "per-serving" kcal that divides into a normal per-serving as
+    // the whole-recipe total (factor 1).
     let looks_whole =
         servings > 1.0 && kcal > 1200.0 && (40.0..=1200.0).contains(&(kcal / servings));
     let factor = if looks_whole { 1.0 } else { servings };
@@ -590,9 +567,7 @@ pub fn source_recipe_macros(recipe: &Recipe) -> Option<Macros> {
     if whole.kcal > 12_000.0 || !(0.0..=1600.0).contains(&per_serving_kcal) {
         return None;
     }
-    // Atwater consistency on the whole-recipe totals (scale-invariant, so it only
-    // catches internally garbled macros, not uniform scale errors — which the
-    // detection above handles).
+    // Atwater consistency on the whole-recipe totals.
     let atwater = 4.0 * whole.protein_g + 9.0 * whole.fat_g + 4.0 * whole.carbs_g;
     if (whole.kcal - atwater).abs() > (0.30 * whole.kcal).max(60.0) {
         return None;
@@ -604,21 +579,20 @@ pub fn source_recipe_macros(recipe: &Recipe) -> Option<Macros> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlanNutrition {
     /// `(day index, macros)` for each day that has at least one meal, in day
-    /// order. Sized by the meals present, not by the requested day count.
+    /// order.
     pub per_day: Vec<(usize, Macros)>,
     pub total: Macros,
     /// Distinct ingredient names that contributed to the totals.
     pub covered: BTreeSet<String>,
     /// Distinct names never estimated in any recipe (excludes names covered
-    /// elsewhere), so `covered` and `uncovered` are disjoint.
+    /// elsewhere).
     pub uncovered: BTreeSet<String>,
-    /// Subset of `uncovered` that `nutrition fetch` could resolve: no macro
-    /// profile exists yet (as opposed to a profile that cannot be converted to
-    /// grams, which fetching cannot fix).
+    /// Subset of `uncovered` with no macro profile, resolvable by `nutrition
+    /// fetch`.
     pub fetchable: BTreeSet<String>,
     /// How many meals used the source's published macros (via
-    /// [`source_recipe_macros`]) instead of the ingredient estimate. Their
-    /// ingredients don't appear in `covered`/`uncovered`.
+    /// [`source_recipe_macros`]). Their ingredients don't appear in
+    /// `covered`/`uncovered`.
     pub source_backed: usize,
 }
 
@@ -638,9 +612,8 @@ pub fn plan_nutrition(
         let recipe = store
             .get_recipe(meal.recipe_id.as_str())?
             .with_context(|| format!("recipe {} missing", meal.recipe_id))?;
-        // Prefer the source's published macros — the same value the planner's
-        // bounds are checked against — so the displayed totals match the
-        // constraint. Fall back to the ingredient estimate (with its coverage).
+        // Prefer the source's published macros; fall back to the ingredient
+        // estimate (with its coverage).
         if let Some(m) = source_recipe_macros(&recipe) {
             by_day.entry(meal.day as usize).or_default().add(&m);
             total.add(&m);
@@ -653,8 +626,7 @@ pub fn plan_nutrition(
             uncovered_raw.extend(rn.uncovered);
         }
     }
-    // A name covered in any recipe counts as covered overall, so the two sets
-    // are disjoint and the coverage denominator does not double-count.
+    // A name covered in any recipe counts as covered overall.
     let uncovered: BTreeSet<String> = uncovered_raw.difference(&covered).cloned().collect();
     let fetchable = uncovered
         .iter()
@@ -734,9 +706,9 @@ mod tests {
 
     #[test]
     fn source_macros_detect_whole_recipe_total_mislabeled_as_per_serving() {
-        // Real DB case: a soup stores the WHOLE-recipe total (2545 kcal) in the
-        // per-serving field with servings=12. 2545/12 ≈ 212 is a sane bowl, so we
-        // must use 2545 directly, not 2545 × 12 = 30,540.
+        // A soup stores the WHOLE-recipe total (2545 kcal) in the per-serving
+        // field with servings=12; 2545/12 ≈ 212 is a sane bowl, and 2545 is used
+        // directly.
         let mut r = rec("Curried Squash Soup", &["1 onion"]);
         r.servings = Some(12.0);
         r.meta.nutrition = Some(nutri(2545.0, 62.0, 120.0, 332.0));
@@ -815,7 +787,7 @@ mod tests {
     #[test]
     fn volume_solid_without_density_is_uncovered_not_1g_per_ml() {
         // Broccoli has a macro profile but no density entry; a volume measure
-        // must not be silently treated as 1 g/ml (which would inflate it).
+        // must not be silently treated as 1 g/ml.
         let r = rec("T", &["2 cups broccoli"]);
         let n = recipe_nutrition(&r, &HashMap::new());
         assert!(
@@ -832,7 +804,7 @@ mod tests {
         let r = rec("T", &["2 cans tomatoes"]);
         let n = recipe_nutrition(&r, &HashMap::new());
         assert!(n.uncovered.contains("tomatoes"));
-        // A bare count of the same item still converts.
+        // A bare count of the same item converts.
         let r2 = rec("T", &["2 tomatoes"]);
         let n2 = recipe_nutrition(&r2, &HashMap::new());
         assert!(n2.covered.contains("tomatoes"));
@@ -853,7 +825,7 @@ mod tests {
         );
         let m = resolve_profile("olive oil", &extra).unwrap();
         assert!((m.kcal - 884.0).abs() < 1.0, "kcal = {}", m.kcal);
-        // But the generic still applies to a name with no specific entry.
+        // The generic applies to a name with no specific entry.
         assert_eq!(resolve_profile("truffle oil", &extra).unwrap().kcal, 1.0);
     }
 
@@ -913,7 +885,7 @@ mod tests {
             offline_body: Some("<html>maintenance</html>".into()),
             ..Default::default()
         };
-        // Must be Err (so the caller does not negative-cache), not Ok(None).
+        // Must be Err, not Ok(None).
         assert!(src.lookup("flour").is_err());
     }
 
@@ -1036,7 +1008,7 @@ mod tests {
         let chain = ChainedNutritionSource::new(vec![a, b]);
         // First name: a rate-limits (called once), b serves it.
         assert_eq!(chain.lookup("x").unwrap().unwrap().kcal, 50.0);
-        // Second name: a is now exhausted (skipped), only b is called.
+        // Second name: a is exhausted (skipped), only b is called.
         assert_eq!(chain.lookup("y").unwrap().unwrap().kcal, 50.0);
         assert_eq!(
             ca.load(Ordering::Relaxed),
@@ -1127,8 +1099,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path().join("t.db")).unwrap();
         // Ingredients can't be estimated, but the recipe publishes per-serving
-        // macros: the display must show the source totals (matching the planner's
-        // bounds), not the empty estimate, and count the meal source-backed.
+        // macros: the display shows the source totals and counts the meal
+        // source-backed.
         let mut r = rec("Published", &["1 pinch mystery"]);
         r.id = RecipeId::from("pub");
         r.servings = Some(4.0);
@@ -1193,7 +1165,7 @@ mod tests {
         let pn = plan_nutrition(&store, &plan, &HashMap::new()).unwrap();
         assert!(pn.covered.contains("broccoli"));
         assert!(!pn.uncovered.contains("broccoli"));
-        // Not fetchable: a profile exists, it just wasn't convertible in B.
+        // Not fetchable: a profile exists.
         assert!(!pn.fetchable.contains("broccoli"));
     }
 }

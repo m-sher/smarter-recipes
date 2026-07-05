@@ -1,19 +1,14 @@
 //! Pure text-cleaning helpers for scraped recipe content: HTML-entity decoding
-//! and typographic normalization. No I/O — safe to use from any layer.
+//! and typographic normalization.
 
-/// Decode HTML entities, then fold typographic punctuation to ASCII. Scraped
-/// recipe text (titles, ingredient lines) routinely carries both — a title like
-/// `S&#8217;mores` or a curly `S'mores` should both read as `S'mores`, and an
-/// ingredient like `&#8531; cup` should become `⅓ cup` so the quantity parser
-/// can see the fraction.
+/// Decode HTML entities, then fold typographic punctuation to ASCII.
 pub fn sanitize(s: &str) -> String {
     fold_typography(&decode_html_entities(s))
 }
 
-/// Replace curly quotes/apostrophes with their ASCII equivalents so text
-/// compares and displays consistently (`S'mores` → `S'mores`, `"x"` → `"x"`).
-/// Leaves everything else — including dashes, which the quantity parser handles
-/// on its own — untouched.
+/// Replace curly quotes/apostrophes with their ASCII equivalents
+/// (`S'mores` → `S'mores`, `"x"` → `"x"`).
+/// Leaves everything else untouched.
 pub fn fold_typography(s: &str) -> String {
     if s.is_ascii() {
         return s.to_string();
@@ -28,9 +23,7 @@ pub fn fold_typography(s: &str) -> String {
 }
 
 /// Decode the HTML entities that commonly leak into scraped recipe text.
-/// JSON-LD strings are plain JSON (not HTML-decoded), so sites that embed
-/// `&nbsp;`, `&amp;`, etc. in `recipeIngredient` values pass them through
-/// verbatim. Handles the common named entities plus numeric `&#N;` / `&#xN;`;
+/// Handles the common named entities plus numeric `&#N;` / `&#xN;`;
 /// unrecognized `&…;` sequences are left untouched.
 pub fn decode_html_entities(s: &str) -> String {
     if !s.contains('&') {
@@ -41,7 +34,7 @@ pub fn decode_html_entities(s: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let after = &rest[amp..];
-        // Look for a ';' close by (entity names/refs are short).
+        // Look for a nearby ';'.
         let semi = after[1..]
             .find(';')
             .map(|p| p + 1)
@@ -64,13 +57,13 @@ pub fn decode_html_entities(s: &str) -> String {
 /// Decode the body of one entity (the text between `&` and `;`).
 fn decode_entity(e: &str) -> Option<String> {
     let named = match e {
-        "nbsp" => ' ', // fold to a plain space; whitespace-collapsing handles it
+        "nbsp" => ' ', // plain space
         "amp" => '&',
         "lt" => '<',
         "gt" => '>',
         "quot" => '"',
         "apos" | "#39" => '\'',
-        "rsquo" | "lsquo" => '\u{2019}', // folded to ASCII by fold_typography
+        "rsquo" | "lsquo" => '\u{2019}',
         "rdquo" | "ldquo" => '\u{201D}',
         "deg" => '°',
         "mdash" => '—',
@@ -124,7 +117,7 @@ mod tests {
         assert_eq!(sanitize("S&#8217;mores Fudge"), "S'mores Fudge");
         // A raw curly apostrophe (no entity) is folded too.
         assert_eq!(sanitize("S\u{2019}mores"), "S'mores");
-        // Entity fraction becomes a real fraction char for the quantity parser.
+        // Entity fraction becomes a real fraction char.
         assert_eq!(sanitize("&#8531; cup cilantro"), "⅓ cup cilantro");
         assert_eq!(
             sanitize("chunky bean &amp; corn salsa"),

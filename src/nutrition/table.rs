@@ -1,9 +1,8 @@
 //! Embedded per-100 g macro table and per-item gram weights.
 //!
 //! Values are USDA-typical culinary estimates (raw for meat/produce, dry for
-//! grains), intended for shopping-scale nutrition summaries, not lab precision.
-//! Names not found here fall back to the cache/network source or are reported
-//! as uncovered.
+//! grains). Names not found here fall back to the cache/network source or are
+//! reported as uncovered.
 
 use crate::domain::{name_candidates, Macros};
 

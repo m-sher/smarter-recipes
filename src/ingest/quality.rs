@@ -1,14 +1,13 @@
-//! Structural "is this actually a cookable recipe?" check, used to keep
-//! non-meals — roundups/listicles, index pages, how-to guides, and extraction
-//! failures — out of the catalog. Deliberately keyword-free: it reads the
-//! recipe's structure, never its title text.
+//! Structural "is this a cookable recipe?" check that keeps non-meals —
+//! roundups/listicles, index pages, how-to guides, and extraction failures —
+//! out of the catalog. Keyword-free: reads the recipe's structure, never its
+//! title text.
 
 use crate::domain::Recipe;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-/// Unicode vulgar fractions the ingest normalizer understands (mirrors
-/// `normalize::parse`), so a line like "½ cup sugar" counts as carrying an amount.
+/// Unicode vulgar fractions the ingest normalizer understands.
 const VULGAR_FRACTIONS: &[char] = &[
     '½', '¼', '¾', '⅓', '⅔', '⅕', '⅖', '⅗', '⅘', '⅙', '⅚', '⅛', '⅜', '⅝', '⅞',
 ];
@@ -23,10 +22,8 @@ static RE_STANDALONE_NUMBER: Lazy<Regex> =
 static RE_GLUED_UNIT: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\b\d[\d.,/]*(?:g|kg|mg|ml|oz|lb|tsp|tbsp)\b").expect("glued re"));
 
-/// Whether an ingredient line carries a real numeric amount. Reads the raw text
-/// rather than the parser's `quantity`, because the parser also treats a leading
-/// article ("a"/"one") and a title-embedded number ("30-Minute") as a quantity —
-/// which would let numeric-title roundups pass the very gate meant to reject them.
+/// Whether an ingredient line carries a real numeric amount. Reads the raw text,
+/// not the parser's `quantity`.
 fn line_has_amount(line: &crate::domain::IngredientLine) -> bool {
     let o = &line.original;
     o.chars().any(|c| VULGAR_FRACTIONS.contains(&c))
@@ -37,13 +34,8 @@ fn line_has_amount(line: &crate::domain::IngredientLine) -> bool {
 /// True when a recipe looks like a real, cookable dish rather than a roundup,
 /// index page, how-to guide, or extraction failure.
 ///
-/// Real recipes quantify their ingredients; roundups and index pages list dish
-/// *titles* as "ingredients" and carry almost no amounts. The rule: at least two
-/// ingredient lines, at least one carrying an amount, and amounts at least a fifth
-/// of the lines. This keeps minimalist real recipes (one quantified main
-/// ingredient plus "to taste" extras, or a two-ingredient condiment) while
-/// rejecting single-ingredient guides (`ing < 2`) and long title lists (few or no
-/// amounts across many lines).
+/// The rule: at least two ingredient lines, at least one carrying an amount, and
+/// amounts at least a fifth of the lines.
 pub fn is_cookable(recipe: &Recipe) -> bool {
     let ing = recipe.ingredients.len();
     let amt = recipe
@@ -80,8 +72,7 @@ mod tests {
             "½ cup soy sauce",
             "¼ cup rice vinegar"
         ])));
-        // Minimalist real recipes: one quantified ingredient + unquantified extras
-        // (these were false-rejected by the earlier amt>=2 rule).
+        // Minimalist real recipes: one quantified ingredient + unquantified extras.
         assert!(is_cookable(&rec(&[
             "1½ cups cooked chickpeas",
             "extra-virgin olive oil",
@@ -115,8 +106,7 @@ mod tests {
 
     #[test]
     fn title_embedded_digits_do_not_count_as_amounts() {
-        // Digits inside names/titles must NOT register as amounts, or numeric
-        // listicles would slip through.
+        // Digits inside names/titles must NOT register as amounts.
         for line in [
             "30-Minute Garlic Chicken",
             "2% milk",
@@ -128,8 +118,7 @@ mod tests {
                 "{line} wrongly counted as an amount"
             );
         }
-        // A roundup whose titles all carry embedded (non-amount) numbers is still
-        // rejected.
+        // A roundup whose titles all carry embedded (non-amount) numbers is rejected.
         assert!(!is_cookable(&rec(&[
             "30-Minute Chicken",
             "20-Minute Shrimp",

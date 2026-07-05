@@ -106,8 +106,8 @@ fn strip_container_word(rest: &str) -> &str {
 }
 
 /// Parse "<count> (<qty> <unit>) [container] <name>", e.g. "2 (400g) cans tomatoes".
-/// The parenthetical carries the purchasable size, so `count * size` becomes the quantity.
-/// Returns `None` when the shape doesn't match or the parenthetical is not a quantity+unit.
+/// Quantity is `count * size`. Returns `None` when the shape doesn't match or the
+/// parenthetical is not a quantity+unit.
 fn try_parenthetical_size(line: &str) -> Option<ParsedIngredient> {
     let caps = RE_LEADING_COUNT_PAREN.captures(line)?;
     let inner = caps.name("inner")?.as_str().trim();
@@ -137,7 +137,7 @@ fn try_parenthetical_size(line: &str) -> Option<ParsedIngredient> {
     })
 }
 
-/// Rewrite Unicode vulgar fractions to ASCII so the quantity parser handles them.
+/// Rewrite Unicode vulgar fractions to ASCII.
 /// `1½` and `1 ½` become `1 1/2`; a standalone `¼` becomes `1/4`.
 fn rewrite_unicode_fractions(s: &str) -> String {
     fn expand(c: char) -> Option<&'static str> {
@@ -257,13 +257,12 @@ fn split_note(rest: &str) -> (String, Option<String>) {
             }
         }
     }
-    // Comma-separated note (common in recipes: "chicken breast, diced")
+    // Comma-separated note
     if let Some(idx) = rest.find(',') {
         let before = rest[..idx].trim();
         let after = rest[idx + 1..].trim();
         if !before.is_empty() && !after.is_empty() {
-            // "skinless, boneless chicken breasts": a leading list of descriptors
-            // isn't the name — keep scanning the remainder for the real noun.
+            // A leading run of descriptors isn't the name; scan the remainder.
             if crate::domain::is_all_descriptors(before) {
                 return split_note(after);
             }
@@ -274,8 +273,7 @@ fn split_note(rest: &str) -> (String, Option<String>) {
 }
 
 /// Earliest char-boundary byte offset in `s` where any phrase begins
-/// (case-insensitive). Boundary-safe: never slices inside a multi-byte char,
-/// even when `to_lowercase` changes byte lengths (e.g. ` K` U+212A, ` İ`).
+/// (case-insensitive).
 fn taste_phrase_start(s: &str, phrases: &[&str]) -> Option<usize> {
     s.char_indices().find_map(|(byte_idx, _)| {
         let rest = s[byte_idx..].to_lowercase();
@@ -287,10 +285,7 @@ fn taste_phrase_start(s: &str, phrases: &[&str]) -> Option<usize> {
 }
 
 /// Remove every parenthetical group `(…)` and collapse the whitespace it leaves.
-/// In ingredient lines these are sizes or clarifications — `(12 ounces)`,
-/// `(such as pop rocks)`, `(cut into chunks)` — never part of the ingredient
-/// identity, and a *leading* one (`(.85 oz) old el paso…`) is what `split_note`
-/// can't catch. Depth-counted so nested/unbalanced parens don't leak fragments.
+/// Depth-counted, handling nested and unbalanced parens.
 fn strip_parentheticals(s: &str) -> String {
     if !s.contains(['(', ')']) {
         return s.to_string();
@@ -308,9 +303,8 @@ fn strip_parentheticals(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Strip a leading `+ <qty> <unit>` addend left when a compound quantity like
-/// `1 cup + 3 tablespoons beef broth` is only partly consumed — the name is the
-/// ingredient (`beef broth`), not the trailing addend.
+/// Strip a leading `+ <qty> <unit>` addend, e.g. the `+ 3 tablespoons` in
+/// `1 cup + 3 tablespoons beef broth`.
 fn strip_leading_addend(s: &str) -> String {
     let Some(rest) = s.trim().strip_prefix('+') else {
         return s.to_string();
@@ -331,9 +325,7 @@ fn strip_leading_addend(s: &str) -> String {
 fn clean_name(name: &str) -> String {
     let without_parens = strip_parentheticals(name);
     let addend_stripped = strip_leading_addend(&without_parens);
-    // A real ingredient name starts with a letter or digit; drop leading stray
-    // punctuation left by mangled quantities (". frozen cranberries",
-    // "/3 cups …", "+ …"). Keeps digits so "5 spice powder" is untouched.
+    // Drop leading non-alphanumeric characters, keeping digits.
     let mut s = addend_stripped
         .trim_start_matches(|c: char| !c.is_alphanumeric())
         .trim()
@@ -351,9 +343,7 @@ fn clean_name(name: &str) -> String {
 
 /// Parse a single free-text ingredient line.
 pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
-    // Decode HTML entities and fold curly punctuation first, so scraped text like
-    // "&#8531; cup" (an ⅓ that would otherwise be lost) and "jalapeño&#8217;s"
-    // parse the same as their clean forms, whatever the ingest path.
+    // Decode HTML entities and fold curly punctuation.
     let sanitized = crate::text::sanitize(line);
     let line = sanitized.trim();
     if line.is_empty() {
@@ -369,8 +359,8 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
     let rewritten = rewrite_unicode_fractions(line);
     let line = rewritten.as_str();
 
-    // "to taste" / "as needed" only when there is no leading quantity — otherwise
-    // parse normally and attach a note (preserve qty/unit and original name casing).
+    // Handle "to taste" / "as needed" only when there is no leading quantity;
+    // with a quantity, parse normally and attach the note.
     let lower = line.to_lowercase();
     let has_taste_note =
         lower.contains("to taste") || lower.contains("as needed") || lower.contains("as desired");
@@ -383,8 +373,8 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
         ) {
             name.truncate(cut);
         }
-        // Also drop a dangling "(" left when the note was parenthesized, e.g.
-        // "salt (to taste)" -> "salt (" -> "salt".
+        // Also drop a dangling "(" from a parenthesized note, e.g.
+        // "salt (to taste)" -> "salt".
         name = name.trim().trim_end_matches([',', '(']).trim().to_string();
         let name = if name.is_empty() {
             clean_name(line)
@@ -488,7 +478,6 @@ pub fn parse_ingredient_line(line: &str) -> ParsedIngredient {
     let (name, note) = split_note(name_part);
     let name = clean_name(&name);
 
-    // If we have qty but no unit and name looks like a countable noun, treat as count.
     let unit: Option<Unit> = unit;
 
     let uncertain = uncertain || (qty.is_some() && unit.is_none() && name.is_empty());
@@ -769,7 +758,7 @@ mod tests {
 
     #[test]
     fn parenthetical_non_size_not_treated_as_size() {
-        // "(optional)" has no quantity+unit, so it must not be read as a package size.
+        // "(optional)" has no quantity+unit and must not be read as a package size.
         let p = parse_ingredient_line("1 (optional) onion");
         assert_eq!(p.quantity, Some(1.0));
         assert!(p.unit.is_none());
@@ -797,7 +786,7 @@ mod tests {
         use crate::normalize::normalize_line;
         let p = parse_ingredient_line("2 skinless, boneless chicken breasts");
         assert_eq!(p.quantity, Some(2.0));
-        // The real noun is retained (not reduced to "skinless").
+        // The real noun is retained.
         assert!(p.name.contains("chicken breast"), "got {:?}", p.name);
         let key = IngredientKey::from_line(&normalize_line("2 skinless, boneless chicken breasts"));
         assert_eq!(key.name, "chicken breasts");
@@ -805,7 +794,7 @@ mod tests {
 
     #[test]
     fn comma_prep_note_still_splits() {
-        // A real prep note after the comma is still separated (regression guard).
+        // A prep note after the comma is separated.
         let p = parse_ingredient_line("2.5 lb chicken breast, diced");
         assert_eq!(p.name, "chicken breast");
         assert_eq!(p.note.as_deref(), Some("diced"));
@@ -819,7 +808,7 @@ mod tests {
             assert_eq!(p.name, line, "{line} mis-parsed");
             assert_eq!(p.quantity, None, "{line} got a phantom quantity");
         }
-        // Genuine word numbers still parse.
+        // Genuine word numbers parse.
         let p = parse_ingredient_line("one onion");
         assert_eq!(p.quantity, Some(1.0));
         assert_eq!(p.name, "onion");
@@ -828,7 +817,7 @@ mod tests {
     #[test]
     fn to_taste_no_panic_on_multibyte_lowercase() {
         // U+212A KELVIN SIGN lowercases to ASCII 'k' (byte length shrinks); the
-        // name-cut must stay on a char boundary rather than panic.
+        // name-cut must stay on a char boundary.
         for line in ["\u{212A}é to taste", "İ salt to taste", "Köşe as needed"] {
             let p = parse_ingredient_line(line);
             assert!(p.quantity.is_none());
@@ -865,16 +854,14 @@ mod tests {
 
     #[test]
     fn leading_stray_punctuation_is_trimmed() {
-        // Mangled quantities leave a leading ". " or similar: drop it so the
-        // name is the ingredient, not punctuation.
+        // Leading stray punctuation is dropped from the name.
         assert_eq!(qty_unit(". frozen cranberries").2, "frozen cranberries");
         assert_eq!(qty_unit("- ice cubes").2, "ice cubes");
     }
 
     #[test]
     fn html_entity_fraction_becomes_a_quantity() {
-        // "&#8531;" is ⅓ — decoding it lets the parser see the quantity instead
-        // of swallowing "⅓ cup" into the name.
+        // "&#8531;" is ⅓; decoding it yields the quantity.
         let (q, k, n) = qty_unit("&#8531; cup chopped fresh cilantro");
         assert_eq!(q, Some(1.0 / 3.0));
         assert_eq!(k, Some(UnitKind::Volume));

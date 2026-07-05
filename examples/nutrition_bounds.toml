@@ -2,12 +2,20 @@
 # Values are whole-recipe estimated macros summed per scope.
 
 [per_day]
-protein_g = { min = 80.0, max = 150.0 }
-kcal = { min = 800, max = 1600.0 }
-fat_g = { max = 100 }
-carbs_g = { max = 100 }
-ratio = { protein = 35, fat = 30, carb = 35 }
+protein_g = { min = 70.0, max = 150.0 }
+kcal = { min = 800, max = 1500.0 }
+ratio = { protein = 40, fat = 30, carb = 30 }
 
 [per_meal]
 
 [plan]
+
+# Optional category filter for the candidate pool, matched against the
+# publisher's schema.org recipeCategory. Keeps standalone meals and drops
+# components (sauces, dressings, condiments). Matching is case-insensitive.
+# The blacklist wins; a non-empty whitelist is strict, so recipes with no
+# category are excluded. Run `smarter-recipes refresh --all --apply` first to
+# backfill categories across existing recipes.
+# [category]
+# whitelist = ["Main Course", "Dinner", "Entree"]
+# blacklist = ["Sauce", "Dressing", "Condiment", "Dip"]

@@ -4,10 +4,7 @@ use super::ingredient::IngredientKey;
 use serde::{Deserialize, Serialize};
 
 /// One stocked ingredient with a quantity in canonical units (g / ml / ea).
-///
-/// Identity matches recipes and shopping: [`IngredientKey`] is
-/// `(normalized_name, UnitKind)`. Quantities use the same bases as the rest of
-/// the system (grams, milliliters, each).
+/// [`IngredientKey`] identity is `(normalized_name, UnitKind)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PantryItem {
     pub key: IngredientKey,

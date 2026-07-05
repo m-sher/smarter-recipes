@@ -218,9 +218,17 @@ protein_g = { min = 15.0 }
 
 [plan]
 protein_g = { min = 350.0 }
+
+# Filter the candidate pool by the publisher's schema.org recipeCategory, to keep
+# standalone meals and drop components (sauces, dressings, condiments).
+[category]
+whitelist = ["Main Course", "Dinner", "Entree"]
+blacklist = ["Sauce", "Dressing", "Condiment", "Dip"]
 ```
 
 CLI `--min-*` / `--max-*` flags overlay `per_day` min/max only. Nutrients: `kcal`, `protein_g`, `fat_g`, `carbs_g`. A `ratio` table (any scope, config only) targets a macro split by grams; a share is satisfied within its tolerance band, and deviation beyond the band (in grams) is reported as a best-effort violation and minimized by the solver.
+
+The `[category]` table filters the candidate pool by `recipeCategory` (matched case-insensitively). The **blacklist** always excludes a matching recipe; a non-empty **whitelist** is **strict** — only recipes whose category is on it are eligible, so recipes with no category are excluded. The blacklist wins when a recipe matches both. Category filtering is independent of the macro bounds (a category-only config still uses the unconstrained planner). Categories are captured on import and can be backfilled across the existing DB with `smarter-recipes refresh --all --apply`.
 
 
 ### Purchase optimization (summary)

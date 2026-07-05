@@ -85,6 +85,91 @@ impl MacroRatio {
     }
 }
 
+/// Normalized comparison key for a single category token (case-insensitive,
+/// trimmed, whitespace-collapsed).
+fn category_key(s: &str) -> String {
+    crate::domain::normalize_title_key(s)
+}
+
+/// Expand a config list into normalized match tokens. Each entry may itself be
+/// comma-joined (e.g. `"Main Course, Sauce"`).
+fn expand_tokens(list: &[String]) -> Vec<String> {
+    list.iter()
+        .flat_map(|e| e.split(','))
+        .map(category_key)
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Category-based pool filter: keep standalone meals, drop components (sauces,
+/// dressings, condiments) by their schema.org `recipeCategory`
+/// ([`crate::domain::RecipeMeta::category`]).
+///
+/// A recipe's stored category may list several values joined by ", "; a recipe
+/// matches a list when any of its tokens equals a list entry (compared on the
+/// normalized key). Not counted by [`NutritionBounds::is_empty`].
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct CategoryFilter {
+    /// When non-empty, ONLY recipes whose category matches one of these are
+    /// eligible (strict): uncategorized recipes are excluded.
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+    /// Recipes whose category matches one of these are always excluded.
+    /// Takes precedence over the whitelist.
+    #[serde(default)]
+    pub blacklist: Vec<String>,
+}
+
+impl CategoryFilter {
+    pub fn is_empty(&self) -> bool {
+        self.whitelist.is_empty() && self.blacklist.is_empty()
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (list, label) in [
+            (&self.whitelist, "whitelist"),
+            (&self.blacklist, "blacklist"),
+        ] {
+            if list
+                .iter()
+                .any(|e| e.split(',').all(|t| category_key(t).is_empty()))
+            {
+                bail!("category.{label}: entries must be non-empty");
+            }
+        }
+        // Compare at the token level.
+        let black = expand_tokens(&self.blacklist);
+        if let Some(dup) = expand_tokens(&self.whitelist)
+            .iter()
+            .find(|t| black.contains(t))
+        {
+            bail!("category: '{dup}' appears in both whitelist and blacklist");
+        }
+        Ok(())
+    }
+
+    /// Whether a recipe with this (optional, possibly comma-joined) category is
+    /// eligible for the meal pool. Blacklist wins; a non-empty whitelist is
+    /// strict (uncategorized recipes are excluded).
+    pub fn allows(&self, category: Option<&str>) -> bool {
+        let tokens: Vec<String> = category
+            .into_iter()
+            .flat_map(|c| c.split(','))
+            .map(category_key)
+            .filter(|t| !t.is_empty())
+            .collect();
+        let black = expand_tokens(&self.blacklist);
+        if tokens.iter().any(|t| black.contains(t)) {
+            return false;
+        }
+        if !self.whitelist.is_empty() {
+            let white = expand_tokens(&self.whitelist);
+            return tokens.iter().any(|t| white.contains(t));
+        }
+        true
+    }
+}
+
 /// Min/max ranges for all tracked macros, plus an optional target macro split.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct MacroBounds {
@@ -119,7 +204,8 @@ impl MacroBounds {
     }
 }
 
-/// Full constraint set: per-day, per-meal, and whole-plan scopes.
+/// Full constraint set: per-day, per-meal, and whole-plan scopes, plus an
+/// optional category-based pool filter.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct NutritionBounds {
     #[serde(default)]
@@ -128,9 +214,15 @@ pub struct NutritionBounds {
     pub per_meal: MacroBounds,
     #[serde(default)]
     pub plan: MacroBounds,
+    /// Category whitelist/blacklist applied to the candidate pool. Not counted
+    /// by [`Self::is_empty`].
+    #[serde(default)]
+    pub category: CategoryFilter,
 }
 
 impl NutritionBounds {
+    /// True when no macro constraints are set. The [`CategoryFilter`] is not
+    /// considered.
     pub fn is_empty(&self) -> bool {
         self.per_day.is_empty() && self.per_meal.is_empty() && self.plan.is_empty()
     }
@@ -139,6 +231,7 @@ impl NutritionBounds {
         self.per_day.validate("per_day")?;
         self.per_meal.validate("per_meal")?;
         self.plan.validate("plan")?;
+        self.category.validate()?;
         Ok(())
     }
 
@@ -382,7 +475,7 @@ fn check_range(
 
 /// Emit a violation for each specified macro share that falls outside its
 /// tolerance band. Shares are of total macro grams; magnitude is grams beyond
-/// the band. Skips scopes with no macro grams (share undefined).
+/// the band. Skips scopes with no macro grams.
 fn check_ratio(
     out: &mut Vec<BoundViolation>,
     scope: &BoundScope,
@@ -436,12 +529,9 @@ pub fn violation_magnitude(violations: &[BoundViolation]) -> f64 {
 
 // --- Constraint weighting for plan ranking --------------------------------
 //
-// Raw violation magnitudes are in mixed units (kcal, grams, grams-beyond-band),
-// so a flat sum lets calories dominate by scale while ratio (small grams) is
-// nearly ignored. For *ranking* we instead normalize each violation to a
-// comparable scale (÷ a reference so a "meaningful" miss ≈ 1.0) and weight
-// calories and the macro-split ratio as the headline constraints. Raw
-// magnitudes are unchanged for the reported violation list.
+// Ranking normalizes each violation to a comparable scale (÷ a per-kind
+// reference) and weights calories and the macro-split ratio as the headline
+// constraints. Raw magnitudes are unchanged for the reported violation list.
 
 /// Reference size of a "meaningful" violation, per kind (normalizes units).
 const KCAL_REF: f64 = 100.0; // kcal
@@ -472,13 +562,12 @@ fn weighted_one(v: &BoundViolation) -> f64 {
 }
 
 /// Weighted, unit-normalized total used to *rank* infeasible plans (calories +
-/// ratio prioritized). Zero exactly when there are no violations, so the
-/// feasible/infeasible split is unchanged.
+/// ratio prioritized). Zero exactly when there are no violations.
 pub fn weighted_magnitude(violations: &[BoundViolation]) -> f64 {
     violations.iter().map(weighted_one).sum()
 }
 
-/// How far `totals` still are below configured mins (0 if met or unset).
+/// How far `totals` are below configured mins (0 if met or unset).
 pub fn min_deficit(bounds: &MacroBounds, totals: &Macros) -> f64 {
     let mut d = 0.0;
     if let Some(min) = bounds.kcal.min {
@@ -591,6 +680,114 @@ mod tests {
         assert_eq!(b.per_meal.protein_g.min, Some(15.0));
         assert_eq!(b.plan.protein_g.min, Some(350.0));
         assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn category_filter_default_allows_everything() {
+        let f = CategoryFilter::default();
+        assert!(f.is_empty());
+        assert!(f.allows(Some("Sauce")));
+        assert!(f.allows(None));
+    }
+
+    #[test]
+    fn category_blacklist_excludes_matching_case_insensitive() {
+        let f = CategoryFilter {
+            blacklist: vec!["Sauce".into(), "Dressing".into()],
+            ..Default::default()
+        };
+        assert!(!f.is_empty());
+        assert!(!f.allows(Some("sauce"))); // case-insensitive
+        assert!(!f.allows(Some("Main Course, Sauce"))); // any token matches
+        assert!(f.allows(Some("Main Course")));
+        assert!(f.allows(None)); // blacklist alone does not exclude uncategorized
+        assert!(f.allows(Some("Applesauce Cake"))); // token equality, not substring
+    }
+
+    #[test]
+    fn category_whitelist_is_strict() {
+        let f = CategoryFilter {
+            whitelist: vec!["Main Course".into(), "Dinner".into()],
+            ..Default::default()
+        };
+        assert!(f.allows(Some("main course"))); // matches (case-insensitive)
+        assert!(f.allows(Some("Sauce, Dinner"))); // any token matches whitelist
+        assert!(!f.allows(Some("Dessert"))); // not on whitelist
+        assert!(!f.allows(None)); // strict: uncategorized excluded
+    }
+
+    #[test]
+    fn category_blacklist_beats_whitelist() {
+        let f = CategoryFilter {
+            whitelist: vec!["Main Course".into()],
+            blacklist: vec!["Sauce".into()],
+        };
+        assert!(!f.allows(Some("Main Course, Sauce"))); // both tokens -> excluded
+        assert!(f.allows(Some("Main Course")));
+    }
+
+    #[test]
+    fn category_config_entry_may_bundle_comma_values() {
+        // A single comma-joined string counts as multiple tokens.
+        let f = CategoryFilter {
+            blacklist: vec!["Sauce, Dip".into()],
+            ..Default::default()
+        };
+        assert!(!f.allows(Some("Sauce")));
+        assert!(!f.allows(Some("Dip")));
+        assert!(f.allows(Some("Main Course")));
+        // Overlap is caught at the token level.
+        let overlap = CategoryFilter {
+            whitelist: vec!["Main Course, Sauce".into()],
+            blacklist: vec!["sauce".into()],
+        };
+        assert!(overlap.validate().is_err());
+    }
+
+    #[test]
+    fn category_validate_rejects_overlap_and_empty() {
+        let overlap = CategoryFilter {
+            whitelist: vec!["Sauce".into()],
+            blacklist: vec!["sauce".into()],
+        };
+        assert!(overlap.validate().is_err());
+
+        let empty_entry = CategoryFilter {
+            blacklist: vec!["  ".into()],
+            ..Default::default()
+        };
+        assert!(empty_entry.validate().is_err());
+    }
+
+    #[test]
+    fn toml_parses_category_table() {
+        let text = r#"
+            [category]
+            whitelist = ["Main Course", "Dinner"]
+            blacklist = ["Sauce", "Dressing"]
+        "#;
+        let b = NutritionBounds::from_toml_str(text).unwrap();
+        assert_eq!(b.category.whitelist, vec!["Main Course", "Dinner"]);
+        assert_eq!(b.category.blacklist, vec!["Sauce", "Dressing"]);
+        // A category-only config must not read as non-empty macro bounds.
+        assert!(
+            b.is_empty(),
+            "category-only config must keep is_empty() true"
+        );
+        assert!(!b.category.is_empty());
+    }
+
+    #[test]
+    fn toml_rejects_category_overlap() {
+        let err = NutritionBounds::from_toml_str(
+            r#"
+            [category]
+            whitelist = ["Main Course"]
+            blacklist = ["main course"]
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("category"), "{err:#}");
     }
 
     #[test]
@@ -923,7 +1120,7 @@ mod tests {
         assert!((kcal - 5.0).abs() < 1e-9, "calories ~5x: {kcal}");
         assert!((ratio - 5.0).abs() < 1e-9, "ratio ~5x: {ratio}");
         assert!(kcal > protein && ratio > protein);
-        // No violations still scores 0 (feasible/infeasible split unchanged).
+        // No violations scores 0.
         assert_eq!(weighted_magnitude(&[]), 0.0);
     }
 }

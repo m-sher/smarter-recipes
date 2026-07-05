@@ -2,7 +2,7 @@
 //!
 //! Uses external `tesseract` when available. If OCR is unavailable, accepts a
 //! companion `.txt` sidecar with the same stem, or returns a clear error with
-//! install instructions. This keeps the core testable without Tesseract.
+//! install instructions.
 
 use super::RecipeSourceIngest;
 use crate::domain::{Recipe, RecipeSource};
@@ -90,7 +90,7 @@ fn text_to_recipe(text: &str, path: &Path) -> Recipe {
         match section {
             "title" => {
                 title = t.to_string();
-                section = "ingredients"; // OCR dumps often list ingredients next
+                section = "ingredients";
             }
             "ingredients" => {
                 let cleaned = t.trim_start_matches(['-', '*', '•', '·']);
@@ -134,7 +134,7 @@ mod tests {
     fn sidecar_txt() {
         let dir = TempDir::new().unwrap();
         let img = dir.path().join("recipe.png");
-        // Minimal fake image file (not decoded — sidecar is used)
+        // Minimal fake image file.
         std::fs::write(&img, b"not-an-image").unwrap();
         let mut txt = std::fs::File::create(dir.path().join("recipe.txt")).unwrap();
         writeln!(txt, "Pancakes").unwrap();

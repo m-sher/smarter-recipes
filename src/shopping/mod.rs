@@ -14,17 +14,14 @@
 //!    - **Tertiary:** fewer packages
 //!
 //! Dry goods measured by volume in recipes are converted to mass via
-//! [`crate::pricing::density`] when a density is known, so packages and leftovers
-//! reflect real grocery units (lb/oz bags), not fictitious fl-oz flour.
+//! [`crate::pricing::density`] when a density is known.
 //!
 //! # Per-trip / ordering benefit
 //!
 //! [`trip_breakdown_for_plan`] walks meals in plan order and reports which
 //! ingredient keys are **newly introduced** at each meal (not seen in earlier
-//! meals). That makes the planner's ordering observable: shared ingredients
-//! appear once as "new" on the earliest meal that needs them, then are covered
-//! for later meals. A "trip" is modeled as one shopping day; `new_keys_per_day`
-//! sums first-seen keys by plan day.
+//! meals). A "trip" is modeled as one shopping day; `new_keys_per_day` sums
+//! first-seen keys by plan day.
 
 mod optimize;
 
@@ -40,8 +37,7 @@ use std::collections::HashSet;
 /// On-hand amount for `key`, preferring an exact identity match.
 ///
 /// If none exists, bridges mass↔volume via the density table for the same
-/// ingredient name (so `pantry add "500g flour"` covers volume-measured flour
-/// in recipes). Exact and converted stock are never double-counted.
+/// ingredient name. Exact and converted stock are never double-counted.
 pub fn pantry_quantity_for(key: &IngredientKey, pantry: &[PantryItem]) -> f64 {
     if let Some(p) = pantry.iter().find(|p| p.key == *key) {
         return p.quantity_canonical;
@@ -74,11 +70,7 @@ fn convert_kind(name: &str, amount: f64, from: UnitKind, to: UnitKind) -> Option
 
 /// Consume up to `need` (in `key`'s canonical units) from the mutable `stock`
 /// ledger: exact-kind match first, then the density-bridged partner kind.
-/// Mutates `stock` (never below zero) so no unit of stock is credited twice.
-/// Returns the unmet remainder.
-///
-/// Used by shopping to net requirements and by planning for virtual consumption
-/// while scoring quantity-aware coverage.
+/// Mutates `stock` (never below zero). Returns the unmet remainder.
 pub fn consume_from_stock(stock: &mut [PantryItem], key: &IngredientKey, need: f64) -> f64 {
     let mut remaining = need;
     if let Some(item) = stock
@@ -129,9 +121,8 @@ fn add_to_stock(stock: &mut Vec<PantryItem>, key: &IngredientKey, qty: f64) {
 
 /// Subtract on-hand pantry quantities from plan requirements.
 ///
-/// Consumes a working copy of the pantry so a single stock row is never credited
-/// against more than one requirement (exact [`IngredientKey`] first, then the
-/// mass↔volume density bridge). Items fully covered by the pantry are omitted.
+/// Consumes a working copy of the pantry, matching exact [`IngredientKey`] first,
+/// then the mass↔volume density bridge. Items fully covered by the pantry are omitted.
 pub fn apply_pantry_to_requirements(
     requirements: &[(IngredientKey, f64)],
     pantry: &[PantryItem],
@@ -240,7 +231,7 @@ pub fn shopping_list_for_plan(
     ))
 }
 
-/// New ingredients introduced at a given meal (for per-trip reporting).
+/// New ingredients introduced at a given meal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TripStep {
     pub day: u32,
@@ -258,18 +249,16 @@ pub struct TripBreakdown {
     pub steps: Vec<TripStep>,
     /// Unique ingredients across the whole plan.
     pub total_unique_ingredients: usize,
-    /// First-seen ingredient keys summed by plan day (one shopping trip per day).
+    /// First-seen ingredient keys summed by plan day.
     pub new_keys_per_day: Vec<usize>,
     /// Human-readable explanation of what the ordering implies for shopping.
     pub summary: String,
 }
 
-/// Explain how plan ordering affects when ingredients are first needed (proxy for trips).
+/// Explain how plan ordering affects when ingredients are first needed.
 ///
 /// Walks meals in schedule order and records which ingredient keys appear for the
-/// first time at each meal. Later meals that reuse those keys contribute 0 new keys
-/// — so a min-union construction order shows large `new_count` early and smaller
-/// increments later when ingredients are reused.
+/// first time at each meal. Later meals that reuse those keys contribute 0 new keys.
 pub fn trip_breakdown_for_plan(store: &Store, plan: &MealPlan) -> Result<TripBreakdown> {
     let mut steps = Vec::new();
     let mut coverage: HashSet<IngredientKey> = HashSet::new();
@@ -584,7 +573,7 @@ mod tests {
         assert_eq!(t.total_unique_ingredients, 3);
         assert!(!t.summary.contains("positive advantage"));
         assert!(!t.summary.contains("reversed"));
-        // Ingredient keys read as plain names, not "name (Kind)".
+        // Ingredient keys read as plain names.
         assert!(t.steps[0]
             .new_ingredient_keys
             .iter()

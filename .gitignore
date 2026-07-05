@@ -5,3 +5,6 @@
 .DS_Store
 /data/*.db
 .env
+
+# Local-only specs and plans
+docs/

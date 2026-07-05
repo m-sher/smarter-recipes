@@ -1,8 +1,7 @@
 //! Exact integer-program selection for nutrition-constrained meal plans.
 //!
-//! The greedy planner in [`super`] minimizes the distinct-ingredient union but
-//! only *steers* by nutrition. When bounds are configured we instead solve the
-//! selection exactly with a MILP (solved by HiGHS, a high-performance solver):
+//! When bounds are configured, the selection is solved exactly with a MILP
+//! (HiGHS):
 //!
 //! * **Variables** — one binary `x` per candidate recipe (flat model) or per
 //!   `(recipe, day)` cell when a per-day bound must partition meals across days.
@@ -10,24 +9,21 @@
 //!   slacks that measure how far each scope total sits outside its min/max.
 //! * **Objective** — a two-phase lexicographic solve: phase 1 minimizes the
 //!   total **weighted** violation magnitude (calories and the macro-split ratio
-//!   are prioritized ~5×, see [`super::weighted_magnitude`]), so a feasible plan
-//!   is returned whenever one exists; phase 2 fixes that optimum (`V ≤ V* + ε`)
-//!   and minimizes the net ingredient union `Σ y`. This mirrors the ranking
-//!   contract in [`super::better_scored`] (feasible-first, then min weighted
-//!   violation, then min union).
+//!   prioritized ~5×, see [`super::weighted_magnitude`]); phase 2 fixes that
+//!   optimum (`V ≤ V* + ε`) and minimizes the net ingredient union `Σ y`. This
+//!   matches the ranking contract in [`super::better_scored`] (feasible-first,
+//!   then min weighted violation, then min union).
 //!
 //! The violation objective reproduces [`super::weighted_magnitude`] exactly:
 //! per-meal bounds are a per-recipe constant, per-day/plan bounds are slacks on
 //! the relevant totals (each scaled by its constraint weight). Only `x` is
-//! integer; `y` and slacks are integral at the optimum on their own, which keeps
-//! the branch-and-bound tree small.
+//! integer; `y` and slacks are integral at the optimum on their own.
 //!
-//! Returns `None` (caller falls back to the greedy planner) only when the exact
-//! model yields nothing usable — the problem is infeasible, or the time budget
-//! elapsed before any feasible plan was found. Otherwise it returns the proven
-//! optimum, or the best feasible plan found within the budget — so we never hang
-//! and never return a plan worse than today's. HiGHS handles the full pool, so
-//! every recipe is a candidate: no size cap, no shortlist.
+//! Returns `None` (caller falls back to the greedy planner) when the exact model
+//! yields nothing usable — the problem is infeasible, or the time budget elapsed
+//! before any feasible plan was found. Otherwise returns the proven optimum, or
+//! the best feasible plan found within the budget. HiGHS handles the full pool:
+//! every recipe is a candidate, no size cap, no shortlist.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -41,24 +37,21 @@ use super::{
 use crate::domain::{Macros, UnitKind};
 use crate::shopping::pantry_quantity_for;
 
-/// Wall-clock backstop per solve so a pathological instance can't hang.
+/// Wall-clock backstop per solve.
 const SOLVE_TIME_LIMIT: Duration = Duration::from_secs(5);
 /// Slack allowed above the phase-1 optimum when minimizing the union in phase 2.
 const VIOLATION_EPS: f64 = 1e-6;
 
 /// Thin adapter over the HiGHS MILP solver presenting the small building-block
 /// API the models below use (binary/continuous columns, linear rows, a solve
-/// that succeeds whenever a feasible primal is available). Keeping it local means
-/// the model code reads the same regardless of backend, and a future solver swap
-/// touches only this module.
+/// that succeeds whenever a feasible primal is available).
 mod backend {
     use std::borrow::Borrow;
     use std::ops::Index;
 
     use highs::{Col, HighsSolutionStatus, RowProblem, Sense};
 
-    /// Objective direction. Only minimization is used, but kept as an enum so the
-    /// call sites read like a conventional solver API.
+    /// Objective direction (minimize only).
     pub enum OptimizationDirection {
         Minimize,
     }
@@ -114,16 +107,9 @@ mod backend {
         /// Solve within `time_limit_secs`. Returns a [`Solution`] whenever the
         /// solver has a feasible primal — a proven optimum, or the best incumbent
         /// found so far if it hit the time limit first. Only genuine infeasibility
-        /// (or no incumbent yet) yields `None`, so the caller falls back to greedy
-        /// exactly when the exact model gives us nothing usable.
+        /// (or no incumbent yet) yields `None`.
         ///
-        /// The default MIP gap (1e-4) is left in place: our objectives are
-        /// integer-dominated (a distinct-ingredient count, plus a violation
-        /// magnitude that is zero for any feasible plan), so that gap resolves to
-        /// the exact optimum while letting HiGHS stop as soon as it finds it
-        /// rather than exhaustively proving it — the difference between a
-        /// sub-second solve and a timeout on the larger partition models. The
-        /// seed is fixed so tie-breaking is reproducible.
+        /// Uses the default MIP gap (1e-4) and a fixed random seed.
         pub fn solve(self, time_limit_secs: f64) -> Option<Solution> {
             let mut model = self.inner.optimise(Sense::Minimise);
             model.make_quiet();
@@ -198,9 +184,8 @@ fn kind_rank(kind: UnitKind) -> u8 {
 }
 
 /// Weighted (calories + ratio prioritized) magnitude by which `m` alone sits
-/// outside `bounds` — a per-recipe constant matching [`super::weighted_magnitude`]
-/// so the ILP objective agrees with the greedy ranking. Scope label is
-/// irrelevant to the magnitude.
+/// outside `bounds` — a per-recipe constant matching [`super::weighted_magnitude`].
+/// Scope label is irrelevant to the magnitude.
 fn recipe_violation(bounds: &MacroBounds, m: &Macros) -> f64 {
     if bounds.is_empty() {
         return 0.0;
@@ -215,7 +200,7 @@ fn recipe_violation(bounds: &MacroBounds, m: &Macros) -> f64 {
 /// Add min/max slacks for one nutrient on a scope total expressed as `terms`
 /// (`(var, nutrient_value)`). `weight` is the ranking weight for this nutrient
 /// (`KCAL_WEIGHT` vs `MACRO_WEIGHT`), applied to both the objective and the
-/// phase-2 cap so the ILP minimizes the same weighted magnitude as the scorer.
+/// phase-2 cap.
 fn add_range_slacks(
     prob: &mut Problem,
     terms: &[(Variable, f64)],
@@ -253,7 +238,7 @@ fn range_weight(i: usize) -> f64 {
 /// selection cell, as `(var, protein_g, fat_g, carbs_g)`. For each specified
 /// macro share `t` (fraction of `base = protein+fat+carbs`) with tolerance
 /// `tol`, a continuous slack `s >= |actual - t*base| - tol*base` measures grams
-/// beyond the band — linear because `base` is linear in the selection vars.
+/// beyond the band.
 fn add_ratio_slacks(
     prob: &mut Problem,
     macro_terms: &[(Variable, f64, f64, f64)],
@@ -270,7 +255,7 @@ fn add_ratio_slacks(
             continue;
         };
         let t = target_pct / 100.0;
-        // Ratio is a headline constraint: weight the slack like the scorer.
+        // Weight the slack like the scorer.
         let s = prob.add_var(slack_obj * RATIO_WEIGHT, (0.0, f64::INFINITY));
         // above: s - actual + (t + tol)*base >= 0
         // below: s + actual + (tol - t)*base >= 0
@@ -470,7 +455,7 @@ fn solve_flat(
 }
 
 /// Partition model: one binary per `(recipe, day)` cell. Used only when a per-day
-/// bound genuinely couples multiple meals within a day (`mpd >= 2`, `>= 2` days).
+/// bound couples multiple meals within a day (`mpd >= 2`, `>= 2` days).
 fn solve_partition(
     input: &GreedyInput<'_>,
     order: &[usize],
@@ -616,8 +601,7 @@ fn solve_partition(
     let (prob2, xs2) = build(Phase::Two, Some(vstar));
     let sol2 = solve_checked(prob2)?;
 
-    // Collect each day's selected recipes (canonical order within a day, since
-    // recipes are visited in canonical index order).
+    // Collect each day's selected recipes (canonical order within a day).
     let mut days: Vec<Vec<usize>> = vec![Vec::new(); used_days];
     for (j, cells) in xs2.iter().enumerate() {
         for (d, &v) in cells.iter().enumerate() {
@@ -633,8 +617,7 @@ fn solve_partition(
     }
 
     // Deterministic day labelling: order full days by their contents, keep the
-    // short (partial) day last so row-major packing reproduces the grouping.
-    // Per-day bounds are identical across days, so relabelling is violation-safe.
+    // short (partial) day last.
     let (mut full, partial): (Vec<Vec<usize>>, Vec<Vec<usize>>) =
         days.into_iter().partition(|g| g.len() == mpd);
     full.sort();
@@ -663,9 +646,7 @@ fn build_union(
     let mut key_to_cells: HashMap<&crate::domain::IngredientKey, Vec<Variable>> = HashMap::new();
     for (j, &r) in order.iter().enumerate() {
         for k in &input.keys[r] {
-            // Treat a key with any pantry stock as covered (set-level proxy for
-            // the quantity-aware net_shortfall_count used elsewhere; exact when
-            // pantry is empty). This is only the secondary union tiebreak.
+            // Treat a key with any pantry stock as covered.
             if pantry_quantity_for(k, input.pantry) > super::EPS {
                 continue;
             }
@@ -675,7 +656,7 @@ fn build_union(
                 .extend(cells[j].iter().copied());
         }
     }
-    // Deterministic key order so the model is stable.
+    // Deterministic key order.
     let mut entries: Vec<(&crate::domain::IngredientKey, Vec<Variable>)> =
         key_to_cells.into_iter().collect();
     entries.sort_by(|a, b| {

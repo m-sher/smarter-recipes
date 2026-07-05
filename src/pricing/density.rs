@@ -1,11 +1,11 @@
 //! Approximate densities (g/ml) for converting recipe volumes of dry goods to mass packages.
 //!
-//! Values are culinary approximations suitable for shopping estimates, not lab precision.
+//! Values are culinary approximations.
 
 /// Grams per milliliter for a normalized ingredient name, if known.
 pub fn density_g_per_ml(name: &str) -> Option<f64> {
     let n = name.to_lowercase();
-    // Prefer longer / more specific keys first via manual checks.
+    // Prefer longer / more specific keys first.
     let table: &[(&str, f64)] = &[
         ("all-purpose flour", 0.53),
         ("all purpose flour", 0.53),
@@ -61,7 +61,7 @@ pub fn density_g_per_ml(name: &str) -> Option<f64> {
     // Token / suffix match: "all-purpose flour" contains key "flour" as last token
     for (k, d) in table {
         if k.contains(' ') {
-            continue; // multiword already tried exact
+            continue; // multiword keys matched by the exact pass above
         }
         if n.split_whitespace().any(|t| t == *k) {
             return Some(*d);
