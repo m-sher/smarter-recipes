@@ -79,8 +79,8 @@ mod nutrition_bounds;
 pub use nutrition_bounds::{
     evaluate_macros, evaluate_schedule, exceeds_max, load_nutrition_bounds, min_deficit,
     violates_per_meal, violation_magnitude, weighted_magnitude, BoundScope, BoundViolation,
-    CliPerDayNutrition, MacroBounds, MacroRange, MacroRatio, NutrientKind, NutritionBounds,
-    ViolationKind, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
+    CategoryFilter, CliPerDayNutrition, MacroBounds, MacroRange, MacroRatio, NutrientKind,
+    NutritionBounds, ViolationKind, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
 };
 
 use crate::domain::{
@@ -128,14 +128,17 @@ impl Default for PlanOptions {
 }
 
 type RecipeReq = Vec<(IngredientKey, f64)>;
-type NormalizedPool<'a> = (
-    Vec<&'a Recipe>,
-    Vec<RecipeReq>,
-    Vec<HashSet<IngredientKey>>,
-    // (dropped as non-meals, dropped for incomplete nutrition estimates)
-    usize,
-    usize,
-);
+
+/// Surviving recipes paired with their precomputed requirements and key sets,
+/// plus how many candidates were dropped for each reason (for the rationale).
+struct NormalizedPool<'a> {
+    recipes: Vec<&'a Recipe>,
+    reqs: Vec<RecipeReq>,
+    keys: Vec<HashSet<IngredientKey>>,
+    dropped_non_meal: usize,
+    dropped_low_coverage: usize,
+    dropped_by_category: usize,
+}
 
 /// Aggregate per-recipe requirements in canonical units. Missing quantities are
 /// recorded as `0.0` (presence-only sentinel); never invent amounts.
@@ -203,17 +206,17 @@ fn is_non_meal_estimate(recipe_macros: &HashMap<RecipeId, Macros>, id: &RecipeId
 }
 
 /// Deduplicate by `recipe_id`, drop empty-ingredient recipes when any non-empty
-/// recipe exists, drop recipes whose precomputed estimate cannot serve as a meal
-/// (no calories, or calories with no macro breakdown), drop recipes in
-/// `exclude_low_coverage` (below the coverage threshold; `Some` only when bounds
-/// are configured), then collapse by normalized title key (first wins among
-/// survivors). Empty filtering must run before title collapse so an empty stub
-/// cannot claim a title and block a fuller same-title recipe. Returns recipes
-/// paired with precomputed requirements and key sets, plus how many candidates
-/// were removed as non-meals and how many for low coverage.
+/// recipe exists, drop recipes excluded by the `category` whitelist/blacklist,
+/// drop recipes whose precomputed estimate cannot serve as a meal (no calories,
+/// or calories with no macro breakdown), drop recipes in `exclude_low_coverage`
+/// (below the coverage threshold; `Some` only when bounds are configured), then
+/// collapse by normalized title key (first wins among survivors). Empty
+/// filtering must run before title collapse so an empty stub cannot claim a
+/// title and block a fuller same-title recipe.
 fn normalize_pool<'a>(
     pool: &'a [Recipe],
     recipe_macros: &HashMap<RecipeId, Macros>,
+    category: &CategoryFilter,
     exclude_low_coverage: Option<&HashSet<RecipeId>>,
 ) -> NormalizedPool<'a> {
     let mut seen_ids = HashSet::new();
@@ -247,10 +250,14 @@ fn normalize_pool<'a>(
 
     let mut dropped_non_meal = 0usize;
     let mut dropped_low_coverage = 0usize;
+    let mut dropped_by_category = 0usize;
+    let filter_category = !category.is_empty();
     let mut i = 0;
     while i < recipes.len() {
         let id = &recipes[i].id;
-        if is_non_meal_estimate(recipe_macros, id) {
+        if filter_category && !category.allows(recipes[i].meta.category.as_deref()) {
+            dropped_by_category += 1;
+        } else if is_non_meal_estimate(recipe_macros, id) {
             dropped_non_meal += 1;
         } else if exclude_low_coverage.is_some_and(|set| set.contains(id)) {
             dropped_low_coverage += 1;
@@ -276,13 +283,14 @@ fn normalize_pool<'a>(
         out_reqs.push(r_reqs);
         out_keys.push(k);
     }
-    (
-        out_recipes,
-        out_reqs,
-        out_keys,
+    NormalizedPool {
+        recipes: out_recipes,
+        reqs: out_reqs,
+        keys: out_keys,
         dropped_non_meal,
         dropped_low_coverage,
-    )
+        dropped_by_category,
+    }
 }
 
 /// Full union size of ingredient keys for recipes at the given pool indices.
@@ -628,14 +636,29 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     // Recipes below the ingredient-coverage threshold are only dropped when
     // bounds are configured — an unconstrained plan doesn't care about macros.
     let exclude_low_coverage = (!bounds.is_empty()).then_some(&opts.recipe_low_coverage);
-    let (pool, reqs, keys, dropped_non_meal, dropped_low_coverage) =
-        normalize_pool(pool, &opts.recipe_macros, exclude_low_coverage);
+    let NormalizedPool {
+        recipes: pool,
+        reqs,
+        keys,
+        dropped_non_meal,
+        dropped_low_coverage,
+        dropped_by_category,
+    } = normalize_pool(
+        pool,
+        &opts.recipe_macros,
+        &bounds.category,
+        exclude_low_coverage,
+    );
     let macros = align_macros(&pool, opts);
     let coverage_pct = (MIN_INGREDIENT_COVERAGE * 100.0).round() as u32;
 
     if pool.is_empty() || slots == 0 {
         let rationale = if slots == 0 {
             "Empty pool or zero slots; no meals planned.".into()
+        } else if dropped_by_category > 0 {
+            format!(
+                "No meals planned: all {dropped_by_category} candidate recipe(s) were excluded by the configured category whitelist/blacklist."
+            )
         } else if dropped_non_meal > 0 {
             format!(
                 "No meals planned: all {dropped_non_meal} candidate recipe(s) had no estimated calories or no macro breakdown, so none qualify as meals."
@@ -736,6 +759,12 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         String::new()
     };
 
+    let category_note = if dropped_by_category > 0 {
+        format!(" Excluded {dropped_by_category} recipe(s) by category (whitelist/blacklist).")
+    } else {
+        String::new()
+    };
+
     let partial_note = if meals.len() < slots {
         format!(
             " Pool has only {} unique non-empty recipe(s); requested {} slot(s), so the plan is partial (repeats are never used).",
@@ -770,7 +799,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let rationale = if bounds.is_empty() {
         format!(
             "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
-             no recipe repeats. {pantry_note}{non_meal_note}{nutrition_note}{partial_note}",
+             no recipe repeats. {pantry_note}{non_meal_note}{category_note}{nutrition_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
@@ -783,7 +812,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         };
         format!(
             "{lead}: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
-             no recipe repeats. {pantry_note}{non_meal_note}{low_coverage_note}{nutrition_note}{partial_note}",
+             no recipe repeats. {pantry_note}{non_meal_note}{low_coverage_note}{category_note}{nutrition_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
@@ -1548,6 +1577,113 @@ mod tests {
         assert!(
             plan.rationale.to_lowercase().contains("no macro breakdown"),
             "rationale should note the macro-less exclusion: {}",
+            plan.rationale
+        );
+    }
+
+    #[test]
+    fn category_blacklist_excludes_component_from_plan() {
+        let mut sauce = rec("Tahini Sauce", &["1/2 cup tahini", "2 tbsp lemon juice"]);
+        sauce.meta.category = Some("Sauce".into());
+        let meal = rec("Grilled Chicken", &["2 chicken breasts", "1 tbsp oil"]);
+        let bounds = NutritionBounds {
+            category: CategoryFilter {
+                blacklist: vec!["Sauce".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = plan_meals(
+            &[sauce, meal],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                nutrition: bounds,
+                ..Default::default()
+            },
+        );
+        assert_eq!(titles(&plan), vec!["Grilled Chicken"]);
+        assert!(
+            plan.rationale.to_lowercase().contains("category"),
+            "rationale should note the category exclusion: {}",
+            plan.rationale
+        );
+    }
+
+    #[test]
+    fn category_whitelist_is_strict_excludes_uncategorized() {
+        let mut main = rec("Beef Stir Fry", &["200 g beef", "1 cup rice"]);
+        main.meta.category = Some("Main Course".into());
+        let uncategorized = rec("Random Dish", &["1 cup lentils", "1 onion"]);
+        let mut dessert = rec("Brownie", &["1 cup flour", "1 cup sugar"]);
+        dessert.meta.category = Some("Dessert".into());
+        let bounds = NutritionBounds {
+            category: CategoryFilter {
+                whitelist: vec!["Main Course".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = plan_meals(
+            &[main, uncategorized, dessert],
+            &PlanOptions {
+                days: 3,
+                meals_per_day: 1,
+                nutrition: bounds,
+                ..Default::default()
+            },
+        );
+        // Strict: only the whitelisted Main Course survives; uncategorized and
+        // non-matching (Dessert) are both dropped.
+        assert_eq!(titles(&plan), vec!["Beef Stir Fry"]);
+    }
+
+    #[test]
+    fn empty_category_filter_keeps_all() {
+        let mut sauce = rec("Tahini Sauce", &["1/2 cup tahini", "2 tbsp lemon juice"]);
+        sauce.meta.category = Some("Sauce".into());
+        let meal = rec("Grilled Chicken", &["2 chicken breasts", "1 tbsp oil"]);
+        // Default bounds -> empty category filter -> no exclusion (unchanged behavior).
+        let plan = plan_meals(
+            &[sauce, meal],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 2);
+    }
+
+    #[test]
+    fn category_filter_alone_keeps_unconstrained_planner() {
+        // A category-only config must NOT switch on the constrained solver; the
+        // rationale lead distinguishes the two planners.
+        let mut main = rec("Beef Bowl", &["200 g beef", "1 cup rice"]);
+        main.meta.category = Some("Main Course".into());
+        let bounds = NutritionBounds {
+            category: CategoryFilter {
+                whitelist: vec!["Main Course".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            bounds.is_empty(),
+            "category-only bounds must be macro-empty"
+        );
+        let plan = plan_meals(
+            &[main],
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 1,
+                nutrition: bounds,
+                ..Default::default()
+            },
+        );
+        assert!(
+            plan.rationale.starts_with("Min-union planner"),
+            "category-only config must use the unconstrained planner: {}",
             plan.rationale
         );
     }

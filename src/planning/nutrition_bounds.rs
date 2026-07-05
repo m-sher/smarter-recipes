@@ -85,6 +85,87 @@ impl MacroRatio {
     }
 }
 
+/// Normalized comparison key for a single category token (case-insensitive,
+/// trimmed, whitespace-collapsed). Reuses the recipe title-key normalizer so
+/// "Main Course" / "main course" / " MAIN  COURSE " all compare equal.
+fn category_key(s: &str) -> String {
+    crate::domain::normalize_title_key(s)
+}
+
+/// Category-based pool filter: keep standalone meals, drop components (sauces,
+/// dressings, condiments) by their schema.org `recipeCategory`
+/// ([`crate::domain::RecipeMeta::category`]).
+///
+/// A recipe's stored category may list several values joined by ", "; a recipe
+/// matches a list when any of its tokens equals a list entry (compared on the
+/// normalized key). This is orthogonal to the macro bounds and is deliberately
+/// left out of [`NutritionBounds::is_empty`] so a category-only config does not
+/// switch the planner into constrained-macro solving.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct CategoryFilter {
+    /// When non-empty, ONLY recipes whose category matches one of these are
+    /// eligible (strict): uncategorized recipes are excluded.
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+    /// Recipes whose category matches one of these are always excluded.
+    /// Takes precedence over the whitelist.
+    #[serde(default)]
+    pub blacklist: Vec<String>,
+}
+
+impl CategoryFilter {
+    pub fn is_empty(&self) -> bool {
+        self.whitelist.is_empty() && self.blacklist.is_empty()
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (list, label) in [
+            (&self.whitelist, "whitelist"),
+            (&self.blacklist, "blacklist"),
+        ] {
+            if list.iter().any(|e| category_key(e).is_empty()) {
+                bail!("category.{label}: entries must be non-empty");
+            }
+        }
+        for w in &self.whitelist {
+            let wk = category_key(w);
+            if self.blacklist.iter().any(|b| category_key(b) == wk) {
+                bail!(
+                    "category: '{}' appears in both whitelist and blacklist",
+                    w.trim()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a recipe with this (optional, possibly comma-joined) category is
+    /// eligible for the meal pool. Blacklist wins; a non-empty whitelist is
+    /// strict (uncategorized recipes are excluded).
+    pub fn allows(&self, category: Option<&str>) -> bool {
+        let tokens: Vec<String> = category
+            .into_iter()
+            .flat_map(|c| c.split(','))
+            .map(category_key)
+            .filter(|t| !t.is_empty())
+            .collect();
+        if self
+            .blacklist
+            .iter()
+            .any(|b| tokens.contains(&category_key(b)))
+        {
+            return false;
+        }
+        if !self.whitelist.is_empty() {
+            return self
+                .whitelist
+                .iter()
+                .any(|w| tokens.contains(&category_key(w)));
+        }
+        true
+    }
+}
+
 /// Min/max ranges for all tracked macros, plus an optional target macro split.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct MacroBounds {
@@ -119,7 +200,8 @@ impl MacroBounds {
     }
 }
 
-/// Full constraint set: per-day, per-meal, and whole-plan scopes.
+/// Full constraint set: per-day, per-meal, and whole-plan scopes, plus an
+/// optional category-based pool filter.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct NutritionBounds {
     #[serde(default)]
@@ -128,9 +210,17 @@ pub struct NutritionBounds {
     pub per_meal: MacroBounds,
     #[serde(default)]
     pub plan: MacroBounds,
+    /// Category whitelist/blacklist applied to the candidate pool. Intentionally
+    /// excluded from [`Self::is_empty`] (see its note) — it filters the pool but
+    /// must not trigger constrained-macro solving.
+    #[serde(default)]
+    pub category: CategoryFilter,
 }
 
 impl NutritionBounds {
+    /// True when no macro constraints are set. Note: the [`CategoryFilter`] is
+    /// deliberately NOT considered here — `is_empty` gates the exact-solver /
+    /// low-coverage paths, which a category-only config must leave untouched.
     pub fn is_empty(&self) -> bool {
         self.per_day.is_empty() && self.per_meal.is_empty() && self.plan.is_empty()
     }
@@ -139,6 +229,7 @@ impl NutritionBounds {
         self.per_day.validate("per_day")?;
         self.per_meal.validate("per_meal")?;
         self.plan.validate("plan")?;
+        self.category.validate()?;
         Ok(())
     }
 
@@ -591,6 +682,96 @@ mod tests {
         assert_eq!(b.per_meal.protein_g.min, Some(15.0));
         assert_eq!(b.plan.protein_g.min, Some(350.0));
         assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn category_filter_default_allows_everything() {
+        let f = CategoryFilter::default();
+        assert!(f.is_empty());
+        assert!(f.allows(Some("Sauce")));
+        assert!(f.allows(None));
+    }
+
+    #[test]
+    fn category_blacklist_excludes_matching_case_insensitive() {
+        let f = CategoryFilter {
+            blacklist: vec!["Sauce".into(), "Dressing".into()],
+            ..Default::default()
+        };
+        assert!(!f.is_empty());
+        assert!(!f.allows(Some("sauce"))); // case-insensitive
+        assert!(!f.allows(Some("Main Course, Sauce"))); // any token matches
+        assert!(f.allows(Some("Main Course")));
+        assert!(f.allows(None)); // blacklist alone does not exclude uncategorized
+        assert!(f.allows(Some("Applesauce Cake"))); // token equality, not substring
+    }
+
+    #[test]
+    fn category_whitelist_is_strict() {
+        let f = CategoryFilter {
+            whitelist: vec!["Main Course".into(), "Dinner".into()],
+            ..Default::default()
+        };
+        assert!(f.allows(Some("main course"))); // matches (case-insensitive)
+        assert!(f.allows(Some("Sauce, Dinner"))); // any token matches whitelist
+        assert!(!f.allows(Some("Dessert"))); // not on whitelist
+        assert!(!f.allows(None)); // strict: uncategorized excluded
+    }
+
+    #[test]
+    fn category_blacklist_beats_whitelist() {
+        let f = CategoryFilter {
+            whitelist: vec!["Main Course".into()],
+            blacklist: vec!["Sauce".into()],
+        };
+        assert!(!f.allows(Some("Main Course, Sauce"))); // both tokens -> excluded
+        assert!(f.allows(Some("Main Course")));
+    }
+
+    #[test]
+    fn category_validate_rejects_overlap_and_empty() {
+        let overlap = CategoryFilter {
+            whitelist: vec!["Sauce".into()],
+            blacklist: vec!["sauce".into()],
+        };
+        assert!(overlap.validate().is_err());
+
+        let empty_entry = CategoryFilter {
+            blacklist: vec!["  ".into()],
+            ..Default::default()
+        };
+        assert!(empty_entry.validate().is_err());
+    }
+
+    #[test]
+    fn toml_parses_category_table() {
+        let text = r#"
+            [category]
+            whitelist = ["Main Course", "Dinner"]
+            blacklist = ["Sauce", "Dressing"]
+        "#;
+        let b = NutritionBounds::from_toml_str(text).unwrap();
+        assert_eq!(b.category.whitelist, vec!["Main Course", "Dinner"]);
+        assert_eq!(b.category.blacklist, vec!["Sauce", "Dressing"]);
+        // A category-only config must not read as non-empty macro bounds.
+        assert!(
+            b.is_empty(),
+            "category-only config must keep is_empty() true"
+        );
+        assert!(!b.category.is_empty());
+    }
+
+    #[test]
+    fn toml_rejects_category_overlap() {
+        let err = NutritionBounds::from_toml_str(
+            r#"
+            [category]
+            whitelist = ["Main Course"]
+            blacklist = ["main course"]
+            "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("category"), "{err:#}");
     }
 
     #[test]
