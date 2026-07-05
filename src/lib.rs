@@ -1,6 +1,6 @@
 //! Smarter Recipes — meal planning CLI library.
 //!
-//! Core modules are independent of network/OCR so they can be tested offline:
+//! Core modules are independent of network/OCR:
 //! - [`domain`] — shared types (recipes, ingredients, plans, pantry, units)
 //! - [`normalize`] — free-text ingredient parsing and unit normalization
 //! - [`planning`] — meal plans minimizing distinct ingredients (no repeats),

@@ -1,8 +1,7 @@
 //! Package sizes and prices for shopping optimization.
 //!
-//! Provides an offline default catalog so purchase optimization works without
-//! network access. Optional store sources implement [`ProductSource`] for live
-//! or fixture-backed package data.
+//! Provides an offline default catalog. Optional store sources implement
+//! [`ProductSource`] for live or fixture-backed package data.
 
 mod catalog;
 mod density;

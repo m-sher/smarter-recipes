@@ -17,7 +17,7 @@ use url::Url;
 const DDG_HTML_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 /// Approximate organic results per DDG HTML page (used for `s=` offset).
 const DDG_PAGE_SIZE: usize = 30;
-/// Pause between SERP page fetches (politeness / bot-challenge avoidance).
+/// Pause between SERP page fetches.
 const DDG_PAGE_DELAY: Duration = Duration::from_millis(300);
 
 /// Build a DuckDuckGo HTML search URL for `query` at zero-based `page_index`.
@@ -33,7 +33,7 @@ pub fn duckduckgo_search_url(query: &str, page_index: usize) -> String {
     url.into()
 }
 
-/// True when the response is DDG's bot/anomaly challenge instead of SERP HTML.
+/// True when the response is DDG's bot/anomaly challenge page.
 pub fn is_duckduckgo_challenge(html: &str) -> bool {
     html.contains("anomaly-modal")
         || html.contains("Unfortunately, bots use DuckDuckGo")
@@ -146,7 +146,7 @@ pub fn parse_duckduckgo_results(html: &str) -> Result<Vec<String>> {
 
 /// Fetch up to `pages` DDG HTML result pages and return deduped destination URLs.
 ///
-/// Page 0 hard-fails on network/challenge errors (nothing useful to crawl).
+/// Page 0 hard-fails on network/challenge errors.
 /// Later pages soft-fail: log-level break and return seeds already collected.
 pub fn search_result_urls(
     fetcher: &dyn HtmlFetcher,
@@ -202,7 +202,7 @@ fn search_result_urls_with_delay(
                 new_on_page += 1;
             }
         }
-        // Stop early if a later page adds nothing new (overlap / end of results).
+        // Stop early if a later page adds nothing new.
         if page > 0 && new_on_page == 0 {
             break;
         }
@@ -221,8 +221,6 @@ pub fn search_scrape_recipes(
     progress: &(dyn Fn(ScrapeEvent) + Sync),
 ) -> Result<ScrapeOutcome> {
     let seeds = search_result_urls(fetcher, query, search_pages)?;
-    // Intentionally no Planned event here — `scrape_from_seeds` emits the
-    // single candidate-queue progress line (avoids duplicate CLI output).
     scrape_from_seeds(fetcher, &seeds, skip, params, progress, HashSet::new())
 }
 
@@ -308,9 +306,7 @@ mod tests {
 
     #[test]
     fn fallback_used_when_primary_only_yields_junk() {
-        // Primary result__a present but only ads / denied — fallback should still run
-        // if there are other uddg anchors (here: only junk, so empty is correct;
-        // ensure we do not short-circuit purely on primary element presence).
+        // Primary result__a yields only ads/denied; fallback runs on remaining uddg anchors.
         let html = r#"<!DOCTYPE html><html><body>
           <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fx=1">Ad</a>
           <a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgoodsite.com%2Fpancakes">Alt</a>
@@ -417,8 +413,7 @@ mod tests {
             },
         )
         .unwrap();
-        // search_scrape_recipes itself must not pre-emit Planned; only the crawl does
-        // (start + optional expansion updates). At least one is required.
+        // search_scrape_recipes must not pre-emit Planned; only the crawl does. At least one is required.
         assert!(*planned.lock().unwrap() >= 1);
         let titles: HashSet<_> = out.recipes.iter().map(|r| r.title.as_str()).collect();
         assert!(

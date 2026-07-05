@@ -3,8 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Macronutrients as published by a recipe source (schema.org
-/// `NutritionInformation`), per serving. Fields are optional because published
-/// data is usually partial.
+/// `NutritionInformation`), per serving.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Nutrition {
     pub kcal: Option<f64>,

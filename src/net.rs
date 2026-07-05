@@ -2,8 +2,7 @@
 
 /// Percent-encode a string for use as a URL query-parameter value. Unreserved
 /// characters (RFC 3986) pass through; everything else, including non-ASCII, is
-/// encoded per UTF-8 byte. Spaces become `%20` (valid in query values on every
-/// server we target).
+/// encoded per UTF-8 byte. Spaces become `%20`.
 pub fn encode_query(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

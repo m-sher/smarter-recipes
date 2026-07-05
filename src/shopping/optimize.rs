@@ -113,8 +113,7 @@ pub fn optimize_purchase(
         }
 
         let p = pkgs[idx];
-        // Saturating throughout: a tiny package vs a large requirement can make the
-        // float→u32 cast reach u32::MAX; a plain `+ 1/2` would overflow-panic.
+        // Saturating count arithmetic; the float→u32 cast may reach u32::MAX.
         let max_c = if p.size_canonical >= required && size < required {
             (((required - size) / p.size_canonical).ceil() as u32).saturating_add(1)
         } else {

@@ -8,10 +8,10 @@ use std::sync::RwLock;
 pub const CANONICAL_MASS: &str = "g";
 pub const CANONICAL_VOLUME: &str = "ml";
 
-/// Case-sensitive aliases that must not collide when lowercased (e.g. t vs T).
+/// Case-sensitive aliases (e.g. t vs T).
 fn case_sensitive_units() -> HashMap<&'static str, Unit> {
     let mut m = HashMap::new();
-    // Culinary convention: lowercase t = teaspoon, uppercase T = tablespoon.
+    // lowercase t = teaspoon, uppercase T = tablespoon.
     m.insert("t", Unit::new("t", UnitKind::Volume, 4.92892159375));
     m.insert("T", Unit::new("T", UnitKind::Volume, 14.78676478125));
     m
@@ -54,7 +54,7 @@ fn builtin_units() -> HashMap<String, Unit> {
         453.59237,
     );
 
-    // Volume → milliliters (do NOT register bare "t" / "T" here — case-sensitive map)
+    // Volume → milliliters
     add(
         &mut m,
         &[

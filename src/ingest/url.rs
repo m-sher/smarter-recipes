@@ -11,8 +11,7 @@ use url::Url;
 
 /// A JSON-LD `url`/`@id` is safe to adopt as recipe identity only when it is the
 /// **same host** as the page we fetched and points at an actual page (not a
-/// fragment-only `@id` like `https://site.com/#recipe`, whose path collapses to
-/// the site root and would merge every recipe on that host into one identity).
+/// fragment-only `@id` like `https://site.com/#recipe`).
 fn canonical_is_trustworthy(canonical: &str, fetch_url: &str) -> bool {
     let (Ok(c), Ok(f)) = (Url::parse(canonical), Url::parse(fetch_url)) else {
         return false;
@@ -23,7 +22,7 @@ fn canonical_is_trustworthy(canonical: &str, fetch_url: &str) -> bool {
 #[derive(Clone)]
 pub struct UrlSource {
     pub timeout: Duration,
-    /// When set, this HTML is parsed instead of fetching over the network.
+    /// When set, this HTML is parsed; no network fetch occurs.
     pub offline_html: Option<String>,
 }
 
@@ -124,9 +123,7 @@ fn find_recipe_objects(v: &Value, out: &mut Vec<Value>) {
     }
 }
 
-/// Collect string values from a JSON-LD field, decoding HTML entities. JSON-LD
-/// is plain JSON, so sites that embed `&nbsp;` / `&amp;` in `recipeIngredient`
-/// values would otherwise leak them into ingredient names.
+/// Collect string values from a JSON-LD field, decoding HTML entities.
 fn json_ld_string_list(v: &Value) -> Vec<String> {
     raw_json_ld_string_list(v)
         .into_iter()
@@ -233,8 +230,7 @@ fn nutrition_number(v: &Value) -> Option<f64> {
     }
 }
 
-/// Energy in kcal. Recipe sources sometimes publish kilojoules (common on
-/// AU/EU sites); convert when the value is explicitly labeled kJ and not kcal.
+/// Energy in kcal. Convert when the value is explicitly labeled kJ and not kcal.
 fn nutrition_energy_kcal(v: &Value) -> Option<f64> {
     let value = nutrition_number(v)?;
     let unit_text = match v {
@@ -509,7 +505,7 @@ mod tests {
     #[test]
     fn json_ld_ingredients_decode_html_entities() {
         // Sites embed raw HTML entities in JSON-LD `recipeIngredient` values;
-        // they must not leak into ingredient text (regression for "&nbsp").
+        // they must not leak into ingredient text.
         let html = r#"
         <html><head>
         <script type="application/ld+json">
@@ -662,7 +658,6 @@ mod tests {
         };
         let fetch = "https://example.com/soup-page";
         let r = src.ingest(fetch).unwrap();
-        // A site-root fragment @id would collapse all recipes to one identity.
         assert_eq!(r.meta.source_url.as_deref(), Some(fetch));
     }
 

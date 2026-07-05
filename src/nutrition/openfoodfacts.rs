@@ -3,10 +3,7 @@
 //! (`search.openfoodfacts.org`) and reads per-100 g macros from the
 //! best-matching product's `nutriments`.
 //!
-//! The legacy `cgi/search.pl` endpoint is frequently overloaded (HTTP 503), so
-//! this deliberately uses the newer search service. No API key is required and
-//! quotas are independent of FDC, keeping `nutrition fetch` making progress
-//! after the FDC DEMO_KEY limit is hit.
+//! No API key is required and quotas are independent of FDC.
 
 use super::{NutritionSource, RateGate, RateLimited};
 use crate::domain::Macros;
@@ -15,7 +12,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 const OFF_SEARCH_URL: &str = "https://search.openfoodfacts.org";
-/// Politeness pause before each search request.
+/// Pause before each search request.
 const OFF_REQUEST_DELAY: Duration = Duration::from_millis(300);
 /// Retries for a transient failure (5xx / network error) before giving up.
 const OFF_MAX_RETRIES: u32 = 2;
@@ -24,7 +21,7 @@ const OFF_MAX_RETRIES: u32 = 2;
 pub struct OpenFoodFactsNutritionSource {
     client: reqwest::blocking::Client,
     pub base_url: String,
-    /// Shared dispatch gate so concurrent workers don't exceed the request rate.
+    /// Shared dispatch gate.
     gate: RateGate,
     /// Canned response body for offline tests.
     pub offline_body: Option<String>,
@@ -92,7 +89,7 @@ impl OpenFoodFactsNutritionSource {
                     using_demo_key: false,
                 }));
             }
-            // 5xx is transient (the search service is occasionally overloaded).
+            // 5xx is transient.
             if status.is_server_error() && attempt < OFF_MAX_RETRIES {
                 attempt += 1;
                 std::thread::sleep(retry_backoff(attempt));
@@ -148,8 +145,7 @@ impl NutritionSource for OpenFoodFactsNutritionSource {
         };
         let parsed: OffSearch =
             serde_json::from_str(&body).context("parsing Open Food Facts response")?;
-        // First hit carrying a usable energy value wins (results are
-        // relevance-ranked, so the leading complete entry is representative).
+        // First hit carrying a usable energy value wins.
         for hit in parsed.hits.unwrap_or_default() {
             if let Some(n) = &hit.nutriments {
                 if let Some(m) = macros_from_nutriments(n) {

@@ -1,14 +1,8 @@
-//! Minimal `.env` loader.
-//!
-//! Sets `KEY=VALUE` pairs from a `.env` file in the current directory into the
-//! process environment, without overriding variables already set (a real
-//! `export` wins over the file). Intentionally tiny — enough to keep secrets
-//! like `SMARTER_RECIPES_FDC_KEY` out of shell history and the repo.
+//! Loads `KEY=VALUE` pairs from a `.env` file into the process environment without overriding existing variables.
 
 use std::path::Path;
 
-/// Load `.env` from the current working directory if present. Missing file is
-/// fine (no-op). Call once at startup, before any threads spawn.
+/// Load `.env` from the current working directory if present; missing file is a no-op.
 pub fn load() {
     load_from(Path::new(".env"));
 }
@@ -89,7 +83,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(".env");
         std::fs::write(&path, "SR_DOTENV_NEW=fromfile\nSR_DOTENV_SET=fromfile\n").unwrap();
-        // A var already in the environment must win over the file.
+        // An existing env var overrides the file.
         std::env::set_var("SR_DOTENV_SET", "preset");
         load_from(&path);
         assert_eq!(std::env::var("SR_DOTENV_NEW").unwrap(), "fromfile");

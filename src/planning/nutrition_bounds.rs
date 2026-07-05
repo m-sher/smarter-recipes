@@ -86,15 +86,13 @@ impl MacroRatio {
 }
 
 /// Normalized comparison key for a single category token (case-insensitive,
-/// trimmed, whitespace-collapsed). Reuses the recipe title-key normalizer so
-/// "Main Course" / "main course" / " MAIN  COURSE " all compare equal.
+/// trimmed, whitespace-collapsed).
 fn category_key(s: &str) -> String {
     crate::domain::normalize_title_key(s)
 }
 
 /// Expand a config list into normalized match tokens. Each entry may itself be
-/// comma-joined (e.g. a copy-pasted `"Main Course, Sauce"`), mirroring how a
-/// recipe's category is stored, so a comma inside one string is not a dead rule.
+/// comma-joined (e.g. `"Main Course, Sauce"`).
 fn expand_tokens(list: &[String]) -> Vec<String> {
     list.iter()
         .flat_map(|e| e.split(','))
@@ -109,9 +107,7 @@ fn expand_tokens(list: &[String]) -> Vec<String> {
 ///
 /// A recipe's stored category may list several values joined by ", "; a recipe
 /// matches a list when any of its tokens equals a list entry (compared on the
-/// normalized key). This is orthogonal to the macro bounds and is deliberately
-/// left out of [`NutritionBounds::is_empty`] so a category-only config does not
-/// switch the planner into constrained-macro solving.
+/// normalized key). Not counted by [`NutritionBounds::is_empty`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct CategoryFilter {
     /// When non-empty, ONLY recipes whose category matches one of these are
@@ -141,8 +137,7 @@ impl CategoryFilter {
                 bail!("category.{label}: entries must be non-empty");
             }
         }
-        // Compare at the token level so a category can't be both required and
-        // forbidden, even when an entry bundles several comma-joined values.
+        // Compare at the token level.
         let black = expand_tokens(&self.blacklist);
         if let Some(dup) = expand_tokens(&self.whitelist)
             .iter()
@@ -219,17 +214,15 @@ pub struct NutritionBounds {
     pub per_meal: MacroBounds,
     #[serde(default)]
     pub plan: MacroBounds,
-    /// Category whitelist/blacklist applied to the candidate pool. Intentionally
-    /// excluded from [`Self::is_empty`] (see its note) — it filters the pool but
-    /// must not trigger constrained-macro solving.
+    /// Category whitelist/blacklist applied to the candidate pool. Not counted
+    /// by [`Self::is_empty`].
     #[serde(default)]
     pub category: CategoryFilter,
 }
 
 impl NutritionBounds {
-    /// True when no macro constraints are set. Note: the [`CategoryFilter`] is
-    /// deliberately NOT considered here — `is_empty` gates the exact-solver /
-    /// low-coverage paths, which a category-only config must leave untouched.
+    /// True when no macro constraints are set. The [`CategoryFilter`] is not
+    /// considered.
     pub fn is_empty(&self) -> bool {
         self.per_day.is_empty() && self.per_meal.is_empty() && self.plan.is_empty()
     }
@@ -482,7 +475,7 @@ fn check_range(
 
 /// Emit a violation for each specified macro share that falls outside its
 /// tolerance band. Shares are of total macro grams; magnitude is grams beyond
-/// the band. Skips scopes with no macro grams (share undefined).
+/// the band. Skips scopes with no macro grams.
 fn check_ratio(
     out: &mut Vec<BoundViolation>,
     scope: &BoundScope,
@@ -536,12 +529,9 @@ pub fn violation_magnitude(violations: &[BoundViolation]) -> f64 {
 
 // --- Constraint weighting for plan ranking --------------------------------
 //
-// Raw violation magnitudes are in mixed units (kcal, grams, grams-beyond-band),
-// so a flat sum lets calories dominate by scale while ratio (small grams) is
-// nearly ignored. For *ranking* we instead normalize each violation to a
-// comparable scale (÷ a reference so a "meaningful" miss ≈ 1.0) and weight
-// calories and the macro-split ratio as the headline constraints. Raw
-// magnitudes are unchanged for the reported violation list.
+// Ranking normalizes each violation to a comparable scale (÷ a per-kind
+// reference) and weights calories and the macro-split ratio as the headline
+// constraints. Raw magnitudes are unchanged for the reported violation list.
 
 /// Reference size of a "meaningful" violation, per kind (normalizes units).
 const KCAL_REF: f64 = 100.0; // kcal
@@ -572,13 +562,12 @@ fn weighted_one(v: &BoundViolation) -> f64 {
 }
 
 /// Weighted, unit-normalized total used to *rank* infeasible plans (calories +
-/// ratio prioritized). Zero exactly when there are no violations, so the
-/// feasible/infeasible split is unchanged.
+/// ratio prioritized). Zero exactly when there are no violations.
 pub fn weighted_magnitude(violations: &[BoundViolation]) -> f64 {
     violations.iter().map(weighted_one).sum()
 }
 
-/// How far `totals` still are below configured mins (0 if met or unset).
+/// How far `totals` are below configured mins (0 if met or unset).
 pub fn min_deficit(bounds: &MacroBounds, totals: &Macros) -> f64 {
     let mut d = 0.0;
     if let Some(min) = bounds.kcal.min {
@@ -739,7 +728,7 @@ mod tests {
 
     #[test]
     fn category_config_entry_may_bundle_comma_values() {
-        // A single comma-joined string counts as multiple tokens, not a dead rule.
+        // A single comma-joined string counts as multiple tokens.
         let f = CategoryFilter {
             blacklist: vec!["Sauce, Dip".into()],
             ..Default::default()
@@ -747,7 +736,7 @@ mod tests {
         assert!(!f.allows(Some("Sauce")));
         assert!(!f.allows(Some("Dip")));
         assert!(f.allows(Some("Main Course")));
-        // Overlap is still caught at the token level.
+        // Overlap is caught at the token level.
         let overlap = CategoryFilter {
             whitelist: vec!["Main Course, Sauce".into()],
             blacklist: vec!["sauce".into()],
@@ -1131,7 +1120,7 @@ mod tests {
         assert!((kcal - 5.0).abs() < 1e-9, "calories ~5x: {kcal}");
         assert!((ratio - 5.0).abs() < 1e-9, "ratio ~5x: {ratio}");
         assert!(kcal > protein && ratio > protein);
-        // No violations still scores 0 (feasible/infeasible split unchanged).
+        // No violations scores 0.
         assert_eq!(weighted_magnitude(&[]), 0.0);
     }
 }

@@ -1,7 +1,6 @@
 //! Free-text ingredient parsing and unit normalization.
 //!
-//! This module is the foundation for aggregation, planning, and shopping.
-//! It intentionally has no I/O dependencies.
+//! No I/O dependencies.
 
 mod parse;
 mod units;

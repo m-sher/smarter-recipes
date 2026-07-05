@@ -60,7 +60,7 @@ pub enum Commands {
         /// How deep to follow descendant links under the seed path (1 = seed's links only)
         #[arg(long, default_value_t = 1)]
         depth: usize,
-        /// Re-attempt URLs previously recorded as failures
+        /// Re-attempt URLs recorded as failures
         #[arg(long)]
         retry_failed: bool,
         /// Discover and report without saving
@@ -87,7 +87,7 @@ pub enum Commands {
         /// How many DuckDuckGo result pages to load
         #[arg(long, default_value_t = 2)]
         pages: usize,
-        /// Re-attempt URLs previously recorded as failures
+        /// Re-attempt URLs recorded as failures
         #[arg(long)]
         retry_failed: bool,
         /// Discover and report without saving
@@ -202,8 +202,8 @@ pub enum Commands {
     },
     /// Print database path and recipe/plan counts
     Status,
-    /// Re-parse stored ingredient lines with the current parser (after normalize
-    /// improvements). Pass a recipe id, or `--all` to reparse every recipe.
+    /// Re-parse stored ingredient lines with the current parser. Pass a recipe
+    /// id, or `--all` to reparse every recipe.
     Reparse {
         /// Recipe id (prefix match). Omit when using --all.
         id: Option<String>,
@@ -250,8 +250,7 @@ pub enum NutritionCmd {
         /// Max lookups this run
         #[arg(long, default_value_t = 25)]
         limit: usize,
-        /// Concurrent lookups (a shared per-source rate gate still caps the
-        /// request rate, so this overlaps latency without hammering the APIs)
+        /// Concurrent lookups (a shared per-source rate gate caps the request rate)
         #[arg(long, default_value_t = 6)]
         jobs: usize,
     },
@@ -330,8 +329,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("input is required for source '{source}'"))?;
                 ingest_from(&source, &input)?
             };
-            // Clean scraped title text (entities, curly punctuation); ingredient
-            // names are already sanitized by the parser.
+            // Clean scraped title text (entities, curly punctuation).
             recipe.title = crate::text::sanitize(&recipe.title);
             print_recipe_summary(&recipe);
             if dry_run {
@@ -437,13 +435,10 @@ pub fn run(cli: Cli) -> Result<()> {
                 .collect();
             let recipes = store.list_recipes(None)?;
             // Purge a recipe only if it is NOT a cookable meal AND carries no
-            // usable source nutrition. The nutrition guard is load-bearing: the
-            // source-macro bypass admits amount-sparse recipes that publish
-            // macros, so deleting them here would undo that rescue.
+            // usable source nutrition.
             let candidates: Vec<&Recipe> = recipes
                 .iter()
-                // Prefix match so the 8-char id shown in the preview works,
-                // consistent with every other id argument (resolve_recipe).
+                // Prefix match against the recipe id.
                 .filter(|r| !keep.iter().any(|k| r.id.as_str().starts_with(k)) && prunable(r))
                 .collect();
             if candidates.is_empty() {
@@ -848,9 +843,8 @@ pub fn run(cli: Cli) -> Result<()> {
                         && crate::nutrition::resolve_profile(n, &extra).is_none()
                 })
                 .collect();
-                // Network runs skip names already tried (positive or negative
-                // cache). A fixture is a local overlay, so it re-checks every
-                // name and its misses are never written to the cache.
+                // Network runs skip already-cached names; a fixture re-checks
+                // every name and never writes misses.
                 let from_network = fixture.is_none();
                 if from_network {
                     names.retain(|n| !cache.contains_key(n));
@@ -865,8 +859,7 @@ pub fn run(cli: Cli) -> Result<()> {
                             Box::new(crate::nutrition::FixtureNutritionSource::from_path(path)?),
                             "fixture".to_string(),
                         ),
-                        // Chain providers so FoodData Central's DEMO_KEY limit
-                        // doesn't block us: fall back to keyless Open Food Facts.
+                        // Chain providers: fall back to keyless Open Food Facts.
                         None => {
                             let chain = crate::nutrition::ChainedNutritionSource::new(vec![
                                 Box::new(crate::nutrition::FdcSource::default()),
@@ -927,8 +920,7 @@ pub fn run(cli: Cli) -> Result<()> {
                                 missed += 1;
                             }
                             Err(e) => {
-                                // Rate limit means every source is spent — finish
-                                // this batch's good results, then stop.
+                                // On rate limit, finish this batch's good results, then stop.
                                 if e.downcast_ref::<crate::nutrition::RateLimited>().is_some() {
                                     eprintln!("  [{done}/{total}] ! stopping: {e:#}");
                                     rate_limited = true;
@@ -944,7 +936,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 // Remaining = names never resolved: those past the limit plus
-                // any that errored (errors are not recorded, so they retry).
+                // any that errored.
                 let remaining = names.len() - found - missed;
                 println!(
                     "Cached {found} profile(s), {missed} miss(es), {errored} error(s); \
@@ -1007,9 +999,8 @@ fn apply_scrape_outcome(store: &Store, outcome: &ScrapeOutcome, dry_run: bool) -
             skipped_dup += 1;
             continue;
         }
-        // Keep roundups / index pages / how-to guides out of the catalog — but
-        // admit an amount-sparse page that publishes usable nutrition (mirrors
-        // `prunable`, so ingest and the retroactive prune agree).
+        // Keep roundups / index pages / how-to guides out of the catalog, but
+        // admit an amount-sparse page that publishes usable nutrition.
         if prunable(recipe) {
             skipped_noncookable += 1;
             continue;
@@ -1067,11 +1058,10 @@ fn nutrition_extra(
 /// Whole-recipe macros for each recipe, plus the set whose data can't be trusted
 /// against a nutrition bound (the planner drops those when bounds are set).
 ///
-/// Prefers the source page's published macros when present and plausible — they
-/// are authoritative and complete. Otherwise falls back to the ingredient
-/// estimate, and flags a recipe low-coverage when fewer than
-/// [`crate::planning::MIN_INGREDIENT_COVERAGE`] of its estimable ingredients
-/// resolve (an understated estimate can't be checked against a constraint).
+/// Prefers the source page's published macros when present and plausible.
+/// Otherwise falls back to the ingredient estimate, and flags a recipe
+/// low-coverage when fewer than [`crate::planning::MIN_INGREDIENT_COVERAGE`] of
+/// its estimable ingredients resolve.
 fn recipe_macros_for_pool(
     recipes: &[Recipe],
     extra: &std::collections::HashMap<String, crate::domain::Macros>,
@@ -1094,10 +1084,8 @@ fn recipe_macros_for_pool(
 
         // Prefer authoritative source macros when present and internally plausible
         // (validated inside source_recipe_macros: whole-recipe detection, absolute
-        // ceilings, Atwater consistency). We deliberately do NOT cross-check against
-        // the ingredient estimate — it is unreliable in both directions (uncovered
-        // units understate it; mis-converted units can inflate it), so it can
-        // neither confirm nor refute the source.
+        // ceilings, Atwater consistency). Does not cross-check against the
+        // ingredient estimate.
         if let Some(src) = crate::nutrition::source_recipe_macros(r) {
             macros.insert(r.id.clone(), src); // authoritative; never low-coverage
         } else {
@@ -1111,9 +1099,7 @@ fn recipe_macros_for_pool(
 }
 
 /// True when a recipe should be pruned as a non-meal: it is not structurally
-/// cookable AND carries no usable source nutrition. The second clause is the
-/// sequencing guard — the source-macro bypass admits amount-sparse recipes that
-/// publish macros, so this must never delete them.
+/// cookable AND carries no usable source nutrition.
 fn prunable(recipe: &Recipe) -> bool {
     !crate::ingest::is_cookable(recipe) && crate::nutrition::source_recipe_macros(recipe).is_none()
 }
@@ -1177,8 +1163,7 @@ fn print_plan_nutrition(pn: &crate::nutrition::PlanNutrition) {
     }
     if !notes.is_empty() {
         let mut line = format!("  {}", notes.join("; "));
-        // Only suggest fetching for names a fetch could actually resolve (missing
-        // profile) — not those uncovered for lack of a gram conversion.
+        // Only suggest fetching for names a fetch could resolve (missing profile).
         if !pn.fetchable.is_empty() {
             line.push_str("; run `nutrition fetch` to resolve missing profiles");
         }
@@ -1188,8 +1173,6 @@ fn print_plan_nutrition(pn: &crate::nutrition::PlanNutrition) {
 
 /// Re-normalize every ingredient line from its stored original text.
 fn reparse_recipe(recipe: &mut Recipe) {
-    // The title doesn't pass through the ingredient parser, so clean it directly
-    // (fixes entity/curly artifacts like "S&#8217;mores Fudge").
     recipe.title = crate::text::sanitize(&recipe.title);
     for line in &mut recipe.ingredients {
         *line = crate::normalize::normalize_line(&line.original);
@@ -1206,10 +1189,9 @@ struct RefreshReport {
 }
 
 /// Re-fetch each `(existing recipe, url)` target, re-parse the HTML offline, and
-/// save the result in place — preserving the existing id and original source so
-/// the row stays refreshable. Fetches run `jobs`-concurrently (store writes stay
-/// on the calling thread). A fetch or parse failure leaves the existing row
-/// untouched.
+/// save the result in place — preserving the existing id and original source.
+/// Fetches run `jobs`-concurrently (store writes stay on the calling thread). A
+/// fetch or parse failure leaves the existing row untouched.
 fn refresh_recipes(
     store: &Store,
     fetcher: &dyn HtmlFetcher,
@@ -1259,16 +1241,13 @@ fn refresh_recipes(
             match parsed {
                 Ok(mut fresh) => {
                     // Adopt the existing identity and keep the original source URL
-                    // (JSON-LD may report a different canonical) on both the source
-                    // and the provenance field so they stay in sync; clean the
-                    // title like the import path does.
+                    // on both the source and the provenance field; clean the title.
                     fresh.title = crate::text::sanitize(&fresh.title);
                     fresh.id = existing.id.clone();
                     fresh.source = existing.source.clone();
                     fresh.meta.source_url = existing.meta.source_url.clone();
                     let category = fresh.meta.category.clone();
-                    // A single save failure shouldn't abort a long backfill; count
-                    // it and move on (updates are idempotent and re-runnable).
+                    // Count a save failure and move on.
                     match store.save_recipe(&fresh) {
                         Ok(()) => {
                             report.updated += 1;
@@ -1352,7 +1331,6 @@ fn resolve_pantry_name(store: &Store, name: &str, kind: Option<UnitKind>) -> Res
 }
 
 /// Warn when a pantry key's unit kind differs from how recipes store the same name.
-/// Shopping still bridges mass↔volume via density; this makes the trap visible.
 fn warn_kind_mismatch(store: &Store, key: &IngredientKey) -> Result<()> {
     let recipes = store.list_recipes(None)?;
     let mut recipe_kinds = HashSet::new();
@@ -1577,8 +1555,7 @@ mod tests {
             r.ingredients = ings.iter().map(|l| normalize_line(l)).collect();
             r
         };
-        // Nonsense ingredient names so only `extra` decides coverage; mass
-        // quantities so gram conversion resolves.
+        // Nonsense ingredient names with mass quantities.
         let recipes = vec![
             mk(
                 "ninety",
@@ -1614,8 +1591,8 @@ mod tests {
     #[test]
     fn recipe_macros_for_pool_prefers_source_nutrition() {
         use crate::domain::{Nutrition, RecipeId};
-        // All-nonsense ingredients → near-zero estimate coverage; but the source
-        // page carries published macros, so the recipe is trusted, not excluded.
+        // All-nonsense ingredients → near-zero estimate coverage; the source
+        // page carries published macros.
         let mut r = Recipe::new("Mystery Stew");
         r.id = RecipeId::from("stew");
         r.ingredients = ["2 cups chopped zaa", "1 clove zbb", "3 blorps zcc"]
@@ -1650,7 +1627,7 @@ mod tests {
         let mut guide = Recipe::new("How to Roast Peppers");
         guide.ingredients = vec![normalize_line("2 red bell peppers")];
         assert!(prunable(&guide));
-        // Same page, but it publishes nutrition → spared (sequencing guard).
+        // Same page, but it publishes nutrition → spared.
         guide.servings = Some(2.0);
         guide.meta.nutrition = Some(Nutrition {
             kcal: Some(50.0),
@@ -1775,7 +1752,7 @@ mod refresh_tests {
         assert_eq!(updated.meta.category.as_deref(), Some("Sauce"));
         assert_eq!(updated.id.as_str(), "id1"); // id preserved
         assert_eq!(updated.title, "Fresh Title"); // content re-parsed
-                                                  // Original source URL kept so the row stays refreshable.
+                                                  // Original source URL kept.
         assert!(matches!(updated.source, RecipeSource::Url { url } if url == "https://ex.com/a"));
     }
 

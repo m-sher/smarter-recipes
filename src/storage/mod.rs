@@ -1,7 +1,6 @@
 //! SQLite persistence for recipes, ingredients, meal plans, and pantry stock.
 //!
-//! Ingredients are deduplicated by `(normalized_name, unit_kind)` so quantities
-//! can be aggregated across recipes, plans, and the pantry.
+//! Ingredients are deduplicated by `(normalized_name, unit_kind)`.
 
 use crate::domain::{
     normalize_title_key, IngredientKey, IngredientLine, MealPlan, PantryItem, PlannedMeal, Recipe,
@@ -110,8 +109,7 @@ impl Store {
             .with_context(|| format!("opening database at {}", path.display()))?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
-        // Migrate pre-existing databases created before the nutrition column.
-        // Fails harmlessly (duplicate column) once the column is present.
+        // Add the nutrition column if missing.
         let _ = conn.execute("ALTER TABLE recipes ADD COLUMN nutrition_json TEXT", []);
         Ok(Self { conn, path })
     }
@@ -166,8 +164,7 @@ impl Store {
         let steps_json = serde_json::to_string(&recipe.steps)?;
         let meta_json = serde_json::to_string(&recipe.meta)?;
         let source_json = serde_json::to_string(&recipe.source)?;
-        // Authoritative copy of nutrition ("null" when absent), kept out of
-        // meta_json so a downgrade write cannot clobber it.
+        // Nutrition as JSON ("null" when absent).
         let nutrition_json = serde_json::to_string(&recipe.meta.nutrition)?;
 
         self.conn.execute(
@@ -237,8 +234,7 @@ impl Store {
         let steps: Vec<String> = serde_json::from_str(&steps_json)?;
         let mut meta: RecipeMeta = serde_json::from_str(&meta_json)?;
         let source: RecipeSource = serde_json::from_str(&source_json)?;
-        // The dedicated column is authoritative when present; a NULL means a
-        // pre-migration row, so fall back to whatever meta_json carried.
+        // The nutrition column overrides meta_json when present.
         if let Some(nj) = nutrition_json {
             meta.nutrition = serde_json::from_str::<Option<crate::domain::Nutrition>>(&nj)?;
         }
@@ -364,11 +360,9 @@ impl Store {
         Ok(out)
     }
 
-    /// Delete a recipe by id, also removing it from any saved plans. `plan_meals`
-    /// references `recipes(id)` without `ON DELETE CASCADE`, so a bare delete of a
-    /// planned recipe fails the foreign-key check; we clear those references first,
-    /// in one transaction, so the delete can't fail on a reference or half-apply.
-    /// `recipe_ingredients` cascade on their own. Returns whether a row existed.
+    /// Delete a recipe by id, also removing it from any saved plans. Clears
+    /// `plan_meals` references and deletes the recipe in one transaction;
+    /// `recipe_ingredients` cascade. Returns whether a row existed.
     pub fn delete_recipe(&self, id: &str) -> Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM plan_meals WHERE recipe_id = ?1", params![id])?;
@@ -489,7 +483,7 @@ impl Store {
                 if let Some((canon, _)) = line.canonical_quantity() {
                     *map.entry(key).or_insert(0.0) += canon;
                 } else {
-                    // No quantity: still register presence with 0 so planners can see overlap.
+                    // No quantity: register presence with 0.
                     map.entry(key).or_insert(0.0);
                 }
             }
@@ -499,7 +493,7 @@ impl Store {
         Ok(v)
     }
 
-    /// Record (or refresh) a URL that failed to scrape, so future runs can skip it.
+    /// Record (or refresh) a URL that failed to scrape.
     pub fn record_scrape_failure(&self, url: &str, reason: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO scrape_failures (url, reason) VALUES (?1, ?2)
@@ -509,7 +503,7 @@ impl Store {
         Ok(())
     }
 
-    /// URLs recorded as previously failed.
+    /// URLs recorded as failed.
     pub fn failed_scrape_urls(&self) -> Result<std::collections::HashSet<String>> {
         let mut stmt = self.conn.prepare("SELECT url FROM scrape_failures")?;
         let urls = stmt
@@ -518,7 +512,7 @@ impl Store {
         Ok(urls)
     }
 
-    /// Forget a recorded failure (e.g. once the URL scrapes successfully).
+    /// Forget a recorded failure.
     pub fn clear_scrape_failure(&self, url: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM scrape_failures WHERE url = ?1", params![url])?;
@@ -552,15 +546,8 @@ impl Store {
         Ok(None)
     }
 
-    /// True if a recipe with the same normalized source URL or title already exists.
-    ///
-    /// URL check (when `source_url` is `Some`) runs first; title uses
-    /// [`normalize_title_key`]. Intended for scrape/import skip-before-save.
-    /// A recipe is a duplicate when its source URL is already stored. Title is
-    /// deliberately NOT used for identity: distinct recipes that share a title
-    /// (e.g. "Banana Bread" from two different sites) must both be importable.
-    /// Same-recipe-different-URL is handled upstream by canonical-URL identity
-    /// and by not importing listing/category pages.
+    /// True if a recipe with the same normalized source URL already exists.
+    /// Title is not used for identity. A `None` source URL is never a duplicate.
     pub fn is_duplicate(&self, source_url: Option<&str>) -> Result<bool> {
         match source_url {
             Some(u) => Ok(self.find_id_by_normalized_source_url(u)?.is_some()),
@@ -669,9 +656,8 @@ impl Store {
     }
 
     /// Persist a completed restock atomically: overwrite every ledger row (rows
-    /// at ≤0 are removed) and mark the plan restocked, in one transaction. The
-    /// idempotency guard is re-checked inside the transaction so a partial
-    /// failure rolls back entirely rather than leaving stock mutated-but-unmarked.
+    /// at ≤0 are removed) and mark the plan restocked, in one transaction.
+    /// Re-checks the idempotency guard inside the transaction.
     pub fn apply_restock(&self, plan_id: &str, stock: &[crate::domain::PantryItem]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let already: i64 = tx.query_row(
@@ -788,8 +774,8 @@ mod tests {
         let id = r.id.as_str().to_string();
         store.save_recipe(&r).unwrap();
 
-        // Simulate an OLD binary rewriting meta_json without the nutrition
-        // field (leaving the dedicated column untouched).
+        // Rewrite meta_json without the nutrition field, leaving the column
+        // untouched.
         store
             .conn
             .execute(
@@ -803,7 +789,7 @@ mod tests {
         assert_eq!(n.kcal, Some(310.0));
         assert_eq!(n.carbs_g, Some(43.0));
 
-        // A pre-migration row (NULL column) falls back to meta_json's copy.
+        // A NULL nutrition column falls back to meta_json's copy.
         store
             .conn
             .execute(
@@ -823,8 +809,7 @@ mod tests {
         let r = sample_recipe("Junk Roundup", &["Dish One", "Dish Two"]);
         let id = r.id.as_str().to_string();
         store.save_recipe(&r).unwrap();
-        // A saved plan references the recipe; plan_meals has no ON DELETE CASCADE,
-        // so a naive delete would fail the foreign-key check.
+        // A saved plan references the recipe.
         let plan = MealPlan {
             id: "p1".into(),
             days: 1,
@@ -965,7 +950,7 @@ mod tests {
             .is_duplicate(Some("https://EXAMPLE.com/grilled-smores/"))
             .unwrap());
 
-        // Same title, DIFFERENT url → NOT a duplicate (distinct recipe allowed).
+        // Same title, different url → not a duplicate.
         assert!(!store.is_duplicate(Some("https://other.example/x")).unwrap());
 
         // No url → not a duplicate.

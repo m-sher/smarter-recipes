@@ -1,7 +1,4 @@
 //! Pluggable recipe ingestion sources.
-//!
-//! Add a new source by implementing [`RecipeSource`] and registering it in
-//! [`ingest_from`] / the CLI `import` command.
 
 mod crawl;
 mod file;
@@ -30,9 +27,8 @@ use crate::domain::Recipe;
 use anyhow::{bail, Result};
 use std::path::Path;
 
-/// Trait for recipe ingestion backends. Keep implementations focused on I/O;
-/// always produce a normalized [`Recipe`] (ingredient lines may still be free text
-/// that [`crate::normalize`] will parse).
+/// Trait for recipe ingestion backends. Produces a normalized [`Recipe`]
+/// (ingredient lines may be free text that [`crate::normalize`] will parse).
 pub trait RecipeSourceIngest {
     fn ingest(&self, input: &str) -> Result<Recipe>;
     fn name(&self) -> &'static str;

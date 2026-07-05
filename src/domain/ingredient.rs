@@ -41,8 +41,7 @@ pub struct ParsedIngredient {
 
 /// Stable key used to deduplicate ingredients across recipes.
 ///
-/// Identity is `(normalized_name, unit_kind)` so we can aggregate quantities
-/// of the same ingredient measured in compatible units.
+/// Identity is `(normalized_name, unit_kind)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IngredientKey {
     pub name: String,
@@ -71,7 +70,7 @@ impl IngredientKey {
 }
 
 /// Lowercase, collapse whitespace, strip trailing punctuation and leading size
-/// descriptors for identity (so "2 large eggs" aggregates with "eggs").
+/// descriptors.
 pub fn normalize_ingredient_name(name: &str) -> String {
     let s = name.trim().to_lowercase();
     let s = s.trim_end_matches(['.', ',', ';']);
@@ -91,9 +90,8 @@ pub fn normalize_ingredient_name(name: &str) -> String {
     strip_leading_descriptors(&out)
 }
 
-/// Remove leading size/quality descriptors used only for identity matching.
-/// Conservative and leading-only: words that change the ingredient itself
-/// (ground, whole, colors, brown/white, sweet, …) are intentionally excluded.
+/// Remove leading size/quality descriptors. Leading-only; words that change the
+/// ingredient itself (ground, whole, colors, brown/white, sweet, …) are excluded.
 const MULTI_DESCRIPTORS: &[&str] = &["extra large", "extra-large"];
 const SINGLE_DESCRIPTORS: &[&str] = &[
     "large", "medium", "small", "jumbo", "fresh", "ripe", "boneless", "skinless",
@@ -152,8 +150,6 @@ pub fn name_candidates(name: &str) -> Vec<String> {
 }
 
 /// True if every whitespace-separated token of `s` is a size/quality descriptor.
-/// Used to detect "skinless, boneless chicken breasts", where the noun follows a
-/// comma-separated list of descriptors rather than preceding it.
 pub fn is_all_descriptors(s: &str) -> bool {
     let s = s.trim();
     !s.is_empty()

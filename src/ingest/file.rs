@@ -173,7 +173,7 @@ fn format_qty(q: f64) -> String {
     }
 }
 
-/// Very simple plain-text format:
+/// Plain-text format:
 /// First non-empty line = title
 /// Lines after `Ingredients:` until `Steps:` / `Instructions:` = ingredient lines
 /// Rest = steps

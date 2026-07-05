@@ -182,7 +182,7 @@ impl PackageCatalog {
             c.insert(name, packs);
         }
 
-        // Kind-specific volume entries still available but density path preferred for dry goods.
+        // Kind-specific volume entries.
         c.exact.insert(
             "flour#volume".into(),
             vec![
@@ -331,7 +331,7 @@ impl PackageCatalog {
                 }
             }
         }
-        // Word-match on catalog keys (skip #kind keys here; handled above via candidates)
+        // Word-match on catalog keys (skip #kind keys here).
         let name_lc = name.to_lowercase();
         for (k, packs) in &self.exact {
             if k.contains('#') {
@@ -375,7 +375,7 @@ impl PackageCatalog {
     /// Packages and required amount in the **package** measurement space.
     ///
     /// For volume-measured dry goods with a known density, converts required ml → g
-    /// and returns mass packages so leftovers are realistic.
+    /// and returns mass packages.
     pub fn packages_for_requirement(
         &self,
         key: &IngredientKey,
@@ -418,8 +418,7 @@ impl PackageCatalog {
     /// the requirement key's canonical units for pantry storage.
     ///
     /// Density-converted dry goods are optimized and displayed in grams but the
-    /// recipe key remains volume (ml); this maps grams back to ml so stock
-    /// subtracts correctly from future requirements.
+    /// recipe key remains volume (ml); this maps grams back to ml.
     pub fn purchased_to_key_units(&self, key: &IngredientKey, purchased_display: f64) -> f64 {
         if self.uses_mass_via_density(key) {
             crate::pricing::density::mass_g_to_volume_ml(&key.name, purchased_display)
