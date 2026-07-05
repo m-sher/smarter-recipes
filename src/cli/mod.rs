@@ -768,10 +768,14 @@ pub fn run(cli: Cli) -> Result<()> {
                         .iter()
                         .filter(|r| r.id.as_str().starts_with(pfx.as_str()))
                         .collect();
-                    if v.is_empty() {
-                        bail!("no recipe matches id '{pfx}'");
+                    // Mirror resolve_recipe: a prefix must identify one recipe.
+                    match v.len() {
+                        0 => bail!("no recipe matches id '{pfx}'"),
+                        1 => v,
+                        n => bail!(
+                            "ambiguous recipe id prefix '{pfx}' matches {n} recipes; use a longer prefix or --all"
+                        ),
                     }
-                    v
                 }
                 (false, None) => bail!("provide a recipe id or --all"),
             };
@@ -794,9 +798,13 @@ pub fn run(cli: Cli) -> Result<()> {
                 let report = refresh_recipes(&store, &fetcher, &targets, jobs.max(1), true)?;
                 println!(
                     "Refreshed {} recipe(s) ({} now carry a category); \
-                     {} fetch failure(s), {} parse failure(s), \
+                     {} fetch failure(s), {} parse failure(s), {} save failure(s), \
                      {skipped_non_url} without a source URL skipped.",
-                    report.updated, report.with_category, report.fetch_failed, report.parse_failed,
+                    report.updated,
+                    report.with_category,
+                    report.fetch_failed,
+                    report.parse_failed,
+                    report.save_failed,
                 );
             } else {
                 println!(
@@ -1194,6 +1202,7 @@ struct RefreshReport {
     with_category: usize,
     fetch_failed: usize,
     parse_failed: usize,
+    save_failed: usize,
 }
 
 /// Re-fetch each `(existing recipe, url)` target, re-parse the HTML offline, and
@@ -1250,22 +1259,41 @@ fn refresh_recipes(
             match parsed {
                 Ok(mut fresh) => {
                     // Adopt the existing identity and keep the original source URL
-                    // (JSON-LD may report a different canonical); clean the title
-                    // like the import path does.
+                    // (JSON-LD may report a different canonical) on both the source
+                    // and the provenance field so they stay in sync; clean the
+                    // title like the import path does.
                     fresh.title = crate::text::sanitize(&fresh.title);
                     fresh.id = existing.id.clone();
                     fresh.source = existing.source.clone();
+                    fresh.meta.source_url = existing.meta.source_url.clone();
                     let category = fresh.meta.category.clone();
-                    store.save_recipe(&fresh)?;
-                    report.updated += 1;
-                    if category.is_some() {
-                        report.with_category += 1;
-                    }
-                    if verbose {
-                        match &category {
-                            Some(c) => eprintln!("  [{done}/{total}] + {}  [{c}]", fresh.title),
-                            None => {
-                                eprintln!("  [{done}/{total}] + {}  (no category)", fresh.title)
+                    // A single save failure shouldn't abort a long backfill; count
+                    // it and move on (updates are idempotent and re-runnable).
+                    match store.save_recipe(&fresh) {
+                        Ok(()) => {
+                            report.updated += 1;
+                            if category.is_some() {
+                                report.with_category += 1;
+                            }
+                            if verbose {
+                                match &category {
+                                    Some(c) => {
+                                        eprintln!("  [{done}/{total}] + {}  [{c}]", fresh.title)
+                                    }
+                                    None => eprintln!(
+                                        "  [{done}/{total}] + {}  (no category)",
+                                        fresh.title
+                                    ),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            report.save_failed += 1;
+                            if verbose {
+                                eprintln!(
+                                    "  [{done}/{total}] ! save failed: {} ({e:#})",
+                                    fresh.title
+                                );
                             }
                         }
                     }

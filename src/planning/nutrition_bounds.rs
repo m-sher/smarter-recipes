@@ -92,6 +92,17 @@ fn category_key(s: &str) -> String {
     crate::domain::normalize_title_key(s)
 }
 
+/// Expand a config list into normalized match tokens. Each entry may itself be
+/// comma-joined (e.g. a copy-pasted `"Main Course, Sauce"`), mirroring how a
+/// recipe's category is stored, so a comma inside one string is not a dead rule.
+fn expand_tokens(list: &[String]) -> Vec<String> {
+    list.iter()
+        .flat_map(|e| e.split(','))
+        .map(category_key)
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 /// Category-based pool filter: keep standalone meals, drop components (sauces,
 /// dressings, condiments) by their schema.org `recipeCategory`
 /// ([`crate::domain::RecipeMeta::category`]).
@@ -123,18 +134,21 @@ impl CategoryFilter {
             (&self.whitelist, "whitelist"),
             (&self.blacklist, "blacklist"),
         ] {
-            if list.iter().any(|e| category_key(e).is_empty()) {
+            if list
+                .iter()
+                .any(|e| e.split(',').all(|t| category_key(t).is_empty()))
+            {
                 bail!("category.{label}: entries must be non-empty");
             }
         }
-        for w in &self.whitelist {
-            let wk = category_key(w);
-            if self.blacklist.iter().any(|b| category_key(b) == wk) {
-                bail!(
-                    "category: '{}' appears in both whitelist and blacklist",
-                    w.trim()
-                );
-            }
+        // Compare at the token level so a category can't be both required and
+        // forbidden, even when an entry bundles several comma-joined values.
+        let black = expand_tokens(&self.blacklist);
+        if let Some(dup) = expand_tokens(&self.whitelist)
+            .iter()
+            .find(|t| black.contains(t))
+        {
+            bail!("category: '{dup}' appears in both whitelist and blacklist");
         }
         Ok(())
     }
@@ -149,18 +163,13 @@ impl CategoryFilter {
             .map(category_key)
             .filter(|t| !t.is_empty())
             .collect();
-        if self
-            .blacklist
-            .iter()
-            .any(|b| tokens.contains(&category_key(b)))
-        {
+        let black = expand_tokens(&self.blacklist);
+        if tokens.iter().any(|t| black.contains(t)) {
             return false;
         }
         if !self.whitelist.is_empty() {
-            return self
-                .whitelist
-                .iter()
-                .any(|w| tokens.contains(&category_key(w)));
+            let white = expand_tokens(&self.whitelist);
+            return tokens.iter().any(|t| white.contains(t));
         }
         true
     }
@@ -726,6 +735,24 @@ mod tests {
         };
         assert!(!f.allows(Some("Main Course, Sauce"))); // both tokens -> excluded
         assert!(f.allows(Some("Main Course")));
+    }
+
+    #[test]
+    fn category_config_entry_may_bundle_comma_values() {
+        // A single comma-joined string counts as multiple tokens, not a dead rule.
+        let f = CategoryFilter {
+            blacklist: vec!["Sauce, Dip".into()],
+            ..Default::default()
+        };
+        assert!(!f.allows(Some("Sauce")));
+        assert!(!f.allows(Some("Dip")));
+        assert!(f.allows(Some("Main Course")));
+        // Overlap is still caught at the token level.
+        let overlap = CategoryFilter {
+            whitelist: vec!["Main Course, Sauce".into()],
+            blacklist: vec!["sauce".into()],
+        };
+        assert!(overlap.validate().is_err());
     }
 
     #[test]
