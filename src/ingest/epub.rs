@@ -893,8 +893,11 @@ fn recipe_from_source_lines(lines: &[SourceLine], title_override: &str) -> Recip
 
 /// Choose ingredient lines from the pre-header buffer.
 ///
-/// - If any [`LineKind::ListItem`] is present: keep **only** list items (HTML
-///   `<li>` / `.ingredient`). Leading/trailing paragraphs are headnotes/notes.
+/// - If any [`LineKind::ListItem`] is present: keep **list items** and also
+///   **paragraphs that look like measured ingredients** (unit token or leading
+///   quantity). Prose paragraphs (headnotes / asides without amounts) are
+///   dropped. This handles mixed/inverted markup where real ingredients are
+///   `<p>2 cups flour</p>` while a tip lives in a stray `<li>`.
 /// - Otherwise (plain text or all-paragraph HTML): fall back to stripping
 ///   leading sentence-shaped prose.
 fn promote_pre_header_as_ingredients(lines: &[SourceLine]) -> Vec<String> {
@@ -902,7 +905,11 @@ fn promote_pre_header_as_ingredients(lines: &[SourceLine]) -> Vec<String> {
     if has_list {
         return lines
             .iter()
-            .filter(|l| l.kind == LineKind::ListItem)
+            .filter(|l| match l.kind {
+                LineKind::ListItem => true,
+                LineKind::Paragraph | LineKind::Plain => looks_like_measured_ingredient(&l.text),
+                LineKind::Heading => false,
+            })
             .map(|l| l.text.clone())
             .collect();
     }
@@ -912,6 +919,12 @@ fn promote_pre_header_as_ingredients(lines: &[SourceLine]) -> Vec<String> {
         .map(|l| l.text.clone())
         .collect();
     strip_leading_headnote_lines(&texts)
+}
+
+/// Paragraph/plain line that carries a measure or leading quantity — treat as
+/// an ingredient even when list items also exist in the buffer.
+fn looks_like_measured_ingredient(line: &str) -> bool {
+    has_measure_unit_token(line) || starts_with_quantity_token(line)
 }
 
 /// Text-shape fallback: drop leading sentence-shaped headnote lines.
@@ -1321,6 +1334,57 @@ mod tests {
                 .iter()
                 .map(|i| &i.original)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mixed_list_tip_and_paragraph_ingredients_kept() {
+        // Round-7: list-only promote dropped measured `<p>` ingredients when a
+        // stray tip `<li>` made has_list true.
+        let html = r#"
+          <h1>Pancakes</h1>
+          <p>A weekend treat with a tip:</p>
+          <ul><li>Use fresh berries if you can</li></ul>
+          <p>2 cups flour</p>
+          <p>1 egg</p>
+          <p>1 cup milk</p>
+          <h2>Method</h2>
+          <ol><li>Mix and griddle.</li></ol>
+        "#;
+        let r = recipe_from_html(html, "Pancakes");
+        let ings: Vec<_> = r.ingredients.iter().map(|i| i.original.as_str()).collect();
+        assert!(
+            is_cookable(&r),
+            "mixed p-ingredients must stay cookable: {ings:?}"
+        );
+        assert!(
+            ings.iter().any(|i| i.contains("flour")),
+            "measured paragraph flour dropped: {ings:?}"
+        );
+        assert!(
+            ings.iter().any(|i| i.contains("egg")),
+            "measured paragraph egg dropped: {ings:?}"
+        );
+        assert!(
+            ings.iter().any(|i| i.contains("milk")),
+            "measured paragraph milk dropped: {ings:?}"
+        );
+        assert!(
+            !ings
+                .iter()
+                .any(|i| i.to_lowercase().contains("weekend treat")),
+            "prose headnote leaked: {ings:?}"
+        );
+        // Tip list item may still be present (list items are kept); real ingredients must not be lost.
+        assert!(
+            r.ingredients
+                .iter()
+                .filter(|i| {
+                    let o = i.original.to_lowercase();
+                    o.contains("flour") || o.contains("egg") || o.contains("milk")
+                })
+                .count()
+                >= 3
         );
     }
 
