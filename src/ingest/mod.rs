@@ -18,7 +18,7 @@ pub use epub::ingest_epub;
 pub use file::FileSource;
 pub use manual::read_manual_recipe;
 pub use ocr::ImageOcrSource;
-pub use quality::is_cookable;
+pub use quality::{is_cookable, text_has_amount};
 pub use search::{
     duckduckgo_search_url, parse_duckduckgo_results, search_result_urls, search_scrape_recipes,
     unwrap_ddg_redirect,

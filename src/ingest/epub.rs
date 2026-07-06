@@ -4,7 +4,7 @@
 //! segment HTML by fragment/spine order → Ingredients/Steps heuristics →
 //! [`Recipe`] values filtered by [`super::is_cookable`].
 
-use super::{epub_source_key_for_resolved, is_cookable, resolve_epub_path};
+use super::{epub_source_key_for_resolved, is_cookable, resolve_epub_path, text_has_amount};
 use crate::domain::{Recipe, RecipeMeta, RecipeSource};
 use crate::normalize::normalize_line;
 use crate::text::sanitize;
@@ -642,14 +642,9 @@ fn element_lines(html: &str) -> Vec<String> {
             let has_block_child = el
                 .children()
                 .filter_map(|n| n.value().as_element())
-                .any(|e| {
-                    matches!(
-                        e.name(),
-                        "h1" | "h2" | "h3" | "h4" | "p" | "li" | "ul" | "ol" | "div"
-                    )
-                });
-            // With nested blocks (e.g. `<li>text<ul>…`), take only this node's own
-            // text so nested selected children still contribute their lines.
+                .any(|e| is_block_level_name(e.name()));
+            // With nested blocks (e.g. `<li>text<ul>…`), take this node's text plus
+            // inline descendants; nested blocks are selected separately.
             let t = if has_block_child {
                 element_own_text(el)
             } else {
@@ -675,18 +670,63 @@ fn element_lines(html: &str) -> Vec<String> {
     lines
 }
 
-/// Direct text-node content of an element (excludes nested element text).
+/// Text for a block that also has nested block children: include this node's
+/// text and **inline** descendants (e.g. `<i>sifted</i>`), but stop at nested
+/// **block** elements (those are selected / emitted separately).
 fn element_own_text(el: ElementRef<'_>) -> String {
     let mut parts = Vec::new();
+    collect_inline_text(el, &mut parts);
+    sanitize(&parts.join(" "))
+}
+
+fn is_block_level_name(name: &str) -> bool {
+    matches!(
+        name,
+        "h1" | "h2"
+            | "h3"
+            | "h4"
+            | "p"
+            | "li"
+            | "ul"
+            | "ol"
+            | "div"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tr"
+            | "td"
+            | "th"
+            | "section"
+            | "article"
+            | "blockquote"
+            | "pre"
+            | "hr"
+            | "figure"
+            | "figcaption"
+    )
+}
+
+fn collect_inline_text(el: ElementRef<'_>, parts: &mut Vec<String>) {
     for child in el.children() {
         if let Some(t) = child.value().as_text() {
-            let s = t.trim();
-            if !s.is_empty() {
-                parts.push(s);
+            // Preserve internal spaces; only skip pure whitespace nodes.
+            if !t.trim().is_empty() {
+                parts.push(t.to_string());
             }
+            continue;
+        }
+        let Some(elem) = child.value().as_element() else {
+            continue;
+        };
+        if is_block_level_name(elem.name()) {
+            // Nested block is handled by its own selector pass.
+            continue;
+        }
+        // Inline (or unknown non-block) element: take its visible text tree.
+        if let Some(child_el) = ElementRef::wrap(child) {
+            collect_inline_text(child_el, parts);
         }
     }
-    sanitize(&parts.join(" "))
 }
 
 fn strip_tags(html: &str) -> String {
@@ -710,24 +750,21 @@ fn html_visible_len(html: &str) -> usize {
 
 /// Same structure as file plain-text import.
 ///
-/// **Headnotes:** prose before the first Ingredients/Steps header is *not* stored
-/// as ingredients. Cookbook headnotes are common; treating them as ingredients
-/// pollutes the list and can push `is_cookable` under its amount ratio (silent drop).
-///
-/// **Headerless fallback:** if the document never declares **either** an
-/// Ingredients **or** a Steps/Method section, pre-header body lines are treated
-/// as the ingredient list (legacy plain-text behaviour for simple lists). If a
-/// Steps/Method header appears without an Ingredients header, the pre-header
-/// buffer is discarded rather than flushed — otherwise headnotes would leak into
-/// the ingredient list (title → headnote → bullets → `Method:`).
+/// **Headnotes:** prose before the first Ingredients header is not stored as
+/// ingredients. When the body is promoted to ingredients (no `Ingredients:`
+/// section — either headerless, or Steps/Method/Directions only), leading
+/// non-amount lines are stripped up to the first amount-bearing line (same
+/// heuristic as [`text_has_amount`] / `is_cookable`). That keeps common
+/// cookbook layouts like *title → bullets → Directions:* cookable while
+/// dropping leading headnote prose.
 pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
     let mut title = title_override.to_string();
     let mut ingredients = Vec::new();
     let mut steps = Vec::new();
     let mut section = "title";
     let mut saw_ingredients_header = false;
-    let mut saw_steps_header = false;
-    // Buffered only; discarded when any Ingredients/Steps header is seen (headnotes).
+    // Buffered body before Ingredients/Steps; may become ingredients when no
+    // Ingredients: section is declared (with leading headnote stripped).
     let mut pre_header_body: Vec<String> = Vec::new();
 
     for line in text.lines() {
@@ -747,7 +784,6 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
             || lower.starts_with("directions")
         {
             section = "steps";
-            saw_steps_header = true;
             continue;
         }
         match section {
@@ -766,30 +802,33 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
                     .to_string(),
             ),
             _ => {
-                // Headnote / ambiguous body before Ingredients/Steps — buffer only.
+                // Headnote / ingredient bullets before headers — buffer only.
                 pre_header_body.push(t.trim_start_matches(['-', '*', '•']).to_string());
             }
         }
     }
 
-    // Truly headerless only: flush buffered body as ingredients. If either an
-    // Ingredients or a Steps/Method header was seen, the buffer is discarded so
-    // headnotes cannot leak (including the Steps-only case).
-    if !saw_ingredients_header
-        && !saw_steps_header
-        && ingredients.is_empty()
-        && !pre_header_body.is_empty()
-    {
-        ingredients = pre_header_body
-            .into_iter()
-            .map(|line| normalize_line(&line))
-            .collect();
+    // No Ingredients: section → promote buffered body, stripping leading headnote
+    // prose (non-amount lines before the first amount-bearing line). Covers both
+    // headerless lists and title → [headnote] → bullets → Method/Directions.
+    if !saw_ingredients_header && ingredients.is_empty() && !pre_header_body.is_empty() {
+        let kept = strip_leading_headnote_lines(&pre_header_body);
+        ingredients = kept.into_iter().map(normalize_line).collect();
     }
 
     let mut recipe = Recipe::new(sanitize(&title));
     recipe.ingredients = ingredients;
     recipe.steps = steps;
     recipe
+}
+
+/// Drop leading non-amount prose until the first amount-bearing line; keep the rest.
+/// If no line has an amount signal, keep all lines (cannot find a headnote boundary).
+fn strip_leading_headnote_lines(lines: &[String]) -> Vec<&str> {
+    match lines.iter().position(|l| text_has_amount(l)) {
+        Some(i) => lines[i..].iter().map(String::as_str).collect(),
+        None => lines.iter().map(String::as_str).collect(),
+    }
 }
 
 fn normalize_title_key(s: &str) -> String {
@@ -984,11 +1023,9 @@ mod tests {
     }
 
     #[test]
-    fn headnote_not_flushed_when_only_method_header() {
-        // title → headnote → bulleted-looking body → Method: (no Ingredients:).
-        // Previously the Steps-only path flushed the whole pre-header buffer as
-        // ingredients, so the headnote leaked. Buffer is discarded when any
-        // section header was seen (Ingredients or Steps/Method).
+    fn method_only_keeps_ingredients_strips_headnote() {
+        // title → headnote → bulleted ingredients → Method: (no Ingredients:).
+        // Must keep amount-bearing bullets and exclude leading headnote prose.
         let text = "\
 Tomato Soup
 A quick weeknight soup.
@@ -1000,6 +1037,15 @@ Simmer everything.
 ";
         let r = plain_recipe_from_text(text, "Tomato Soup");
         assert!(
+            is_cookable(&r),
+            "Method-only recipe must stay cookable: ings={:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(r.ingredients.len(), 3);
+        assert!(
             !r.ingredients
                 .iter()
                 .any(|i| i.original.to_lowercase().contains("weeknight")),
@@ -1009,12 +1055,69 @@ Simmer everything.
                 .map(|i| &i.original)
                 .collect::<Vec<_>>()
         );
+        assert!(r
+            .ingredients
+            .iter()
+            .any(|i| i.original.contains("tomatoes")));
         assert_eq!(r.steps.len(), 1);
         assert!(r.steps[0].contains("Simmer"));
-        // No Ingredients: section ⇒ pre-header not promoted (avoids headnote leak).
+    }
+
+    #[test]
+    fn directions_only_html_imports_ingredients() {
+        // Reproduces the round-4 regression: no Ingredients heading.
+        let html = r#"
+          <section id="soup">
+            <h1>Tomato Soup</h1>
+            <ul>
+              <li>2 cups tomatoes</li>
+              <li>1 cup stock</li>
+              <li>1 tbsp olive oil</li>
+            </ul>
+            <h2>Directions</h2>
+            <ol>
+              <li>Simmer everything.</li>
+            </ol>
+          </section>
+        "#;
+        let text = html_to_recipe_text(html, "Tomato Soup");
+        let r = plain_recipe_from_text(&text, "Tomato Soup");
         assert!(
-            r.ingredients.is_empty(),
-            "expected empty ingredients without Ingredients header, got {:?}",
+            is_cookable(&r),
+            "Directions-only HTML must import: ings={:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(r.ingredients.len(), 3);
+        assert_eq!(r.steps.len(), 1);
+    }
+
+    #[test]
+    fn headerless_strips_leading_headnote_keeps_amounts() {
+        let text = "\
+Simple Salad
+A bright summer side for picnics.
+2 cups lettuce
+1 cup tomatoes
+1 tbsp oil
+";
+        let r = plain_recipe_from_text(text, "Simple Salad");
+        assert!(
+            is_cookable(&r),
+            "headerless with headnote must stay cookable: ings={:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(r.ingredients.len(), 3);
+        assert!(
+            !r.ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("picnic")),
+            "headnote leaked: {:?}",
             r.ingredients
                 .iter()
                 .map(|i| &i.original)
@@ -1032,6 +1135,26 @@ Simmer everything.
         );
         assert!(
             lines.iter().any(|l| l.contains("preferably sifted")),
+            "nested li text lost: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn element_lines_keeps_inline_markup_with_nested_blocks() {
+        // Mixed inline + block: must not drop <i>sifted</i> when skipping nested <ul>.
+        let html = r#"<li>2 cups <i>sifted</i> flour<ul><li>optional note</li></ul></li>"#;
+        let lines = element_lines(html);
+        let outer = lines
+            .iter()
+            .find(|l| l.contains("flour") || l.contains("sifted"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            outer.contains("sifted") && outer.contains("flour") && outer.contains("2 cups"),
+            "inline text lost in mixed node: lines={lines:?}, outer={outer:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("optional note")),
             "nested li text lost: {lines:?}"
         );
     }

@@ -22,13 +22,20 @@ static RE_STANDALONE_NUMBER: Lazy<Regex> =
 static RE_GLUED_UNIT: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\b\d[\d.,/]*(?:g|kg|mg|ml|oz|lb|tsp|tbsp)\b").expect("glued re"));
 
+/// Whether raw text carries a real numeric amount (same rule as cookable checks).
+///
+/// Used by EPUB headnote stripping: drop leading non-amount prose until the first
+/// amount-bearing line, then keep the rest as candidate ingredients.
+pub fn text_has_amount(text: &str) -> bool {
+    text.chars().any(|c| VULGAR_FRACTIONS.contains(&c))
+        || RE_STANDALONE_NUMBER.is_match(text)
+        || RE_GLUED_UNIT.is_match(text)
+}
+
 /// Whether an ingredient line carries a real numeric amount. Reads the raw text,
 /// not the parser's `quantity`.
 fn line_has_amount(line: &crate::domain::IngredientLine) -> bool {
-    let o = &line.original;
-    o.chars().any(|c| VULGAR_FRACTIONS.contains(&c))
-        || RE_STANDALONE_NUMBER.is_match(o)
-        || RE_GLUED_UNIT.is_match(o)
+    text_has_amount(&line.original)
 }
 
 /// True when a recipe looks like a real, cookable dish rather than a roundup,
