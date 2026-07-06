@@ -4,7 +4,7 @@
 //! segment HTML by fragment/spine order → Ingredients/Steps heuristics →
 //! [`Recipe`] values filtered by [`super::is_cookable`].
 
-use super::{epub_source_key, is_cookable};
+use super::{epub_source_key_for_resolved, is_cookable, resolve_epub_path};
 use crate::domain::{Recipe, RecipeMeta, RecipeSource};
 use crate::normalize::normalize_line;
 use crate::text::sanitize;
@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use epub::doc::EpubDoc;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::path::{Component, Path, PathBuf};
@@ -43,6 +43,9 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
         );
     }
 
+    // Canonicalize once per book — every recipe identity key shares this path.
+    let resolved_epub_path = resolve_epub_path(path);
+
     let spine_order = spine_path_order(&doc);
     let mut by_path: HashMap<String, Vec<IndexEntry>> = HashMap::new();
     for e in entries {
@@ -57,6 +60,7 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
     let mut seen_href: HashSet<String> = HashSet::new();
     let mut missing_resources = 0usize;
     let mut loaded_any = false;
+    let mut skipped_unresolved = 0usize;
 
     for res_path in path_keys {
         let mut group = by_path.remove(&res_path).unwrap_or_default();
@@ -69,9 +73,16 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
         };
         loaded_any = true;
         // Order entries by first occurrence of fragment in HTML (unresolved last).
-        group.sort_by_key(|e| fragment_offset(&html, e.fragment.as_deref()).unwrap_or(usize::MAX));
+        // Cached key so fragment_offset runs once per entry, not O(n log n) times.
+        group.sort_by_cached_key(|e| {
+            fragment_offset(&html, e.fragment.as_deref()).unwrap_or(usize::MAX)
+        });
 
+        let entry_count = group.len();
         let segments = segment_html(&html, &group);
+        if segments.len() < entry_count {
+            skipped_unresolved += entry_count - segments.len();
+        }
         for (entry, segment_html) in segments {
             // Dedup by locator (path+fragment/href), not display title — cookbooks
             // often reuse titles like "Vinaigrette".
@@ -83,11 +94,18 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
             if !seen_href.insert(loc_key) {
                 continue;
             }
-            let recipe = html_segment_to_recipe(&entry, &segment_html, path);
+            let recipe = html_segment_to_recipe(&entry, &segment_html, path, &resolved_epub_path);
             if is_cookable(&recipe) {
                 out.push(recipe);
             }
         }
+    }
+
+    if skipped_unresolved > 0 {
+        eprintln!(
+            "note: skipped {skipped_unresolved} EPUB index entr{} with unresolved fragment anchors",
+            if skipped_unresolved == 1 { "y" } else { "ies" }
+        );
     }
 
     if !loaded_any && missing_resources > 0 {
@@ -144,9 +162,7 @@ fn find_index_path<R: Read + Seek>(doc: &mut EpubDoc<R>) -> Option<String> {
         .into_iter()
         .filter(|np| {
             let label = np.label.to_lowercase();
-            label.contains("recipe index")
-                || label == "index"
-                || label.contains("index of recipes")
+            label.contains("recipe index") || label == "index" || label.contains("index of recipes")
         })
         .map(|np| {
             let path = path_to_string(&np.content);
@@ -204,7 +220,10 @@ fn best_index_scan<R: Read + Seek>(doc: &mut EpubDoc<R>) -> Option<Vec<IndexEntr
         }
         let text_len = html_visible_len(&html);
         // Prefer many links with relatively little body text.
-        let score = entries.len().saturating_mul(1000).saturating_sub(text_len / 20);
+        let score = entries
+            .len()
+            .saturating_mul(1000)
+            .saturating_sub(text_len / 20);
         if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
             best = Some((score, entries));
         }
@@ -312,11 +331,10 @@ pub fn parse_index_entries(html: &str, base_path: &str) -> Vec<IndexEntry> {
 }
 
 fn is_noise_title(title: &str) -> bool {
+    // Single-line pattern: raw-string `\`+newline is literal, not a continuation.
     static NOISE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
-            r"(?i)^(cover|title page|copyright|contents|table of contents|toc|acknowledg|\
-foreword|preface|introduction|about the author|bibliography|glossary|notes?|\
-dedication|half title|also by|colophon)s?$",
+            r"(?i)^(cover|title page|copyright|contents|table of contents|toc|acknowledgements?|acknowledgments?|foreword|preface|introduction|about the author|bibliography|glossary|notes?|dedication|half title|also by|colophon)s?$",
         )
         .expect("noise re")
     });
@@ -331,7 +349,14 @@ dedication|half title|also by|colophon)s?$",
 pub fn resolve_href(base_path: &str, href: &str) -> (String, Option<String>) {
     let href = href.trim();
     let (path_part, fragment) = match href.split_once('#') {
-        Some((p, f)) => (p, if f.is_empty() { None } else { Some(f.to_string()) }),
+        Some((p, f)) => (
+            p,
+            if f.is_empty() {
+                None
+            } else {
+                Some(f.to_string())
+            },
+        ),
         None => (href, None),
     };
     if path_part.is_empty() {
@@ -392,19 +417,91 @@ fn spine_path_order<R: Read + Seek>(doc: &EpubDoc<R>) -> HashMap<String, usize> 
     m
 }
 
-/// Byte offset of an element id/name attribute with an **exact** fragment value.
-/// Avoids prefix false-positives (`id="a"` matching inside `id="apple"`).
+/// Byte offset of an element `id`/`name` attribute with an **exact** fragment value.
+///
+/// - No per-call `Regex::new` (used inside sorts / multi-entry segmentation).
+/// - Avoids prefix false-positives (`id="a"` matching inside `id="apple"`).
+/// - Avoids `data-id` / `xml:id` false matches (attr name must be a full token).
 fn fragment_offset(html: &str, fragment: Option<&str>) -> Option<usize> {
-    let frag = fragment?;
-    if frag.is_empty() {
+    let frag = fragment.filter(|f| !f.is_empty())?;
+    find_attr_value_offset(html, "id", frag).or_else(|| find_attr_value_offset(html, "name", frag))
+}
+
+/// Find `attr="value"` / `attr='value'` / `attr=value` (ASCII case-insensitive attr name).
+fn find_attr_value_offset(html: &str, attr: &str, value: &str) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let attr_bytes = attr.as_bytes();
+    if attr_bytes.is_empty() || bytes.len() < attr_bytes.len() {
         return None;
     }
-    let escaped = regex::escape(frag);
-    let re = Regex::new(&format!(
-        r#"(?i)\b(?:id|name)\s*=\s*(?:["']{escaped}["']|{escaped}\b)"#
-    ))
-    .ok()?;
-    re.find(html).map(|m| m.start())
+    let mut i = 0;
+    while i + attr_bytes.len() <= bytes.len() {
+        if !eq_ascii_ignore_case_prefix(&bytes[i..], attr_bytes) {
+            i += 1;
+            continue;
+        }
+        // Full attribute-name token: reject `data-id`, `xml:id`, `my_id`, etc.
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-' || prev == b':' {
+                i += 1;
+                continue;
+            }
+        }
+        let mut j = i + attr_bytes.len();
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'=' {
+            i += 1;
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let matched = match bytes[j] {
+            b'"' => {
+                let end = memchr_byte(bytes, j + 1, b'"')?;
+                &html[j + 1..end]
+            }
+            b'\'' => {
+                let end = memchr_byte(bytes, j + 1, b'\'')?;
+                &html[j + 1..end]
+            }
+            _ => {
+                let start = j;
+                while j < bytes.len()
+                    && !bytes[j].is_ascii_whitespace()
+                    && bytes[j] != b'>'
+                    && bytes[j] != b'/'
+                {
+                    j += 1;
+                }
+                &html[start..j]
+            }
+        };
+        if matched == value {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn eq_ascii_ignore_case_prefix(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len()
+        && hay[..needle.len()]
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn memchr_byte(bytes: &[u8], from: usize, b: u8) -> Option<usize> {
+    bytes[from..].iter().position(|&c| c == b).map(|p| from + p)
 }
 
 /// Split HTML into per-entry segments using fragment anchors.
@@ -451,7 +548,12 @@ pub fn segment_html(html: &str, entries: &[IndexEntry]) -> Vec<(IndexEntry, Stri
     out
 }
 
-fn html_segment_to_recipe(entry: &IndexEntry, segment_html: &str, epub_path: &str) -> Recipe {
+fn html_segment_to_recipe(
+    entry: &IndexEntry,
+    segment_html: &str,
+    epub_path: &str,
+    resolved_epub_path: &str,
+) -> Recipe {
     let text = html_to_recipe_text(segment_html, &entry.title);
     let mut recipe = plain_recipe_from_text(&text, &entry.title);
     recipe.source = RecipeSource::Epub {
@@ -461,29 +563,25 @@ fn html_segment_to_recipe(entry: &IndexEntry, segment_html: &str, epub_path: &st
     recipe.meta = RecipeMeta {
         notes: Some(format!("Imported from EPUB index entry: {}", entry.href)),
         // Query form — fragments would be stripped by normalize_url dedup.
-        source_url: Some(epub_source_key(epub_path, &entry.href)),
+        // Path component reused from a single canonicalize per book.
+        source_url: Some(epub_source_key_for_resolved(
+            resolved_epub_path,
+            &entry.href,
+        )),
         ..Default::default()
     };
     recipe
 }
 
 /// Convert a recipe HTML fragment into plain text with Ingredients:/Steps: markers.
+///
+/// Index/`fallback_title` is the recipe title (always set for index-driven import).
+/// Pre-header prose (headnotes) is kept in the body section of the text;
+/// [`plain_recipe_from_text`] discards it once an Ingredients/Steps header appears.
 pub fn html_to_recipe_text(html: &str, fallback_title: &str) -> String {
-    let document = Html::parse_fragment(html);
-    let mut title = fallback_title.to_string();
-    if let Ok(h_sel) = Selector::parse("h1, h2, h3") {
-        if let Some(h) = document.select(&h_sel).next() {
-            let t = sanitize(&h.text().collect::<String>());
-            let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !t.is_empty() && !is_section_header(&t) {
-                title = t;
-            }
-        }
-    }
-
     let body_text = element_lines(html);
     let mut out = Vec::new();
-    out.push(title);
+    out.push(fallback_title.to_string());
     let mut section = "body";
     for line in body_text {
         let lower = line.to_lowercase();
@@ -497,23 +595,13 @@ pub fn html_to_recipe_text(html: &str, fallback_title: &str) -> String {
             section = "steps";
             continue;
         }
-        // Skip repeating the title line.
+        // Skip repeating the title line (common when the heading is also in body text).
         if section == "body" && normalize_title_key(&line) == normalize_title_key(fallback_title) {
             continue;
         }
-        if section == "body" {
-            // Before any header: treat non-header lines as potential ingredients later via body mode.
-            out.push(line);
-        } else {
-            out.push(line);
-        }
+        out.push(line);
     }
     out.join("\n")
-}
-
-fn is_section_header(t: &str) -> bool {
-    let l = t.to_lowercase();
-    is_ingredients_header(&l) || is_steps_header(&l)
 }
 
 fn is_ingredients_header(lower: &str) -> bool {
@@ -547,16 +635,10 @@ fn element_lines(html: &str) -> Vec<String> {
     let document = Html::parse_fragment(html);
     let mut lines = Vec::new();
     // Walk block-ish elements.
-    if let Ok(sel) = Selector::parse("h1, h2, h3, h4, p, li, dt, dd, div.ingredient, span.ingredient")
+    if let Ok(sel) =
+        Selector::parse("h1, h2, h3, h4, p, li, dt, dd, div.ingredient, span.ingredient")
     {
         for el in document.select(&sel) {
-            // Skip empty / whitespace-only.
-            let t = sanitize(&el.text().collect::<String>());
-            let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
-            if t.is_empty() {
-                continue;
-            }
-            // Avoid mega nested duplicates: skip if this element has block children we also select.
             let has_block_child = el
                 .children()
                 .filter_map(|n| n.value().as_element())
@@ -566,7 +648,15 @@ fn element_lines(html: &str) -> Vec<String> {
                         "h1" | "h2" | "h3" | "h4" | "p" | "li" | "ul" | "ol" | "div"
                     )
                 });
-            if has_block_child {
+            // With nested blocks (e.g. `<li>text<ul>…`), take only this node's own
+            // text so nested selected children still contribute their lines.
+            let t = if has_block_child {
+                element_own_text(el)
+            } else {
+                sanitize(&el.text().collect::<String>())
+            };
+            let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            if t.is_empty() {
                 continue;
             }
             lines.push(t);
@@ -583,6 +673,20 @@ fn element_lines(html: &str) -> Vec<String> {
         }
     }
     lines
+}
+
+/// Direct text-node content of an element (excludes nested element text).
+fn element_own_text(el: ElementRef<'_>) -> String {
+    let mut parts = Vec::new();
+    for child in el.children() {
+        if let Some(t) = child.value().as_text() {
+            let s = t.trim();
+            if !s.is_empty() {
+                parts.push(s);
+            }
+        }
+    }
+    sanitize(&parts.join(" "))
 }
 
 fn strip_tags(html: &str) -> String {
@@ -605,11 +709,22 @@ fn html_visible_len(html: &str) -> usize {
 }
 
 /// Same structure as file plain-text import.
+///
+/// **Headnotes:** prose before the first Ingredients/Steps header is *not* stored
+/// as ingredients. Cookbook headnotes are common; treating them as ingredients
+/// pollutes the list and can push `is_cookable` under its amount ratio (silent drop).
+///
+/// **Headerless fallback:** if the document never declares Ingredients or Steps
+/// sections, pre-header body lines are treated as the ingredient list (legacy
+/// plain-text behaviour for simple lists).
 pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
     let mut title = title_override.to_string();
     let mut ingredients = Vec::new();
     let mut steps = Vec::new();
     let mut section = "title";
+    let mut saw_ingredients_header = false;
+    // Buffered only; discarded when an Ingredients: header is seen (headnotes).
+    let mut pre_header_body: Vec<String> = Vec::new();
 
     for line in text.lines() {
         let t = line.trim();
@@ -619,6 +734,7 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
         let lower = t.to_lowercase();
         if is_ingredients_header(&lower) || (lower.starts_with("ingredients") && t.contains(':')) {
             section = "ingredients";
+            saw_ingredients_header = true;
             continue;
         }
         if is_steps_header(&lower)
@@ -645,14 +761,21 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
                     .to_string(),
             ),
             _ => {
-                // Ambiguous body before headers: accumulate as ingredients.
-                ingredients.push(normalize_line(t.trim_start_matches(['-', '*', '•'])));
+                // Headnote / ambiguous body before Ingredients/Steps — buffer only.
+                pre_header_body.push(t.trim_start_matches(['-', '*', '•']).to_string());
             }
         }
     }
 
-    // If we never saw Ingredients: but body collected lines and we have no steps header,
-    // keep body-as-ingredients. If we have steps only, ok.
+    // Headerless (or no Ingredients: section): use buffered body as ingredients.
+    // When Ingredients: was present, headnote buffer is intentionally discarded.
+    if !saw_ingredients_header && ingredients.is_empty() && !pre_header_body.is_empty() {
+        ingredients = pre_header_body
+            .into_iter()
+            .map(|line| normalize_line(&line))
+            .collect();
+    }
+
     let mut recipe = Recipe::new(sanitize(&title));
     recipe.ingredients = ingredients;
     recipe.steps = steps;
@@ -737,11 +860,131 @@ mod tests {
     #[test]
     fn fragment_offset_exact_not_prefix() {
         let html = r#"<section id="apple">x</section><section id="a">y</section>"#;
-        assert!(fragment_offset(html, Some("a")).unwrap() > fragment_offset(html, Some("apple")).unwrap());
+        assert!(
+            fragment_offset(html, Some("a")).unwrap()
+                > fragment_offset(html, Some("apple")).unwrap()
+        );
         // "a" must not resolve to the start of id="apple"
         let off_a = fragment_offset(html, Some("a")).unwrap();
         assert!(html[off_a..].starts_with("id=\"a\"") || html[off_a..].contains("id=\"a\""));
         assert!(!html[off_a..off_a + 10.min(html.len() - off_a)].contains("apple"));
+    }
+
+    #[test]
+    fn fragment_offset_ignores_data_id() {
+        let html = r#"<div data-id="frag">nope</div><section id="frag">yes</section>"#;
+        let off = fragment_offset(html, Some("frag")).unwrap();
+        assert!(
+            html[off..].starts_with("id=\"frag\""),
+            "matched at {:?}: {}",
+            off,
+            &html[off..off + 20.min(html.len() - off)]
+        );
+    }
+
+    #[test]
+    fn noise_title_matches_foreword_dedication_acknowledgements() {
+        assert!(is_noise_title("Foreword"));
+        assert!(is_noise_title("Dedication"));
+        assert!(is_noise_title("Acknowledgements"));
+        assert!(is_noise_title("Acknowledgments"));
+        assert!(!is_noise_title("Fluffy Pancakes"));
+    }
+
+    #[test]
+    fn headnote_prose_not_stored_as_ingredients() {
+        let html = r#"
+          <section id="stew">
+            <h1>Grandma's Beef Stew</h1>
+            <p>This hearty stew is my grandmother's cherished winter recipe, simmered for hours.</p>
+            <p>Serve with crusty bread and a green salad for a complete meal.</p>
+            <h2>Ingredients</h2>
+            <ul>
+              <li>2 lbs beef chuck</li>
+              <li>3 carrots</li>
+              <li>2 cups broth</li>
+            </ul>
+            <h2>Steps</h2>
+            <ol>
+              <li>Brown the beef.</li>
+              <li>Simmer with vegetables.</li>
+            </ol>
+          </section>
+        "#;
+        let text = html_to_recipe_text(html, "Grandma's Beef Stew");
+        let r = plain_recipe_from_text(&text, "Grandma's Beef Stew");
+        assert!(
+            is_cookable(&r),
+            "headnoted recipe must remain cookable: ings={:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(r.ingredients.len(), 3);
+        for ing in &r.ingredients {
+            assert!(
+                !ing.original.to_lowercase().contains("grandmother"),
+                "headnote leaked into ingredients: {}",
+                ing.original
+            );
+            assert!(
+                !ing.original.to_lowercase().contains("crusty bread"),
+                "headnote leaked into ingredients: {}",
+                ing.original
+            );
+        }
+        assert_eq!(r.steps.len(), 2);
+    }
+
+    #[test]
+    fn long_headnote_does_not_drop_cookable_recipe() {
+        // Nine narrative lines before Ingredients — previously diluted amt ratio.
+        let mut lines = vec!["Tomato Soup".into(), "A quick weeknight soup.".into()];
+        for i in 0..8 {
+            lines.push(format!(
+                "Family story paragraph number {i} about why we love this soup on cold days."
+            ));
+        }
+        lines.push("Ingredients:".into());
+        lines.push("2 cups tomatoes".into());
+        lines.push("1 cup stock".into());
+        lines.push("1 tbsp olive oil".into());
+        lines.push("Steps:".into());
+        lines.push("Simmer everything.".into());
+        let text = lines.join("\n");
+        let r = plain_recipe_from_text(&text, "Tomato Soup");
+        assert!(
+            is_cookable(&r),
+            "long headnote must not drop recipe: ings={:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(r.ingredients.len(), 3);
+        assert!(!r
+            .ingredients
+            .iter()
+            .any(|i| i.original.contains("Family story")));
+        assert!(!r
+            .ingredients
+            .iter()
+            .any(|i| i.original.contains("weeknight")));
+    }
+
+    #[test]
+    fn element_lines_keeps_own_text_with_nested_blocks() {
+        let html = r#"<li>2 cups flour<ul><li>preferably sifted</li></ul></li>"#;
+        let lines = element_lines(html);
+        assert!(
+            lines.iter().any(|l| l.contains("2 cups flour")),
+            "outer li own text lost: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("preferably sifted")),
+            "nested li text lost: {lines:?}"
+        );
     }
 
     #[test]
@@ -769,7 +1012,7 @@ mod tests {
 
     #[test]
     fn epub_identity_keys_survive_normalize_url() {
-        use crate::ingest::normalize_url;
+        use crate::ingest::{epub_source_key, normalize_url};
         let a = epub_source_key("/tmp/book.epub", "recipes.xhtml#pancakes");
         let b = epub_source_key("/tmp/book.epub", "recipes.xhtml#omelette");
         assert_ne!(normalize_url(&a), normalize_url(&b));
@@ -807,7 +1050,12 @@ mod tests {
         let epub_path = dir.path().join("cookbook.epub");
         write_sample_epub(&epub_path);
         let recipes = ingest_epub(epub_path.to_str().unwrap()).expect("ingest");
-        assert_eq!(recipes.len(), 2, "got: {:?}", recipes.iter().map(|r| &r.title).collect::<Vec<_>>());
+        assert_eq!(
+            recipes.len(),
+            2,
+            "got: {:?}",
+            recipes.iter().map(|r| &r.title).collect::<Vec<_>>()
+        );
         let titles: HashSet<_> = recipes.iter().map(|r| r.title.as_str()).collect();
         assert!(titles.contains("Fluffy Pancakes"));
         assert!(titles.contains("Simple Omelette"));
@@ -833,7 +1081,10 @@ mod tests {
         let mut saved = 0;
         for r in &recipes {
             let src = recipe_source_url(r);
-            assert!(!store.is_duplicate(src.as_deref()).unwrap(), "pre-save dup: {src:?}");
+            assert!(
+                !store.is_duplicate(src.as_deref()).unwrap(),
+                "pre-save dup: {src:?}"
+            );
             store.save_recipe(r).unwrap();
             saved += 1;
         }
@@ -842,18 +1093,15 @@ mod tests {
 
         // Re-import: both should now be duplicates.
         for r in &recipes {
-            assert!(
-                store
-                    .is_duplicate(recipe_source_url(r).as_deref())
-                    .unwrap()
-            );
+            assert!(store.is_duplicate(recipe_source_url(r).as_deref()).unwrap());
         }
     }
 
     fn write_sample_epub(path: &Path) {
         let file = fs::File::create(path).unwrap();
         let mut zip = ZipWriter::new(file);
-        let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         let deflated =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
@@ -923,7 +1171,8 @@ mod tests {
         )
         .unwrap();
 
-        zip.start_file("OEBPS/Text/recipes.xhtml", deflated).unwrap();
+        zip.start_file("OEBPS/Text/recipes.xhtml", deflated)
+            .unwrap();
         zip.write_all(
             br#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">

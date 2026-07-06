@@ -109,18 +109,40 @@ pub fn recipe_source_url(r: &Recipe) -> Option<String> {
     }
 }
 
+/// Resolve an EPUB filesystem path for identity keys: canonicalize when the file
+/// exists, otherwise keep the raw path (normalized slashes, leading `/`).
+///
+/// Call once per book and reuse with [`epub_source_key_for_resolved`] so every
+/// recipe from the same import shares the same path component.
+pub fn resolve_epub_path(path: &str) -> String {
+    let path = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.replace('\\', "/"));
+    if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    }
+}
+
 /// Stable identity for one recipe entry inside an EPUB file.
 ///
 /// Form: `epub://local/<canonical-or-raw-path>?href=<encoded>`.
 /// Query is preserved by [`normalize_url`]; path is canonicalized when possible.
+///
+/// Prefer [`resolve_epub_path`] + [`epub_source_key_for_resolved`] when emitting
+/// many keys for the same book (avoids repeated `canonicalize` syscalls).
 pub fn epub_source_key(path: &str, href: &str) -> String {
-    let path = std::fs::canonicalize(path)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| path.replace('\\', "/"));
-    let path = if path.starts_with('/') {
-        path
+    epub_source_key_for_resolved(&resolve_epub_path(path), href)
+}
+
+/// Like [`epub_source_key`] but reuses a path already passed through [`resolve_epub_path`].
+pub fn epub_source_key_for_resolved(resolved_path: &str, href: &str) -> String {
+    let path = if resolved_path.starts_with('/') {
+        resolved_path
     } else {
-        format!("/{path}")
+        // Defensive: accept raw paths without a leading slash.
+        return epub_source_key(resolved_path, href);
     };
     format!("epub://local{path}?href={}", encode_query_component(href))
 }
