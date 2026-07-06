@@ -22,6 +22,12 @@
 //! violation (then min-union). The rationale records a short status; callers
 //! render the full violation list separately (e.g. CLI summary).
 //!
+//! Optional **time-of-day** steering ([`PlanOptions::time_of_day`]) maps each
+//! in-day meal index to breakfast/lunch/dinner/any and prefers recipes whose
+//! `meta.tags` or `meta.category` carry a matching label. Mismatches are soft
+//! (counted after nutrition magnitude, before net union). When enabled, the
+//! exact solver uses per-slot variables so assignment respects slot identity.
+//!
 //! When [`PlanOptions::recipe_macros`] contains an estimate for a recipe with
 //! `kcal <= 0`, that recipe is dropped from the pool entirely (not a meal).
 //! Recipes omitted from the map are left untouched.
@@ -69,12 +75,17 @@
 
 mod ilp;
 mod nutrition_bounds;
+mod tod;
 
 pub use nutrition_bounds::{
     evaluate_macros, evaluate_schedule, exceeds_max, load_nutrition_bounds, min_deficit,
     violates_per_meal, violation_magnitude, weighted_magnitude, BoundScope, BoundViolation,
     CategoryFilter, CliPerDayNutrition, MacroBounds, MacroRange, MacroRatio, NutrientKind,
     NutritionBounds, ViolationKind, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
+};
+pub use tod::{
+    count_tod_misses, recipe_tod_labels, slot_requirement, tod_fits, tod_mismatches, TodKind,
+    TodLabels, TodMismatch,
 };
 
 use crate::domain::{
@@ -104,6 +115,9 @@ pub struct PlanOptions {
     /// Excluded from the pool only when nutrition bounds are configured; ignored
     /// for unconstrained min-union planning.
     pub recipe_low_coverage: HashSet<RecipeId>,
+    /// When true, steer each in-day slot toward breakfast/lunch/dinner labels
+    /// from recipe tags and categories (soft mismatches).
+    pub time_of_day: bool,
 }
 
 impl Default for PlanOptions {
@@ -115,6 +129,7 @@ impl Default for PlanOptions {
             nutrition: NutritionBounds::default(),
             recipe_macros: HashMap::new(),
             recipe_low_coverage: HashSet::new(),
+            time_of_day: false,
         }
     }
 }
@@ -362,6 +377,19 @@ struct GreedyInput<'a> {
     pantry: &'a [PantryItem],
     bounds: &'a NutritionBounds,
     meals_per_day: u32,
+    time_of_day: bool,
+    tod_labels: &'a [TodLabels],
+}
+
+fn slot_allows(input: &GreedyInput<'_>, ri: usize, meal: u32, day_macros: &Macros) -> bool {
+    let nutrition_ok =
+        input.bounds.is_empty() || nutrition_allows(input.bounds, &input.macros[ri], day_macros);
+    let tod_ok = !input.time_of_day
+        || tod_fits(
+            input.tod_labels[ri],
+            slot_requirement(input.meals_per_day.max(1), meal),
+        );
+    nutrition_ok && tod_ok
 }
 
 /// Greedy growth from `seed`: always add the unused recipe that introduces the
@@ -376,6 +404,7 @@ fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<
         pantry,
         bounds,
         meals_per_day,
+        ..
     } = input;
     let mpd = (*meals_per_day).max(1);
     let mut selected = Vec::with_capacity(target);
@@ -391,6 +420,7 @@ fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<
     while selected.len() < target {
         let slot = selected.len() as u32;
         let day = slot / mpd;
+        let meal = slot % mpd;
         if day != cur_day {
             cur_day = day;
             day_macros = Macros::default();
@@ -415,7 +445,7 @@ fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<
                 &day_macros,
                 i,
             );
-            let allowed = bounds.is_empty() || nutrition_allows(bounds, &macros[i], &day_macros);
+            let allowed = slot_allows(input, i, meal, &day_macros);
             if allowed {
                 if best_key.as_ref().is_none_or(|bk| key < *bk) {
                     best = Some(i);
@@ -467,31 +497,30 @@ struct ScoredSchedule {
     indices: Vec<usize>,
     net_union: usize,
     magnitude: f64,
+    tod_misses: usize,
     violations: Vec<BoundViolation>,
 }
 
-fn score_schedule(
-    _pool: &[&Recipe],
-    reqs: &[RecipeReq],
-    macros: &[Macros],
-    indices: Vec<usize>,
-    pantry: &[PantryItem],
-    bounds: &NutritionBounds,
-    meals_per_day: u32,
-) -> ScoredSchedule {
-    let net_union = net_shortfall_count(reqs, &indices, pantry);
-    let violations = if bounds.is_empty() {
+fn score_schedule(input: &GreedyInput<'_>, indices: Vec<usize>) -> ScoredSchedule {
+    let net_union = net_shortfall_count(input.reqs, &indices, input.pantry);
+    let violations = if input.bounds.is_empty() {
         Vec::new()
     } else {
-        schedule_violations(macros, &indices, bounds, meals_per_day)
+        schedule_violations(input.macros, &indices, input.bounds, input.meals_per_day)
     };
     // Rank by the weighted (calories + ratio prioritized) magnitude; the raw
     // violation list is reported verbatim.
     let magnitude = weighted_magnitude(&violations);
+    let tod_misses = if input.time_of_day {
+        count_tod_misses(input.tod_labels, &indices, input.meals_per_day)
+    } else {
+        0
+    };
     ScoredSchedule {
         indices,
         net_union,
         magnitude,
+        tod_misses,
         violations,
     }
 }
@@ -529,6 +558,9 @@ fn better_scored(pool: &[&Recipe], a: &ScoredSchedule, b: &ScoredSchedule) -> bo
     if (a.magnitude - b.magnitude).abs() > 1e-9 {
         return a.magnitude < b.magnitude;
     }
+    if a.tod_misses != b.tod_misses {
+        return a.tod_misses < b.tod_misses;
+    }
     if a.net_union != b.net_union {
         return a.net_union < b.net_union;
     }
@@ -542,15 +574,7 @@ fn greedy_constrained_scored(input: &GreedyInput<'_>, target: usize) -> ScoredSc
     let mut best: Option<ScoredSchedule> = None;
     for seed in 0..input.pool.len() {
         let indices = greedy_from_seed(input, seed, target);
-        let candidate = score_schedule(
-            input.pool,
-            input.reqs,
-            input.macros,
-            indices,
-            input.pantry,
-            input.bounds,
-            input.meals_per_day,
-        );
+        let candidate = score_schedule(input, indices);
         let take = match &best {
             None => true,
             Some(b) => better_scored(input.pool, &candidate, b),
@@ -563,6 +587,7 @@ fn greedy_constrained_scored(input: &GreedyInput<'_>, target: usize) -> ScoredSc
         indices: Vec::new(),
         net_union: 0,
         magnitude: 0.0,
+        tod_misses: 0,
         violations: Vec::new(),
     })
 }
@@ -610,6 +635,9 @@ pub fn plan_bound_violations(
 /// macro min/max bounds (estimated whole-recipe macros in `opts.recipe_macros`).
 /// If no feasible schedule exists, the least-violation plan is returned and
 /// the rationale notes the violation count (details via [`plan_bound_violations`]).
+///
+/// When `opts.time_of_day` is set, each in-day slot prefers breakfast/lunch/dinner
+/// labels (details via [`plan_tod_mismatches`]).
 pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     let slots = opts
         .days
@@ -636,7 +664,9 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         exclude_low_coverage,
     );
     let macros = align_macros(&pool, opts);
+    let tod_labels: Vec<TodLabels> = pool.iter().map(|r| recipe_tod_labels(r)).collect();
     let coverage_pct = (MIN_INGREDIENT_COVERAGE * 100.0).round() as u32;
+    let constrained = !bounds.is_empty() || opts.time_of_day;
 
     if pool.is_empty() || slots == 0 {
         let rationale = if slots == 0 {
@@ -675,14 +705,16 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         pantry,
         bounds,
         meals_per_day: mpd,
+        time_of_day: opts.time_of_day,
+        tod_labels: &tod_labels,
     };
 
     // Track whether the exact solver produced the constrained plan.
     let mut planner_ilp = false;
-    let scored = if target == pool.len() && bounds.is_empty() {
+    let scored = if target == pool.len() && !constrained {
         let indices = order_full_pool(&input);
-        score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd)
-    } else if bounds.is_empty() {
+        score_schedule(&input, indices)
+    } else if !constrained {
         let mut best: Option<(Vec<usize>, usize)> = None;
         for seed in 0..pool.len() {
             let candidate = greedy_from_seed(&input, seed, target);
@@ -696,14 +728,14 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
             }
         }
         let indices = best.map(|(s, _)| s).unwrap_or_default();
-        score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd)
+        score_schedule(&input, indices)
     } else {
-        // Non-empty bounds: solve the selection exactly, falling back to the
-        // greedy planner when the solver declines.
+        // Nutrition bounds and/or time-of-day: solve exactly, falling back to
+        // multi-start greedy when the solver declines.
         match ilp::solve_constrained(&input, target) {
             Some(indices) => {
                 planner_ilp = true;
-                score_schedule(&pool, &reqs, &macros, indices, pantry, bounds, mpd)
+                score_schedule(&input, indices)
             }
             None => greedy_constrained_scored(&input, target),
         }
@@ -776,10 +808,21 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         )
     };
 
-    let rationale = if bounds.is_empty() {
+    let tod_note = if !opts.time_of_day {
+        String::new()
+    } else if scored.tod_misses == 0 {
+        " Time-of-day slots matched.".to_string()
+    } else {
+        format!(
+            " Time-of-day: {} slot mismatch(es) (best effort).",
+            scored.tod_misses
+        )
+    };
+
+    let rationale = if !constrained {
         format!(
             "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
-             no recipe repeats. {pantry_note}{excluded_note}{nutrition_note}{partial_note}",
+             no recipe repeats. {pantry_note}{excluded_note}{nutrition_note}{tod_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
@@ -792,7 +835,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         };
         format!(
             "{lead}: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
-             no recipe repeats. {pantry_note}{excluded_note}{nutrition_note}{partial_note}",
+             no recipe repeats. {pantry_note}{excluded_note}{nutrition_note}{tod_note}{partial_note}",
             meals.len(),
             opts.days,
             pool.len(),
@@ -806,6 +849,33 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         meals,
         rationale,
     }
+}
+
+/// TOD slot mismatches for a saved plan (empty when every constrained slot
+/// matched or a meal's recipe is missing from `pool`).
+pub fn plan_tod_mismatches(pool: &[Recipe], plan: &MealPlan) -> Vec<TodMismatch> {
+    let by_id: HashMap<&str, &Recipe> = pool.iter().map(|r| (r.id.as_str(), r)).collect();
+    let mpd = plan.meals_per_day.max(1);
+    let mut out = Vec::new();
+    for m in &plan.meals {
+        let Some(expected) = slot_requirement(mpd, m.meal) else {
+            continue;
+        };
+        let Some(r) = by_id.get(m.recipe_id.as_str()) else {
+            continue;
+        };
+        let labels = recipe_tod_labels(r);
+        if !labels.contains(expected) {
+            out.push(TodMismatch {
+                day: m.day,
+                meal: m.meal,
+                expected,
+                recipe_title: r.title.clone(),
+                labels,
+            });
+        }
+    }
+    out
 }
 
 /// Ingredient keys introduced by recipes in order (for analysis/tests).
@@ -2348,5 +2418,294 @@ mod tests {
         let reversed: Vec<Recipe> = pool.iter().rev().cloned().collect();
         let plan2 = plan_meals(&reversed, &opts);
         assert_eq!(titles(&plan), titles(&plan2));
+    }
+
+    fn tod_rec(
+        id: &str,
+        title: &str,
+        ings: &[&str],
+        tags: &[&str],
+        category: Option<&str>,
+    ) -> Recipe {
+        let mut r = rec_with_id(id, title, ings);
+        r.meta.tags = tags.iter().map(|t| (*t).to_string()).collect();
+        r.meta.category = category.map(str::to_string);
+        r
+    }
+
+    #[test]
+    fn tod_three_meals_prefers_breakfast_lunch_dinner() {
+        let pool = vec![
+            tod_rec("d1", "Dinner Stew", &["1 cup beef"], &["dinner"], None),
+            tod_rec("l1", "Lunch Salad", &["1 cup lettuce"], &["lunch"], None),
+            tod_rec(
+                "b1",
+                "Breakfast Oats",
+                &["1 cup oats"],
+                &["breakfast"],
+                None,
+            ),
+            tod_rec("x1", "Mystery Bowl", &["1 cup rice"], &[], None),
+        ];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 3,
+                time_of_day: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            titles(&plan),
+            vec!["Breakfast Oats", "Lunch Salad", "Dinner Stew"]
+        );
+        assert!(plan_tod_mismatches(&pool, &plan).is_empty());
+        assert!(plan
+            .rationale
+            .to_lowercase()
+            .contains("time-of-day slots matched"));
+    }
+
+    #[test]
+    fn tod_two_meals_breakfast_then_dinner() {
+        let pool = vec![
+            tod_rec("d1", "Dinner Stew", &["1 cup beef"], &[], Some("Dinner")),
+            tod_rec("b1", "Pancakes", &["1 cup flour"], &["breakfast"], None),
+            tod_rec("l1", "Lunch Wrap", &["1 tortilla"], &["lunch"], None),
+        ];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 2,
+                time_of_day: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(titles(&plan), vec!["Pancakes", "Dinner Stew"]);
+        assert!(plan_tod_mismatches(&pool, &plan).is_empty());
+    }
+
+    #[test]
+    fn tod_one_meal_accepts_any_label() {
+        let pool = vec![
+            tod_rec(
+                "d1",
+                "Dinner Stew",
+                &["1 cup beef", "1 cup stock"],
+                &["dinner"],
+                None,
+            ),
+            tod_rec("b1", "Pancakes", &["1 cup flour"], &["breakfast"], None),
+        ];
+        let with_tod = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 1,
+                time_of_day: true,
+                ..Default::default()
+            },
+        );
+        let without = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 1,
+                time_of_day: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(titles(&with_tod), titles(&without));
+        assert!(plan_tod_mismatches(&pool, &with_tod).is_empty());
+    }
+
+    #[test]
+    fn tod_four_meals_lunch_at_index_one() {
+        let pool = vec![
+            tod_rec("b1", "Breakfast A", &["1 egg"], &["breakfast"], None),
+            tod_rec("l1", "Lunch A", &["1 cup rice"], &["lunch"], None),
+            tod_rec("a1", "Anytime Soup", &["1 cup broth"], &[], None),
+            tod_rec("d1", "Dinner A", &["1 cup pasta"], &["dinner"], None),
+        ];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 4,
+                time_of_day: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 4);
+        assert_eq!(plan.meals[0].recipe_title, "Breakfast A");
+        assert_eq!(plan.meals[1].recipe_title, "Lunch A");
+        assert_eq!(plan.meals[3].recipe_title, "Dinner A");
+        assert!(plan_tod_mismatches(&pool, &plan).is_empty());
+    }
+
+    #[test]
+    fn tod_counts_mismatches_when_labels_missing() {
+        let pool = vec![
+            tod_rec("x1", "Plain A", &["1 cup rice"], &[], None),
+            tod_rec("x2", "Plain B", &["1 cup oats"], &[], None),
+            tod_rec("x3", "Plain C", &["1 cup pasta"], &[], None),
+        ];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 3,
+                time_of_day: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 3);
+        let misses = plan_tod_mismatches(&pool, &plan);
+        assert_eq!(misses.len(), 3);
+        assert!(plan.rationale.contains("3 slot mismatch"));
+    }
+
+    #[test]
+    fn tod_off_matches_prior_selection() {
+        let pool = vec![
+            tod_rec("d1", "Dinner Stew", &["1 cup beef"], &["dinner"], None),
+            tod_rec(
+                "b1",
+                "Breakfast Oats",
+                &["1 cup oats"],
+                &["breakfast"],
+                None,
+            ),
+            tod_rec("l1", "Lunch Salad", &["1 cup lettuce"], &["lunch"], None),
+        ];
+        let off = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 3,
+                time_of_day: false,
+                ..Default::default()
+            },
+        );
+        let also_off = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(titles(&off), titles(&also_off));
+        assert!(!off.rationale.to_lowercase().contains("time-of-day"));
+    }
+
+    #[test]
+    fn tod_nutrition_feasibility_outranks_tod_misses() {
+        let dessert_b = tod_rec(
+            "db",
+            "Sweet Breakfast",
+            &["100 g sugar"],
+            &["breakfast"],
+            None,
+        );
+        let dessert_l = tod_rec("dl", "Sweet Lunch", &["100 g sugar"], &["lunch"], None);
+        let protein_x = tod_rec("px", "Protein Anytime", &["200 g chicken"], &[], None);
+        let mut macros = HashMap::new();
+        macros.insert(
+            RecipeId::from("db"),
+            Macros {
+                kcal: 400.0,
+                protein_g: 2.0,
+                ..Default::default()
+            },
+        );
+        macros.insert(
+            RecipeId::from("dl"),
+            Macros {
+                kcal: 400.0,
+                protein_g: 2.0,
+                ..Default::default()
+            },
+        );
+        macros.insert(
+            RecipeId::from("px"),
+            Macros {
+                kcal: 500.0,
+                protein_g: 60.0,
+                ..Default::default()
+            },
+        );
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                protein_g: MacroRange {
+                    min: Some(50.0),
+                    max: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pool = vec![dessert_b, dessert_l, protein_x];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 1,
+                meals_per_day: 2,
+                nutrition: nutrition.clone(),
+                recipe_macros: macros.clone(),
+                time_of_day: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            plan.meals
+                .iter()
+                .any(|m| m.recipe_title == "Protein Anytime"),
+            "must include protein recipe for nutrition feasibility: {:?}",
+            titles(&plan)
+        );
+        assert!(
+            plan_bound_violations(&pool, &plan, &nutrition, &macros).is_empty(),
+            "nutrition should be feasible"
+        );
+        let misses = plan_tod_mismatches(&pool, &plan);
+        assert!(
+            !misses.is_empty(),
+            "unlabeled protein forces at least one TOD miss"
+        );
+    }
+
+    #[test]
+    fn tod_repeats_template_each_day() {
+        let pool = vec![
+            tod_rec("b1", "B1", &["1 egg"], &["breakfast"], None),
+            tod_rec("d1", "D1", &["1 cup beef"], &["dinner"], None),
+            tod_rec("b2", "B2", &["1 cup milk"], &["breakfast"], None),
+            tod_rec("d2", "D2", &["1 cup pasta"], &["dinner"], None),
+        ];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 2,
+                time_of_day: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.meals.len(), 4);
+        for m in &plan.meals {
+            let labels = recipe_tod_labels(pool.iter().find(|r| r.id == m.recipe_id).unwrap());
+            let req = slot_requirement(2, m.meal).unwrap();
+            assert!(
+                labels.contains(req),
+                "day {} meal {} ({}) missing {:?}",
+                m.day,
+                m.meal,
+                m.recipe_title,
+                req
+            );
+        }
     }
 }

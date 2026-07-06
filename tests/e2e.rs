@@ -138,3 +138,49 @@ fn plan_respects_per_day_protein_config() {
     assert!(plan.meals.iter().any(|m| m.recipe_title == "Chicken Rice"));
     assert!(plan_bound_violations(&pool, &plan, &nutrition, &macros).is_empty());
 }
+
+#[test]
+fn plan_tod_uses_fixture_tags() {
+    use smarter_recipes::planning::{plan_meals, plan_tod_mismatches, PlanOptions};
+
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("t.db");
+    let store = Store::open(&db).unwrap();
+    for path in [
+        "recipes/pancakes.json",
+        "recipes/french_toast.json",
+        "recipes/tomato_pasta.json",
+        "recipes/chicken_rice.json",
+        "recipes/omelette.txt",
+        "recipes/garlic_bread.toml",
+    ] {
+        let r = ingest_from("file", path).unwrap();
+        store.save_recipe(&r).unwrap();
+    }
+    let pool = store.list_recipes(None).unwrap();
+    let plan = plan_meals(
+        &pool,
+        &PlanOptions {
+            days: 1,
+            meals_per_day: 2,
+            time_of_day: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(plan.meals.len(), 2);
+    assert!(plan.rationale.to_lowercase().contains("time-of-day"));
+    let misses = plan_tod_mismatches(&pool, &plan);
+    let breakfast = &plan.meals[0];
+    let dinner = &plan.meals[1];
+    let b = pool.iter().find(|r| r.id == breakfast.recipe_id).unwrap();
+    let d = pool.iter().find(|r| r.id == dinner.recipe_id).unwrap();
+    let b_ok = b
+        .meta
+        .tags
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("breakfast"));
+    let d_ok = d.meta.tags.iter().any(|t| t.eq_ignore_ascii_case("dinner"));
+    if b_ok && d_ok {
+        assert!(misses.is_empty(), "expected full TOD match, got {misses:?}");
+    }
+}
