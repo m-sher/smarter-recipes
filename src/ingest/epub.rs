@@ -554,8 +554,7 @@ fn html_segment_to_recipe(
     epub_path: &str,
     resolved_epub_path: &str,
 ) -> Recipe {
-    let text = html_to_recipe_text(segment_html, &entry.title);
-    let mut recipe = plain_recipe_from_text(&text, &entry.title);
+    let mut recipe = recipe_from_html(segment_html, &entry.title);
     recipe.source = RecipeSource::Epub {
         path: epub_path.to_string(),
         href: entry.href.clone(),
@@ -573,35 +572,66 @@ fn html_segment_to_recipe(
     recipe
 }
 
-/// Convert a recipe HTML fragment into plain text with Ingredients:/Steps: markers.
-///
-/// Index/`fallback_title` is the recipe title (always set for index-driven import).
-/// Pre-header prose (headnotes) is kept in the body section of the text;
-/// [`plain_recipe_from_text`] discards it once an Ingredients/Steps header appears.
-pub fn html_to_recipe_text(html: &str, fallback_title: &str) -> String {
-    let body_text = element_lines(html);
+/// HTML element role for a source line — used to separate headnotes (`<p>`) from
+/// ingredient bullets (`<li>`) without guessing from text shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineKind {
+    Heading,
+    Paragraph,
+    /// `<li>`, `<dt>`/`<dd>`, or `.ingredient` nodes — preferred ingredient source.
+    ListItem,
+    /// No HTML structure (plain-text import / tag-strip fallback).
+    Plain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceLine {
+    kind: LineKind,
+    text: String,
+}
+
+/// Build a recipe from an HTML fragment, preserving element kinds so list items
+/// become ingredients and leading paragraphs become headnotes when there is no
+/// explicit `Ingredients:` heading.
+pub fn recipe_from_html(html: &str, fallback_title: &str) -> Recipe {
+    recipe_from_source_lines(&html_to_source_lines(html, fallback_title), fallback_title)
+}
+
+fn html_to_source_lines(html: &str, fallback_title: &str) -> Vec<SourceLine> {
+    let body = element_lines(html);
     let mut out = Vec::new();
-    out.push(fallback_title.to_string());
+    out.push(SourceLine {
+        kind: LineKind::Heading,
+        text: fallback_title.to_string(),
+    });
     let mut section = "body";
-    for line in body_text {
-        let lower = line.to_lowercase();
+    for line in body {
+        let lower = line.text.to_lowercase();
         if is_ingredients_header(&lower) {
-            out.push("Ingredients:".into());
+            out.push(SourceLine {
+                kind: LineKind::Heading,
+                text: "Ingredients:".into(),
+            });
             section = "ingredients";
             continue;
         }
         if is_steps_header(&lower) {
-            out.push("Steps:".into());
+            out.push(SourceLine {
+                kind: LineKind::Heading,
+                text: "Steps:".into(),
+            });
             section = "steps";
             continue;
         }
         // Skip repeating the title line (common when the heading is also in body text).
-        if section == "body" && normalize_title_key(&line) == normalize_title_key(fallback_title) {
+        if section == "body"
+            && normalize_title_key(&line.text) == normalize_title_key(fallback_title)
+        {
             continue;
         }
         out.push(line);
     }
-    out.join("\n")
+    out
 }
 
 fn is_ingredients_header(lower: &str) -> bool {
@@ -630,8 +660,8 @@ fn is_steps_header(lower: &str) -> bool {
     )
 }
 
-/// Extract visible text lines from HTML, preferring list items.
-fn element_lines(html: &str) -> Vec<String> {
+/// Extract visible text lines from HTML with their source element kind.
+fn element_lines(html: &str) -> Vec<SourceLine> {
     let document = Html::parse_fragment(html);
     let mut lines = Vec::new();
     // Walk block-ish elements.
@@ -654,20 +684,38 @@ fn element_lines(html: &str) -> Vec<String> {
             if t.is_empty() {
                 continue;
             }
-            lines.push(t);
+            let kind = line_kind_for_element(el);
+            lines.push(SourceLine { kind, text: t });
         }
     }
     if lines.is_empty() {
-        // Fallback: all text collapsed by lines from raw strip.
+        // Fallback: all text collapsed by lines from raw strip (no structure).
         let stripped = strip_tags(html);
         for line in stripped.lines() {
             let t = line.trim();
             if !t.is_empty() {
-                lines.push(sanitize(t));
+                lines.push(SourceLine {
+                    kind: LineKind::Plain,
+                    text: sanitize(t),
+                });
             }
         }
     }
     lines
+}
+
+fn line_kind_for_element(el: ElementRef<'_>) -> LineKind {
+    let name = el.value().name();
+    match name {
+        "h1" | "h2" | "h3" | "h4" => LineKind::Heading,
+        "li" | "dt" | "dd" => LineKind::ListItem,
+        "p" => LineKind::Paragraph,
+        "div" | "span" => {
+            // Only matched via `.ingredient` in the selector.
+            LineKind::ListItem
+        }
+        _ => LineKind::Paragraph,
+    }
 }
 
 /// Text for a block that also has nested block children: include this node's
@@ -748,28 +796,45 @@ fn html_visible_len(html: &str) -> usize {
     strip_tags(html).split_whitespace().map(|w| w.len()).sum()
 }
 
-/// Same structure as file plain-text import.
+/// Same structure as file plain-text import (no HTML element kinds).
 ///
-/// **Headnotes:** prose before the first Ingredients header is not stored as
-/// ingredients. When the body is promoted to ingredients (no `Ingredients:`
-/// section — either headerless, or Steps/Method/Directions only), leading
-/// **sentence-shaped** headnote lines are stripped (several words, terminal
-/// sentence punctuation, no measure/unit token). Stripping stops at the first
-/// list-like line (short, leading quantity, or unit token), so unquantified
-/// ingredients like "Salt and pepper to taste" are kept while numeric prose
-/// such as "Serves 4 as a hearty Sunday dinner." is dropped.
-pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
+/// All lines are [`LineKind::Plain`]; headnote stripping uses the text-shape
+/// fallback. Prefer [`recipe_from_html`] when source HTML is available.
+#[cfg(test)]
+fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // First non-empty line is the title slot; rest are structure-less Plain
+        // (text-shape headnote fallback applies on promote).
+        let kind = if lines.is_empty() {
+            LineKind::Heading
+        } else {
+            LineKind::Plain
+        };
+        lines.push(SourceLine {
+            kind,
+            text: t.to_string(),
+        });
+    }
+    recipe_from_source_lines(&lines, title_override)
+}
+
+fn recipe_from_source_lines(lines: &[SourceLine], title_override: &str) -> Recipe {
     let mut title = title_override.to_string();
     let mut ingredients = Vec::new();
     let mut steps = Vec::new();
     let mut section = "title";
     let mut saw_ingredients_header = false;
-    // Buffered body before Ingredients/Steps; may become ingredients when no
-    // Ingredients: section is declared (with leading headnote stripped).
-    let mut pre_header_body: Vec<String> = Vec::new();
+    // Buffered body before Ingredients/Steps; promoted when no Ingredients:
+    // section (structure-aware when list items are present).
+    let mut pre_header_body: Vec<SourceLine> = Vec::new();
 
-    for line in text.lines() {
-        let t = line.trim();
+    for line in lines {
+        let t = line.text.trim();
         if t.is_empty() {
             continue;
         }
@@ -803,18 +868,21 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
                     .to_string(),
             ),
             _ => {
-                // Headnote / ingredient bullets before headers — buffer only.
-                pre_header_body.push(t.trim_start_matches(['-', '*', '•']).to_string());
+                // Headnote paragraphs / ingredient list items before headers.
+                pre_header_body.push(SourceLine {
+                    kind: line.kind,
+                    text: t.trim_start_matches(['-', '*', '•']).to_string(),
+                });
             }
         }
     }
 
-    // No Ingredients: section → promote buffered body, stripping leading
-    // sentence-shaped headnote prose. Covers headerless lists and
-    // title → [headnote] → bullets → Method/Directions.
+    // No Ingredients: section → promote buffered body.
+    // Prefer structural discrimination (list items = ingredients, paragraphs =
+    // headnotes). Text-shape heuristic only when the buffer has no list items.
     if !saw_ingredients_header && ingredients.is_empty() && !pre_header_body.is_empty() {
-        let kept = strip_leading_headnote_lines(&pre_header_body);
-        ingredients = kept.into_iter().map(normalize_line).collect();
+        let kept = promote_pre_header_as_ingredients(&pre_header_body);
+        ingredients = kept.iter().map(|s| normalize_line(s)).collect();
     }
 
     let mut recipe = Recipe::new(sanitize(&title));
@@ -823,39 +891,55 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
     recipe
 }
 
-/// Drop leading sentence-shaped headnote lines; keep from the first list-like line.
-fn strip_leading_headnote_lines(lines: &[String]) -> Vec<&str> {
+/// Choose ingredient lines from the pre-header buffer.
+///
+/// - If any [`LineKind::ListItem`] is present: keep **only** list items (HTML
+///   `<li>` / `.ingredient`). Leading/trailing paragraphs are headnotes/notes.
+/// - Otherwise (plain text or all-paragraph HTML): fall back to stripping
+///   leading sentence-shaped prose.
+fn promote_pre_header_as_ingredients(lines: &[SourceLine]) -> Vec<String> {
+    let has_list = lines.iter().any(|l| l.kind == LineKind::ListItem);
+    if has_list {
+        return lines
+            .iter()
+            .filter(|l| l.kind == LineKind::ListItem)
+            .map(|l| l.text.clone())
+            .collect();
+    }
+    let texts: Vec<String> = lines
+        .iter()
+        .filter(|l| l.kind != LineKind::Heading)
+        .map(|l| l.text.clone())
+        .collect();
+    strip_leading_headnote_lines(&texts)
+}
+
+/// Text-shape fallback: drop leading sentence-shaped headnote lines.
+fn strip_leading_headnote_lines(lines: &[String]) -> Vec<String> {
     let start = lines
         .iter()
         .position(|l| !looks_like_headnote_sentence(l))
         .unwrap_or(lines.len());
-    lines[start..].iter().map(String::as_str).collect()
+    lines[start..].to_vec()
 }
 
-/// True when a line looks like narrative headnote prose rather than an ingredient.
+/// True when a plain-text line looks like narrative headnote prose.
 ///
-/// Heuristic (prose shape, not pure amount): several words, ends with sentence
-/// punctuation, and carries no unit/measure token. Numeric headnotes like
-/// "Serves 4 as a hearty Sunday dinner." match; list items like "2 lb chicken"
-/// or short unquantified "Salt and pepper to taste" do not.
+/// Used only when HTML provides no list structure. Sentence-shaped (several
+/// words, terminal punctuation, no measure/unit token); quantity-led short
+/// lines and unit-bearing lines are kept as ingredients.
 fn looks_like_headnote_sentence(line: &str) -> bool {
     let t = line.trim();
     if t.is_empty() || !ends_with_sentence_punct(t) {
         return false;
     }
     let word_count = t.split_whitespace().count();
-    // "Several words" — short label-ish lines with a period stay ingredients.
     if word_count < 4 {
         return false;
     }
-    // Measure/unit tokens mark list items even when they end in a period
-    // (e.g. "2 cups flour, sifted.").
     if has_measure_unit_token(t) {
         return false;
     }
-    // Leading quantity with no unit is still usually a list item ("3 avocados.")
-    // rather than headnote prose — only treat as headnote when it does *not*
-    // look quantity-led.
     if starts_with_quantity_token(t) && word_count <= 6 {
         return false;
     }
@@ -867,8 +951,7 @@ fn ends_with_sentence_punct(t: &str) -> bool {
     t.ends_with(['.', '!', '?', '…']) || t.ends_with("...")
 }
 
-/// Common culinary unit / measure tokens (word-boundary). Intentionally does
-/// **not** treat a bare number as a measure — "Serves 4 …" is still a headnote.
+/// Common culinary unit / measure tokens (word-boundary). Bare numbers do not count.
 fn has_measure_unit_token(line: &str) -> bool {
     static UNIT: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
@@ -879,7 +962,6 @@ fn has_measure_unit_token(line: &str) -> bool {
     UNIT.is_match(line)
 }
 
-/// Leading digit or vulgar fraction (not bare "a"/"an", which opens many headnotes).
 fn starts_with_quantity_token(line: &str) -> bool {
     let t = line.trim_start();
     let Some(first) = t.chars().next() else {
@@ -1034,8 +1116,7 @@ mod tests {
             </ol>
           </section>
         "#;
-        let text = html_to_recipe_text(html, "Grandma's Beef Stew");
-        let r = plain_recipe_from_text(&text, "Grandma's Beef Stew");
+        let r = recipe_from_html(html, "Grandma's Beef Stew");
         assert!(
             is_cookable(&r),
             "headnoted recipe must remain cookable: ings={:?}",
@@ -1098,18 +1179,19 @@ mod tests {
 
     #[test]
     fn method_only_keeps_ingredients_strips_headnote() {
-        // title → headnote → bulleted ingredients → Method: (no Ingredients:).
-        // Must keep amount-bearing bullets and exclude leading headnote prose.
-        let text = "\
-Tomato Soup
-A quick weeknight soup.
-2 cups tomatoes
-1 cup stock
-1 tbsp olive oil
-Method:
-Simmer everything.
-";
-        let r = plain_recipe_from_text(text, "Tomato Soup");
+        // Structured HTML: paragraph headnote + list ingredients + Method.
+        let html = r#"
+          <h1>Tomato Soup</h1>
+          <p>A quick weeknight soup.</p>
+          <ul>
+            <li>2 cups tomatoes</li>
+            <li>1 cup stock</li>
+            <li>1 tbsp olive oil</li>
+          </ul>
+          <h2>Method</h2>
+          <ol><li>Simmer everything.</li></ol>
+        "#;
+        let r = recipe_from_html(html, "Tomato Soup");
         assert!(
             is_cookable(&r),
             "Method-only recipe must stay cookable: ings={:?}",
@@ -1154,8 +1236,7 @@ Simmer everything.
             </ol>
           </section>
         "#;
-        let text = html_to_recipe_text(html, "Tomato Soup");
-        let r = plain_recipe_from_text(&text, "Tomato Soup");
+        let r = recipe_from_html(html, "Tomato Soup");
         assert!(
             is_cookable(&r),
             "Directions-only HTML must import: ings={:?}",
@@ -1166,6 +1247,81 @@ Simmer everything.
         );
         assert_eq!(r.ingredients.len(), 3);
         assert_eq!(r.steps.len(), 1);
+    }
+
+    #[test]
+    fn list_item_ingredient_with_period_kept() {
+        // Round-6: unquantified `<li>….</li>` must not be dropped as "sentence headnote".
+        let html = r#"
+          <h1>Steak</h1>
+          <p>An old family favorite</p>
+          <ul>
+            <li>Freshly ground black pepper.</li>
+            <li>2 lb ribeye</li>
+            <li>1 tbsp oil</li>
+          </ul>
+          <h2>Directions</h2>
+          <ol><li>Sear hard.</li></ol>
+        "#;
+        let r = recipe_from_html(html, "Steak");
+        assert!(
+            is_cookable(&r),
+            "ings={:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            r.ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("black pepper")),
+            "period-terminated list ingredient dropped: {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !r.ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("family favorite")),
+            "paragraph headnote leaked: {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn short_paragraph_headnote_without_punct_stripped() {
+        // Round-6: `<p>An old family favorite</p>` has no sentence punct but is still headnote.
+        let html = r#"
+          <h1>Stew</h1>
+          <p>An old family favorite</p>
+          <ul>
+            <li>2 cups broth</li>
+            <li>1 onion</li>
+            <li>1 lb beef</li>
+          </ul>
+          <h2>Method</h2>
+          <ol><li>Simmer.</li></ol>
+        "#;
+        let r = recipe_from_html(html, "Stew");
+        assert!(is_cookable(&r));
+        assert_eq!(r.ingredients.len(), 3);
+        assert!(
+            !r.ingredients.iter().any(|i| {
+                let o = i.original.to_lowercase();
+                o.contains("family") || o.contains("favorite")
+            }),
+            "short paragraph headnote leaked: {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1201,16 +1357,18 @@ A bright summer side for picnics.
 
     #[test]
     fn numeric_headnote_sentence_not_kept_as_ingredient() {
-        // Pure amount heuristic would keep "Serves 4 …" because of the digit.
-        let text = "\
-Roast Chicken
-Serves 4 as a hearty Sunday dinner.
-2 lb chicken
-1 tbsp salt
-Method:
-Roast until done.
-";
-        let r = plain_recipe_from_text(text, "Roast Chicken");
+        // Paragraph headnote with a digit must not become an ingredient when lists exist.
+        let html = r#"
+          <h1>Roast Chicken</h1>
+          <p>Serves 4 as a hearty Sunday dinner.</p>
+          <ul>
+            <li>2 lb chicken</li>
+            <li>1 tbsp salt</li>
+          </ul>
+          <h2>Method</h2>
+          <ol><li>Roast until done.</li></ol>
+        "#;
+        let r = recipe_from_html(html, "Roast Chicken");
         assert!(
             is_cookable(&r),
             "expected cookable: ings={:?}",
@@ -1237,17 +1395,19 @@ Roast until done.
 
     #[test]
     fn leading_unquantified_ingredient_kept_before_amounts() {
-        // Pure amount strip wrongly dropped "Salt and pepper to taste".
-        let text = "\
-Guacamole
-A party favorite from our summer cookouts.
-Salt and pepper to taste
-3 avocados
-1 lime
-Directions:
-Mash and mix.
-";
-        let r = plain_recipe_from_text(text, "Guacamole");
+        // List-item "Salt and pepper to taste" kept; paragraph headnote dropped.
+        let html = r#"
+          <h1>Guacamole</h1>
+          <p>A party favorite from our summer cookouts.</p>
+          <ul>
+            <li>Salt and pepper to taste</li>
+            <li>3 avocados</li>
+            <li>1 lime</li>
+          </ul>
+          <h2>Directions</h2>
+          <ol><li>Mash and mix.</li></ol>
+        "#;
+        let r = recipe_from_html(html, "Guacamole");
         assert!(
             is_cookable(&r),
             "expected cookable: ings={:?}",
@@ -1289,13 +1449,14 @@ Mash and mix.
         let html = r#"<li>2 cups flour<ul><li>preferably sifted</li></ul></li>"#;
         let lines = element_lines(html);
         assert!(
-            lines.iter().any(|l| l.contains("2 cups flour")),
+            lines.iter().any(|l| l.text.contains("2 cups flour")),
             "outer li own text lost: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("preferably sifted")),
+            lines.iter().any(|l| l.text.contains("preferably sifted")),
             "nested li text lost: {lines:?}"
         );
+        assert!(lines.iter().all(|l| l.kind == LineKind::ListItem));
     }
 
     #[test]
@@ -1305,15 +1466,15 @@ Mash and mix.
         let lines = element_lines(html);
         let outer = lines
             .iter()
-            .find(|l| l.contains("flour") || l.contains("sifted"))
-            .cloned()
+            .find(|l| l.text.contains("flour") || l.text.contains("sifted"))
+            .map(|l| l.text.clone())
             .unwrap_or_default();
         assert!(
             outer.contains("sifted") && outer.contains("flour") && outer.contains("2 cups"),
             "inline text lost in mixed node: lines={lines:?}, outer={outer:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("optional note")),
+            lines.iter().any(|l| l.text.contains("optional note")),
             "nested li text lost: {lines:?}"
         );
     }
@@ -1368,8 +1529,7 @@ Mash and mix.
             </ol>
           </section>
         "#;
-        let text = html_to_recipe_text(html, "Fluffy Pancakes");
-        let r = plain_recipe_from_text(&text, "Fluffy Pancakes");
+        let r = recipe_from_html(html, "Fluffy Pancakes");
         assert!(is_cookable(&r), "recipe: {:?}", r.ingredients);
         assert!(r.ingredients.len() >= 3);
         assert_eq!(r.steps.len(), 2);
