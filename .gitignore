@@ -6,5 +6,6 @@
 /data/*.db
 .env
 
-# Local-only specs and plans
+# Local-only agent state, specs, and plans
+.superpowers/
 docs/
