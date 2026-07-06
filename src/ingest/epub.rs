@@ -164,84 +164,9 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ep
 }
 
 fn collect_entries<R: Read + Seek>(doc: &mut EpubDoc<R>) -> Result<Vec<IndexEntry>> {
-    if let Some(index_path) = find_index_path(doc) {
-        if let Some(html) = doc.get_resource_str_by_path(Path::new(&index_path)) {
-            let from_index = parse_index_entries(&html, &index_path);
-            if !from_index.is_empty() {
-                return Ok(from_index);
-            }
-        }
-    }
-    // Fallback: scan all XHTML for the best index-like document.
-    if let Some(entries) = best_index_scan(doc) {
-        if !entries.is_empty() {
-            return Ok(entries);
-        }
-    }
-    Ok(entries_from_toc(doc))
-}
+    let mut candidates: Vec<(i64, Vec<IndexEntry>)> = Vec::new();
 
-fn find_index_path<R: Read + Seek>(doc: &mut EpubDoc<R>) -> Option<String> {
-    // Prefer resources whose path or id suggests an index.
-    let mut candidates: Vec<(i32, String)> = Vec::new();
-    for item in &doc.spine {
-        let Some(res) = doc.resources.get(&item.idref) else {
-            continue;
-        };
-        let path_str = path_to_string(&res.path);
-        let lower = path_str.to_lowercase();
-        let score = index_path_score(&lower);
-        if score > 0 {
-            candidates.push((score, path_str));
-        }
-    }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
-
-    // TOC label "Index" only wins if that document actually has linked entries.
-    let toc_index_paths: Vec<String> = flatten_nav(&doc.toc)
-        .into_iter()
-        .filter(|np| {
-            let label = np.label.to_lowercase();
-            label.contains("recipe index") || label == "index" || label.contains("index of recipes")
-        })
-        .map(|np| {
-            let path = path_to_string(&np.content);
-            split_path_fragment(&path).0
-        })
-        .collect();
-    for path in toc_index_paths {
-        if let Some(html) = doc.get_resource_str_by_path(Path::new(&path)) {
-            if !parse_index_entries(&html, &path).is_empty() {
-                return Some(path);
-            }
-        }
-    }
-
-    candidates.into_iter().map(|(_, p)| p).next()
-}
-
-fn index_path_score(lower_path: &str) -> i32 {
-    let file = Path::new(lower_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(lower_path);
-    if file == "recipe-index" || file == "recipe_index" || file == "recipes-index" {
-        return 100;
-    }
-    if file == "index" || file.ends_with("-index") || file.ends_with("_index") {
-        return 80;
-    }
-    if file.contains("recipe") && file.contains("index") {
-        return 90;
-    }
-    if file.contains("index") {
-        return 40;
-    }
-    0
-}
-
-fn best_index_scan<R: Read + Seek>(doc: &mut EpubDoc<R>) -> Option<Vec<IndexEntry>> {
-    let mut best: Option<(usize, Vec<IndexEntry>)> = None;
+    // Score every HTML/XML spine resource as a potential catalog (Contents, Index, …).
     for item in doc.spine.clone() {
         let Some(res) = doc.resources.get(&item.idref) else {
             continue;
@@ -253,22 +178,227 @@ fn best_index_scan<R: Read + Seek>(doc: &mut EpubDoc<R>) -> Option<Vec<IndexEntr
         let Some(html) = doc.get_resource_str_by_path(Path::new(&path_str)) else {
             continue;
         };
-        let entries = parse_index_entries(&html, &path_str);
-        // Index-like: several internal links, not a huge prose chapter.
-        if entries.len() < 2 {
-            continue;
-        }
-        let text_len = html_visible_len(&html);
-        // Prefer many links with relatively little body text.
-        let score = entries
-            .len()
-            .saturating_mul(1000)
-            .saturating_sub(text_len / 20);
-        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
-            best = Some((score, entries));
+        let parsed = parse_index_document(&html, &path_str);
+        if let Some(score) = catalog_quality_score(&parsed, &path_str) {
+            candidates.push((score, parsed.entries));
         }
     }
-    best.map(|(_, e)| e)
+
+    // NCX / nav leaves are a first-class catalog (recipe titles, not page numbers).
+    let toc_entries = entries_from_toc(doc);
+    if toc_entries.len() >= 2 {
+        let parsed = IndexParseResult {
+            titled_link_count: toc_entries.len(),
+            page_number_link_count: 0,
+            entries: toc_entries,
+        };
+        if let Some(score) = catalog_quality_score(&parsed, "toc.ncx") {
+            // Small bonus so a large nav catalog wins over a thin XHTML contents twin.
+            candidates.push((score + 30, parsed.entries));
+        }
+    }
+
+    pick_best_catalog(candidates).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no linked recipe entries found in EPUB index or TOC; \
+             need a recipe index with hyperlinks (page-number-only indexes unsupported)"
+        )
+    })
+}
+
+/// Link-scan result: titled recipe entries plus counts used for subject-index detection.
+#[derive(Debug, Clone, Default)]
+pub struct IndexParseResult {
+    pub entries: Vec<IndexEntry>,
+    /// Internal links whose text passed the titled-entry filters (same as `entries.len()`).
+    pub titled_link_count: usize,
+    /// Internal links rejected only because the label was a page/roman numeral.
+    pub page_number_link_count: usize,
+}
+
+/// True when link text is only a page number or short roman numeral (`12`, `xiv`).
+pub fn is_page_number_label(title: &str) -> bool {
+    let title_lc = title.to_ascii_lowercase();
+    !title_lc.is_empty()
+        && title_lc.len() < 6
+        && title_lc
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 'x' | 'i' | 'v'))
+}
+
+/// Subject (back-matter) index: majority of labeled links are page numbers.
+pub fn is_subject_index_stats(page_number_links: usize, titled_links: usize) -> bool {
+    let total = page_number_links.saturating_add(titled_links);
+    if total == 0 {
+        return true;
+    }
+    // ≥ 70% page-number labels.
+    page_number_links * 10 >= total * 7
+}
+
+/// Quality score for a catalog candidate. `None` = do not use (subject index / too small).
+pub fn catalog_quality_score(parsed: &IndexParseResult, path_hint: &str) -> Option<i64> {
+    // Single-recipe cookbooks (one titled index link) are valid catalogs.
+    if parsed.entries.is_empty() {
+        return None;
+    }
+    // Never treat a page-number subject index (plus a few section labels) as the catalog.
+    if is_subject_index_stats(parsed.page_number_link_count, parsed.titled_link_count) {
+        return None;
+    }
+    let mut score = parsed.entries.len() as i64 * 1000;
+    // Prefer deep links (path#fragment) over top-level spine nav ("Recipes" → whole file).
+    let with_fragment = parsed
+        .entries
+        .iter()
+        .filter(|e| e.fragment.is_some())
+        .count() as i64;
+    score += with_fragment * 500;
+    // Demote catalogs whose targets are mostly other index/nav/contents pages.
+    let meta_targets = parsed
+        .entries
+        .iter()
+        .filter(|e| path_looks_like_meta_catalog(&e.path))
+        .count() as i64;
+    score -= meta_targets * 800;
+    score += catalog_path_bonus(path_hint) as i64;
+    Some(score)
+}
+
+fn path_looks_like_meta_catalog(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let file = Path::new(&lower)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    matches!(
+        file,
+        "index"
+            | "contents"
+            | "toc"
+            | "nav"
+            | "table-of-contents"
+            | "tableofcontents"
+            | "cover"
+            | "title"
+            | "copyright"
+    ) || file.contains("index") && !file.contains("recipe")
+}
+
+/// Path stem bonuses — tie-breakers only; titled count dominates via `catalog_quality_score`.
+pub fn catalog_path_bonus(path: &str) -> i32 {
+    let lower = path.to_lowercase();
+    let file = Path::new(&lower)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(lower.as_str());
+    if file == "recipe-index" || file == "recipe_index" || file == "recipes-index" {
+        return 100;
+    }
+    if file.contains("recipe") && file.contains("index") {
+        return 90;
+    }
+    if matches!(
+        file,
+        "contents" | "toc" | "table-of-contents" | "tableofcontents" | "nav"
+    ) || file.ends_with("-contents")
+        || file.ends_with("_contents")
+    {
+        return 60;
+    }
+    if file == "toc" || lower.contains("toc.ncx") || file.ends_with(".ncx") {
+        return 55;
+    }
+    if file == "index" || file.ends_with("-index") || file.ends_with("_index") {
+        // Mild bonus only when the document is *not* a subject index (caller filters those).
+        return 20;
+    }
+    if file.contains("index") {
+        return 10;
+    }
+    0
+}
+
+/// Pick the highest-scoring catalog; ties keep the first inserted.
+pub fn pick_best_catalog(mut candidates: Vec<(i64, Vec<IndexEntry>)>) -> Option<Vec<IndexEntry>> {
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.into_iter().next().map(|(_, e)| e)
+}
+
+/// Parse index/contents HTML: titled entries for import, plus page-number stats.
+pub fn parse_index_document(html: &str, base_path: &str) -> IndexParseResult {
+    let document = Html::parse_document(html);
+    let Ok(sel) = Selector::parse("a[href]") else {
+        return IndexParseResult::default();
+    };
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    let mut titled_link_count = 0usize;
+    let mut page_number_link_count = 0usize;
+
+    for a in document.select(&sel) {
+        let href = a.value().attr("href").unwrap_or("").trim();
+        if href.is_empty() || href.starts_with("http://") || href.starts_with("https://") {
+            continue;
+        }
+        if href.starts_with("mailto:") || href.starts_with("javascript:") {
+            continue;
+        }
+        // Skip stylesheet / non-document targets.
+        let href_lower = href.to_ascii_lowercase();
+        if href_lower.ends_with(".css")
+            || href_lower.ends_with(".jpg")
+            || href_lower.ends_with(".jpeg")
+            || href_lower.ends_with(".png")
+            || href_lower.ends_with(".gif")
+            || href_lower.ends_with(".svg")
+        {
+            continue;
+        }
+
+        let title = sanitize(&a.text().collect::<String>());
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.is_empty() {
+            continue;
+        }
+        if is_page_number_label(&title) {
+            page_number_link_count += 1;
+            continue;
+        }
+        if is_noise_title(&title) {
+            continue;
+        }
+
+        let (path, fragment) = resolve_href(base_path, href);
+        if path.is_empty() {
+            continue;
+        }
+        let key = format!(
+            "{}#{}|{}",
+            path,
+            fragment.as_deref().unwrap_or(""),
+            normalize_title_key(&title)
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        titled_link_count += 1;
+        entries.push(IndexEntry {
+            title,
+            path,
+            fragment,
+            href: href.to_string(),
+        });
+    }
+
+    IndexParseResult {
+        entries,
+        titled_link_count,
+        page_number_link_count,
+    }
 }
 
 fn entries_from_toc<R: Read + Seek>(doc: &EpubDoc<R>) -> Vec<IndexEntry> {
@@ -317,57 +447,10 @@ fn flatten_nav(points: &[epub::doc::NavPoint]) -> Vec<&epub::doc::NavPoint> {
     out
 }
 
-/// Parse `<a href>` entries from an index HTML document.
+/// Parse `<a href>` entries from an index HTML document (titled links only).
+#[cfg(test)]
 pub fn parse_index_entries(html: &str, base_path: &str) -> Vec<IndexEntry> {
-    let document = Html::parse_document(html);
-    let Ok(sel) = Selector::parse("a[href]") else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for a in document.select(&sel) {
-        let href = a.value().attr("href").unwrap_or("").trim();
-        if href.is_empty() || href.starts_with("http://") || href.starts_with("https://") {
-            continue;
-        }
-        if href.starts_with("mailto:") || href.starts_with("javascript:") {
-            continue;
-        }
-        let title = sanitize(&a.text().collect::<String>());
-        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-        if title.is_empty() || is_noise_title(&title) {
-            continue;
-        }
-        // Skip pure page-number labels ("12", "xiv", "XII").
-        let title_lc = title.to_ascii_lowercase();
-        if title_lc
-            .chars()
-            .all(|c| c.is_ascii_digit() || matches!(c, 'x' | 'i' | 'v'))
-            && title_lc.len() < 6
-        {
-            continue;
-        }
-        let (path, fragment) = resolve_href(base_path, href);
-        if path.is_empty() {
-            continue;
-        }
-        let key = format!(
-            "{}#{}|{}",
-            path,
-            fragment.as_deref().unwrap_or(""),
-            normalize_title_key(&title)
-        );
-        if !seen.insert(key) {
-            continue;
-        }
-        out.push(IndexEntry {
-            title,
-            path,
-            fragment,
-            href: href.to_string(),
-        });
-    }
-    out
+    parse_index_document(html, base_path).entries
 }
 
 fn is_noise_title(title: &str) -> bool {
@@ -622,13 +705,15 @@ fn html_segment_to_recipe(
 }
 
 /// HTML element role for a source line — used to separate headnotes (`<p>`) from
-/// ingredient bullets (`<li>`) without guessing from text shape.
+/// ingredient bullets (`<li>`) and class-tagged ingredient blocks without text-shape guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineKind {
     Heading,
     Paragraph,
-    /// `<li>`, `<dt>`/`<dd>`, or `.ingredient` nodes — preferred ingredient source.
+    /// Generic `<li>` / `<dt>` / `<dd>` — structural, but may co-exist with tip-only lists.
     ListItem,
+    /// Publisher CSS ingredient blocks (`p.hang`, `.ingredient`, …) — trusted complete set.
+    ClassIngredient,
     /// No HTML structure (plain-text import / tag-strip fallback).
     Plain,
 }
@@ -761,16 +846,57 @@ fn element_lines(html: &str) -> Vec<SourceLine> {
 
 fn line_kind_for_element(el: ElementRef<'_>) -> LineKind {
     let name = el.value().name();
+    let class_attr = el.value().attr("class").unwrap_or("");
+    // Publisher CSS ingredient blocks (e.g. Agate `p.hang`) are a distinct structural source.
+    if is_ingredient_class_attr(class_attr) {
+        return LineKind::ClassIngredient;
+    }
     match name {
         "h1" | "h2" | "h3" | "h4" => LineKind::Heading,
         "li" | "dt" | "dd" => LineKind::ListItem,
         "p" => LineKind::Paragraph,
         "div" | "span" => {
-            // Only matched via `.ingredient` in the selector.
-            LineKind::ListItem
+            // Only matched via `.ingredient` in the selector (also covered by class check).
+            LineKind::ClassIngredient
         }
         _ => LineKind::Paragraph,
     }
+}
+
+/// Whole-token class match for ingredient-paragraph conventions (never free-text guess).
+///
+/// Intentionally omits the short token `ing` (too collision-prone with unrelated classes).
+pub fn is_ingredient_class_attr(class_attr: &str) -> bool {
+    class_attr.split_whitespace().any(|tok| {
+        matches!(
+            tok.to_ascii_lowercase().as_str(),
+            "hang" | "ingredient" | "ingredients" | "recipe-ingredient"
+        )
+    })
+}
+
+/// Nutrition / exchanges section markers that end the ingredient block.
+pub fn is_nutrition_block_header(line: &str) -> bool {
+    let t = line.trim();
+    let lower = t.to_ascii_lowercase();
+    lower.starts_with("per serving")
+        || lower.starts_with("calories:")
+        || lower.starts_with("calories ")
+        || lower == "calories"
+        || lower.starts_with("exchanges:")
+        || lower == "exchanges"
+        || lower.starts_with("% of calories from fat")
+        || lower.starts_with("saturated fat")
+        || lower.starts_with("cholesterol")
+        || lower.starts_with("sodium:")
+        || lower.starts_with("protein:")
+        || lower.starts_with("carbohydrate:")
+}
+
+/// Numbered procedure line (`1. Mix…`, `2) Bake…`).
+pub fn is_numbered_step_line(line: &str) -> bool {
+    static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d+[\.)]\s+\S").expect("numbered step re"));
+    RE.is_match(line.trim())
 }
 
 /// Text for a block that also has nested block children: include this node's
@@ -847,6 +973,7 @@ fn strip_tags(html: &str) -> String {
     out
 }
 
+#[allow(dead_code)] // retained for future density scoring of catalog pages
 fn html_visible_len(html: &str) -> usize {
     strip_tags(html).split_whitespace().map(|w| w.len()).sum()
 }
@@ -907,6 +1034,16 @@ fn recipe_from_source_lines(
             section = "steps";
             continue;
         }
+        // Nutrition block ends pre-header / class-based ingredients (not an ingredient source).
+        if matches!(section, "body" | "title") && is_nutrition_block_header(t) {
+            section = "post_ingredients";
+            continue;
+        }
+        // Numbered procedure lines switch into steps without a Method: header.
+        if matches!(section, "body" | "post_ingredients") && is_numbered_step_line(t) {
+            section = "steps";
+            // fall through to steps arm
+        }
         match section {
             "title" => {
                 if title_override.is_empty() {
@@ -922,6 +1059,9 @@ fn recipe_from_source_lines(
                     .trim()
                     .to_string(),
             ),
+            "post_ingredients" => {
+                // Skip nutrition / exchanges lines until a numbered step or steps header.
+            }
             _ => {
                 // Headnote paragraphs / ingredient list items before headers.
                 pre_header_body.push(SourceLine {
@@ -952,52 +1092,81 @@ fn recipe_from_source_lines(
     (recipe, status)
 }
 
-/// Unambiguous list-only promote, or skip (no guessing).
+/// Unambiguous structural promote, or skip (no guessing).
 enum PreHeaderIngredients {
-    /// List items only; no non-heading paragraph carries unit/quantity.
+    /// Class- or list-derived ingredients only.
     ListItems(Vec<String>),
-    /// No list items, or list coexists with a measured paragraph/plain line.
+    /// No structural ingredients, or generic list coexists with measured paragraphs.
     Ambiguous,
 }
 
-/// On the no-`Ingredients:` path: import list items only when that is the sole
-/// structural ingredient source. Never guess from prose or merge mixed markup.
+/// On the no-`Ingredients:` path: import structural ingredients only when unambiguous.
+///
+/// **Class-tagged ingredients** (`p.hang`, `.ingredient`, …) are treated as the
+/// complete ingredient set — coexisting headnote/yield/nutrition paragraphs are
+/// different classes and do **not** run the measured-paragraph guard.
+///
+/// **Generic `<li>` only:** coexisting Paragraph/Plain lines with a leading
+/// quantity (e.g. `6 eggs`, `2 cups flour`) make the structure **Ambiguous**
+/// (never-guess; tip-li alone must not import as the sole ingredients).
 fn resolve_pre_header_ingredients(lines: &[SourceLine]) -> PreHeaderIngredients {
+    let class_items: Vec<String> = lines
+        .iter()
+        .filter(|l| l.kind == LineKind::ClassIngredient)
+        .map(|l| l.text.clone())
+        .collect();
+    if !class_items.is_empty() {
+        // Publisher class markup is authoritative; do not text-guess coexisting `<p>`.
+        return PreHeaderIngredients::ListItems(class_items);
+    }
+
     let list_items: Vec<String> = lines
         .iter()
         .filter(|l| l.kind == LineKind::ListItem)
         .map(|l| l.text.clone())
         .collect();
-    let has_measured_paragraph = lines.iter().any(|l| {
-        matches!(l.kind, LineKind::Paragraph | LineKind::Plain)
-            && looks_like_measured_ingredient(&l.text)
-    });
-
     if list_items.is_empty() {
         // Would require text-shape guessing — refuse.
         return PreHeaderIngredients::Ambiguous;
     }
-    if has_measured_paragraph {
-        // List tip coexisting with `<p>2 cups flour</p>`-style lines — refuse.
+
+    let has_competing_paragraph = lines.iter().any(|l| {
+        matches!(l.kind, LineKind::Paragraph | LineKind::Plain)
+            && looks_like_competing_ingredient_paragraph(&l.text)
+    });
+    if has_competing_paragraph {
+        // Tip-li coexisting with bare measured `<p>6 eggs</p>` / `2 cups flour` — refuse.
         return PreHeaderIngredients::Ambiguous;
     }
-    // Headnote paragraphs without measure/quantity are fine; list items win.
+    // Headnote prose without a leading quantity is fine; generic list items win.
     PreHeaderIngredients::ListItems(list_items)
 }
 
-fn looks_like_measured_ingredient(line: &str) -> bool {
-    has_measure_unit_token(line) || starts_with_quantity_token(line)
+/// Broader never-guess guard for coexisting Paragraph/Plain next to generic `<li>`.
+///
+/// Leading quantity alone counts (`6 eggs`, `3 avocados`) — not only qty+unit lines.
+/// Yield / servings lines are excluded. Mid-prose unit words without a leading
+/// quantity (modal "can", unquantified "slices") do not compete.
+fn looks_like_competing_ingredient_paragraph(line: &str) -> bool {
+    if looks_like_yield_line(line) {
+        return false;
+    }
+    starts_with_quantity_token(line)
 }
 
-/// Common culinary unit / measure tokens (word-boundary). Bare numbers do not count.
-fn has_measure_unit_token(line: &str) -> bool {
-    static UNIT: Lazy<Regex> = Lazy::new(|| {
+/// `16 servings`, `Serves 4`, `Makes about 2 cups`, short `8 slices` yield lines.
+///
+/// Defense in depth for non-class yield paragraphs; class-ingredient trust is primary.
+pub fn looks_like_yield_line(line: &str) -> bool {
+    static RE: Lazy<Regex> = Lazy::new(|| {
+        // Allow a few words between the count and "servings" (e.g. "4 first-course servings",
+        // "6 entrée servings"). Also match a sole short "N slices" yield line.
         Regex::new(
-            r"(?i)\b(?:cups?|tbsps?|tsps?|teaspoons?|tablespoons?|lbs?|pounds?|oz|ounces?|kg|kilograms?|g|grams?|ml|milliliters?|l|liters?|litres?|pints?|quarts?|gallons?|cloves?|pinches?|dashes?|cans?|packages?|pkg|sticks?|bunches?|heads?|slices?|pieces?|sprigs?|handfuls?|scoops?|drops?)\b",
+            r"(?i)^(?:\d[\d./\-–to\s]*\s+(?:\S+\s+){0,4}servings?\b|serves\b|makes\b|yield(?:s|ed)?\b|about\s+\d+\s+servings?\b|\d[\d./]*\s+slices?\s*(?:\([^)]*\))?\s*$)",
         )
-        .expect("unit re")
+        .expect("yield re")
     });
-    UNIT.is_match(line)
+    RE.is_match(line.trim())
 }
 
 fn starts_with_quantity_token(line: &str) -> bool {
@@ -1062,6 +1231,333 @@ mod tests {
         assert_eq!(entries[0].path, "OEBPS/Text/recipes.xhtml");
         assert_eq!(entries[0].fragment.as_deref(), Some("pancakes"));
         assert_eq!(entries[1].fragment.as_deref(), Some("omelette"));
+        let parsed = parse_index_document(html, "OEBPS/Text/index.xhtml");
+        assert_eq!(parsed.titled_link_count, 2);
+        assert_eq!(parsed.page_number_link_count, 1);
+    }
+
+    #[test]
+    fn page_number_label_detection() {
+        assert!(is_page_number_label("12"));
+        assert!(is_page_number_label("xiv"));
+        assert!(is_page_number_label("XII"));
+        assert!(!is_page_number_label("Baked Artichoke Dip"));
+        assert!(!is_page_number_label("Chapter 12"));
+    }
+
+    #[test]
+    fn subject_index_stats_majority_page_numbers() {
+        assert!(is_subject_index_stats(20, 3));
+        assert!(!is_subject_index_stats(2, 10));
+        assert!(is_subject_index_stats(0, 0));
+    }
+
+    #[test]
+    fn catalog_prefers_contents_titled_links_over_subject_index() {
+        let subject = r#"<html><body>
+          <a href="Chapter001sec1.html#page_2">2</a>
+          <a href="Chapter001sec2.html#page_3">3</a>
+          <a href="Chapter001sec3.html#page_4">4</a>
+          <a href="Chapter001sec4.html#page_5">5</a>
+          <a href="Chapter001sec5.html#page_6">6</a>
+          <a href="Chapter001sec6.html#page_7">7</a>
+          <a href="Chapter001sec7.html#page_8">8</a>
+          <a href="Index.html#ind2">Casseroles</a>
+          <a href="Index.html#ind3">Beans and Legumes</a>
+          <a href="Index.html#ind4">Beef</a>
+        </body></html>"#;
+        let contents = r#"<html><body>
+          <a href="Chapter001sec1.html#sec1">Baked Artichoke Dip</a>
+          <a href="Chapter001sec2.html#sec2">Curry Dip</a>
+          <a href="Chapter001sec3.html#sec3">Toasted Onion Dip</a>
+          <a href="Chapter001sec4.html#sec4">Sun-Dried Tomato Hummus</a>
+          <a href="Chapter001sec5.html#sec5">Black Bean Hummus</a>
+          <a href="Chapter001sec6.html#sec6">Roasted Garlic Dip</a>
+          <a href="Chapter001sec7.html#sec7">Black Bean Dip</a>
+          <a href="Chapter001sec8.html#sec8">Pinto Bean Dip</a>
+          <a href="Chapter001sec9.html#sec9">Chili Con Queso</a>
+          <a href="Chapter001sec10.html#sec10">Queso Fundido</a>
+        </body></html>"#;
+        let sub = parse_index_document(subject, "OEBPS/Index.html");
+        let con = parse_index_document(contents, "OEBPS/Contents.html");
+        assert!(
+            catalog_quality_score(&sub, "OEBPS/Index.html").is_none(),
+            "subject index must not be a catalog candidate"
+        );
+        let con_score =
+            catalog_quality_score(&con, "OEBPS/Contents.html").expect("contents should score");
+        assert!(con_score > 0);
+        assert_eq!(con.entries.len(), 10);
+        let best = pick_best_catalog(vec![
+            // Even if something wrongly scored the subject entries alone:
+            (con_score, con.entries.clone()),
+        ])
+        .unwrap();
+        assert_eq!(best.len(), 10);
+        assert!(best.iter().any(|e| e.title.contains("Artichoke")));
+        assert!(!best.iter().any(|e| e.title == "Beef"));
+    }
+
+    #[test]
+    fn subject_index_only_is_not_a_usable_catalog() {
+        let subject = r#"<html><body>
+          <a href="a.html#p1">1</a><a href="a.html#p2">2</a><a href="a.html#p3">3</a>
+          <a href="a.html#p4">4</a><a href="a.html#p5">5</a><a href="a.html#p6">6</a>
+          <a href="a.html#p7">7</a><a href="a.html#p8">8</a><a href="a.html#p9">9</a>
+          <a href="a.html#p10">10</a>
+          <a href="Index.html#x">Pies</a>
+          <a href="Index.html#y">Cakes</a>
+        </body></html>"#;
+        let parsed = parse_index_document(subject, "OEBPS/Index.html");
+        assert_eq!(parsed.entries.len(), 2);
+        assert!(catalog_quality_score(&parsed, "OEBPS/Index.html").is_none());
+        assert!(pick_best_catalog(vec![]).is_none());
+    }
+
+    #[test]
+    fn hang_class_paragraphs_are_ingredients_not_headnote_or_nutrition() {
+        let html = r#"
+        <html><body>
+          <p class="subheadingr">BAKED ARTICHOKE DIP</p>
+          <p class="normalr"><i>Everyone's favorite, modified for healthful, low-fat goodness.</i></p>
+          <p class="hangms"><b>16 servings</b> (about 3 tablespoons each)</p>
+          <p class="hang">1 can (15 ounces) artichoke hearts, rinsed, drained</p>
+          <p class="hang">4 ounces fat-free cream cheese, room temperature</p>
+          <p class="hang">1/2 cup fat-free mayonnaise</p>
+          <p class="hang">2 teaspoons minced garlic</p>
+          <p class="hangss"><b>Per Serving:</b></p>
+          <p class="hangsr">Calories: 39</p>
+          <p class="hangsr">Protein (gm): 3.5</p>
+          <p class="normal-ts1"><b>1.</b> Process artichoke hearts and cream cheese until smooth.</p>
+          <p class="normal-ts1"><b>2.</b> Bake until hot.</p>
+        </body></html>
+        "#;
+        let (recipe, status) = recipe_from_html_status(html, "Baked Artichoke Dip");
+        assert_eq!(status, IngredientStatus::Resolved);
+        assert!(
+            recipe.ingredients.len() >= 4,
+            "ingredients={:?}",
+            recipe.ingredients
+        );
+        assert!(
+            !recipe
+                .ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("everyone")),
+            "headnote must not be an ingredient: {:?}",
+            recipe.ingredients
+        );
+        assert!(
+            !recipe
+                .ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("calories")),
+            "nutrition must not be ingredients: {:?}",
+            recipe.ingredients
+        );
+        assert!(
+            !recipe
+                .ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("16 servings")),
+            "yield line (hangms) must not be an ingredient"
+        );
+        assert!(
+            !recipe.steps.is_empty(),
+            "expected numbered steps, got {:?}",
+            recipe.steps
+        );
+        assert!(is_cookable(&recipe), "recipe should be cookable");
+    }
+
+    #[test]
+    fn measured_paragraphs_without_ingredient_class_still_ambiguous() {
+        let html = r#"
+        <html><body>
+          <h1>Dressing</h1>
+          <p>A zippy little sauce we adore.</p>
+          <p>2 cups yogurt</p>
+          <p>1 clove garlic</p>
+          <h2>Method</h2>
+          <p>Whisk together.</p>
+        </body></html>
+        "#;
+        let (_recipe, status) = recipe_from_html_status(html, "Dressing");
+        assert_eq!(status, IngredientStatus::AmbiguousStructure);
+    }
+
+    #[test]
+    fn ingredient_class_attr_token_match() {
+        assert!(is_ingredient_class_attr("hang"));
+        assert!(is_ingredient_class_attr("foo hang bar"));
+        assert!(!is_ingredient_class_attr("hangms"));
+        assert!(!is_ingredient_class_attr("hangsr"));
+        assert!(is_ingredient_class_attr("recipe-ingredient"));
+        assert!(is_ingredient_class_attr("ingredient"));
+        assert!(is_ingredient_class_attr("ingredients"));
+        // Short `ing` token is too collision-prone; do not treat as ingredient class.
+        assert!(!is_ingredient_class_attr("ing"));
+        assert!(!is_ingredient_class_attr("foo ing bar"));
+    }
+
+    #[test]
+    fn catalog_quality_score_accepts_single_titled_entry() {
+        let html = r#"<html><body>
+          <a href="Chapter001.html#sec1">Method Style One-Shot</a>
+        </body></html>"#;
+        let parsed = parse_index_document(html, "OEBPS/Contents.html");
+        assert_eq!(parsed.entries.len(), 1);
+        let score =
+            catalog_quality_score(&parsed, "OEBPS/Contents.html").expect("single entry scores");
+        assert!(score > 0);
+    }
+
+    #[test]
+    fn hang_ingredients_with_modal_can_and_slices_headnote_resolve() {
+        // many.epub-style false positives: headnote prose with modal "can" / "slices"
+        // must not compete with p.hang ClassIngredient lines.
+        let html = r#"
+        <html><body>
+          <p class="subheadingr">SWEET POTATO CASSEROLE</p>
+          <p class="normalr"><i>Raw sweet potato slices keep well. Any extra can be frozen for later.</i></p>
+          <p class="hangms"><b>8 servings</b></p>
+          <p class="hang">2 cups mashed sweet potatoes</p>
+          <p class="hang">1/2 cup brown sugar</p>
+          <p class="hang">1 can (5 ounces) evaporated milk</p>
+          <p class="hangss"><b>Per Serving:</b></p>
+          <p class="hangsr">Calories: 120</p>
+          <p class="normal-ts1"><b>1.</b> Combine and bake.</p>
+        </body></html>
+        "#;
+        let (recipe, status) = recipe_from_html_status(html, "Sweet Potato Casserole");
+        assert_eq!(
+            status,
+            IngredientStatus::Resolved,
+            "headnote unit words must not make structure ambiguous"
+        );
+        assert_eq!(
+            recipe.ingredients.len(),
+            3,
+            "hang lines only: {:?}",
+            recipe.ingredients
+        );
+        assert!(
+            recipe
+                .ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("sweet potatoes")),
+            "{:?}",
+            recipe.ingredients
+        );
+        assert!(
+            recipe
+                .ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("evaporated milk")),
+            "leading-qty '1 can …' hang line must still import: {:?}",
+            recipe.ingredients
+        );
+        assert!(
+            !recipe.ingredients.iter().any(|i| {
+                let o = i.original.to_lowercase();
+                o.contains("frozen") || o.contains("raw sweet potato slices")
+            }),
+            "headnote must not be an ingredient: {:?}",
+            recipe.ingredients
+        );
+        assert!(is_cookable(&recipe));
+    }
+
+    #[test]
+    fn hang_ingredients_with_hangms_yield_variants_resolve() {
+        // hangms yield variants must not compete with p.hang ClassIngredients.
+        for yield_text in [
+            "8 slices",
+            "4 first-course servings (about 1 cup each)",
+            "6 entrée servings (about 1½ cups each)",
+        ] {
+            let html = format!(
+                r#"
+                <html><body>
+                  <p class="subheadingr">RECIPE</p>
+                  <p class="normalr"><i>A headnote with can and slices words.</i></p>
+                  <p class="hangms"><b>{yield_text}</b></p>
+                  <p class="hang">2 cups flour</p>
+                  <p class="hang">1 teaspoon salt</p>
+                  <p class="hang">1 cup milk</p>
+                  <p class="hangss"><b>Per Serving:</b></p>
+                  <p class="hangsr">Calories: 99</p>
+                  <p class="normal-ts1"><b>1.</b> Mix.</p>
+                </body></html>
+                "#
+            );
+            let (recipe, status) = recipe_from_html_status(&html, "Recipe");
+            assert_eq!(
+                status,
+                IngredientStatus::Resolved,
+                "yield {yield_text:?} must not force ambiguous: ingredients={:?}",
+                recipe.ingredients
+            );
+            assert_eq!(
+                recipe.ingredients.len(),
+                3,
+                "yield {yield_text:?}: expected hang ingredients only, got {:?}",
+                recipe.ingredients
+            );
+            assert!(
+                !recipe.ingredients.iter().any(|i| {
+                    let o = i.original.to_lowercase();
+                    o.contains("serving") || o == "8 slices" || o.contains("first-course")
+                }),
+                "yield line leaked for {yield_text:?}: {:?}",
+                recipe.ingredients
+            );
+            assert!(is_cookable(&recipe), "yield {yield_text:?}");
+        }
+    }
+
+    #[test]
+    fn tip_li_with_bare_quantity_paragraphs_is_ambiguous() {
+        // Never-guess restored: tip-only <li> + bare-qty <p> (no unit) must not import tip alone.
+        let html = r#"
+          <h1>Guacamole</h1>
+          <p>A party favorite with a tip:</p>
+          <ul><li>Use ripe fruit if you can</li></ul>
+          <p>6 eggs</p>
+          <p>3 avocados</p>
+          <h2>Method</h2>
+          <ol><li>Mash and serve.</li></ol>
+        "#;
+        let (r, status) = recipe_from_html_status(html, "Guacamole");
+        assert_eq!(
+            status,
+            IngredientStatus::AmbiguousStructure,
+            "bare-qty paragraphs must compete with tip-li"
+        );
+        assert!(
+            r.ingredients.is_empty(),
+            "must not import tip alone: {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert!(!is_cookable(&r));
+    }
+
+    #[test]
+    fn looks_like_yield_line_covers_hangms_variants() {
+        assert!(looks_like_yield_line("16 servings"));
+        assert!(looks_like_yield_line("8 slices"));
+        assert!(looks_like_yield_line(
+            "4 first-course servings (about 1 cup each)"
+        ));
+        assert!(looks_like_yield_line(
+            "6 entrée servings (about 1½ cups each)"
+        ));
+        assert!(looks_like_yield_line("Serves 4"));
+        assert!(!looks_like_yield_line("8 slices bacon, cooked"));
+        assert!(!looks_like_yield_line("2 cups flour"));
     }
 
     #[test]
