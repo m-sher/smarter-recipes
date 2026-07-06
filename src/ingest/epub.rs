@@ -238,7 +238,8 @@ pub fn is_subject_index_stats(page_number_links: usize, titled_links: usize) -> 
 
 /// Quality score for a catalog candidate. `None` = do not use (subject index / too small).
 pub fn catalog_quality_score(parsed: &IndexParseResult, path_hint: &str) -> Option<i64> {
-    if parsed.entries.len() < 2 {
+    // Single-recipe cookbooks (one titled index link) are valid catalogs.
+    if parsed.entries.is_empty() {
         return None;
     }
     // Never treat a page-number subject index (plus a few section labels) as the catalog.
@@ -861,11 +862,13 @@ fn line_kind_for_element(el: ElementRef<'_>) -> LineKind {
 }
 
 /// Whole-token class match for ingredient-paragraph conventions (never free-text guess).
+///
+/// Intentionally omits the short token `ing` (too collision-prone with unrelated classes).
 pub fn is_ingredient_class_attr(class_attr: &str) -> bool {
     class_attr.split_whitespace().any(|tok| {
         matches!(
             tok.to_ascii_lowercase().as_str(),
-            "hang" | "ingredient" | "ingredients" | "ing" | "recipe-ingredient"
+            "hang" | "ingredient" | "ingredients" | "recipe-ingredient"
         )
     })
 }
@@ -1089,7 +1092,7 @@ fn recipe_from_source_lines(
 
 /// Unambiguous list-only promote, or skip (no guessing).
 enum PreHeaderIngredients {
-    /// List items only; no non-heading paragraph carries unit/quantity.
+    /// List items only; no competing ingredient-shaped paragraph/plain lines.
     ListItems(Vec<String>),
     /// No list items, or list coexists with a measured paragraph/plain line.
     Ambiguous,
@@ -1097,6 +1100,11 @@ enum PreHeaderIngredients {
 
 /// On the no-`Ingredients:` path: import list items only when that is the sole
 /// structural ingredient source. Never guess from prose or merge mixed markup.
+///
+/// Headnote prose that merely mentions unit words (`can` as a modal, `slices` of
+/// potato, etc.) is **not** competing measured content. Only ingredient-shaped
+/// Paragraph/Plain lines (leading quantity **and** a unit token) count as
+/// ambiguous co-sources alongside list/class items.
 fn resolve_pre_header_ingredients(lines: &[SourceLine]) -> PreHeaderIngredients {
     let list_items: Vec<String> = lines
         .iter()
@@ -1116,16 +1124,21 @@ fn resolve_pre_header_ingredients(lines: &[SourceLine]) -> PreHeaderIngredients 
         // List tip coexisting with `<p>2 cups flour</p>`-style lines — refuse.
         return PreHeaderIngredients::Ambiguous;
     }
-    // Headnote paragraphs without measure/quantity are fine; list items win.
+    // Ordinary headnotes (incl. modal "can", unquantified "slices") are fine;
+    // list / hang-class items win.
     PreHeaderIngredients::ListItems(list_items)
 }
 
+/// True only for **ingredient-shaped** lines: leading quantity + unit token.
+///
+/// Bare unit words mid-prose (modal "can", "sweet potato slices", …) must not
+/// trigger the measured-paragraph ambiguity guard against hang/li ingredients.
 fn looks_like_measured_ingredient(line: &str) -> bool {
     // Yield lines co-exist with real ingredient lists; they are not competing `<p>` ingredients.
     if looks_like_yield_line(line) {
         return false;
     }
-    has_measure_unit_token(line) || starts_with_quantity_token(line)
+    starts_with_quantity_token(line) && has_measure_unit_token(line)
 }
 
 /// `16 servings`, `Serves 4`, `Makes about 2 cups` — not an ingredient paragraph.
@@ -1374,6 +1387,79 @@ mod tests {
         assert!(!is_ingredient_class_attr("hangms"));
         assert!(!is_ingredient_class_attr("hangsr"));
         assert!(is_ingredient_class_attr("recipe-ingredient"));
+        assert!(is_ingredient_class_attr("ingredient"));
+        assert!(is_ingredient_class_attr("ingredients"));
+        // Short `ing` token is too collision-prone; do not treat as ingredient class.
+        assert!(!is_ingredient_class_attr("ing"));
+        assert!(!is_ingredient_class_attr("foo ing bar"));
+    }
+
+    #[test]
+    fn catalog_quality_score_accepts_single_titled_entry() {
+        let html = r#"<html><body>
+          <a href="Chapter001.html#sec1">Method Style One-Shot</a>
+        </body></html>"#;
+        let parsed = parse_index_document(html, "OEBPS/Contents.html");
+        assert_eq!(parsed.entries.len(), 1);
+        let score =
+            catalog_quality_score(&parsed, "OEBPS/Contents.html").expect("single entry scores");
+        assert!(score > 0);
+    }
+
+    #[test]
+    fn hang_ingredients_with_modal_can_and_slices_headnote_resolve() {
+        // many.epub-style false positives: headnote prose with modal "can" / "slices"
+        // must not compete with p.hang ListItems.
+        let html = r#"
+        <html><body>
+          <p class="subheadingr">SWEET POTATO CASSEROLE</p>
+          <p class="normalr"><i>Raw sweet potato slices keep well. Any extra can be frozen for later.</i></p>
+          <p class="hangms"><b>8 servings</b></p>
+          <p class="hang">2 cups mashed sweet potatoes</p>
+          <p class="hang">1/2 cup brown sugar</p>
+          <p class="hang">1 can (5 ounces) evaporated milk</p>
+          <p class="hangss"><b>Per Serving:</b></p>
+          <p class="hangsr">Calories: 120</p>
+          <p class="normal-ts1"><b>1.</b> Combine and bake.</p>
+        </body></html>
+        "#;
+        let (recipe, status) = recipe_from_html_status(html, "Sweet Potato Casserole");
+        assert_eq!(
+            status,
+            IngredientStatus::Resolved,
+            "headnote unit words must not make structure ambiguous"
+        );
+        assert_eq!(
+            recipe.ingredients.len(),
+            3,
+            "hang lines only: {:?}",
+            recipe.ingredients
+        );
+        assert!(
+            recipe
+                .ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("sweet potatoes")),
+            "{:?}",
+            recipe.ingredients
+        );
+        assert!(
+            recipe
+                .ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("evaporated milk")),
+            "leading-qty '1 can …' hang line must still import: {:?}",
+            recipe.ingredients
+        );
+        assert!(
+            !recipe.ingredients.iter().any(|i| {
+                let o = i.original.to_lowercase();
+                o.contains("frozen") || o.contains("raw sweet potato slices")
+            }),
+            "headnote must not be an ingredient: {:?}",
+            recipe.ingredients
+        );
+        assert!(is_cookable(&recipe));
     }
 
     #[test]
