@@ -61,6 +61,7 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
     let mut missing_resources = 0usize;
     let mut loaded_any = false;
     let mut skipped_unresolved = 0usize;
+    let mut skipped_ambiguous: Vec<String> = Vec::new();
 
     for res_path in path_keys {
         let mut group = by_path.remove(&res_path).unwrap_or_default();
@@ -94,9 +95,17 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
             if !seen_href.insert(loc_key) {
                 continue;
             }
-            let recipe = html_segment_to_recipe(&entry, &segment_html, path, &resolved_epub_path);
-            if is_cookable(&recipe) {
-                out.push(recipe);
+            let (recipe, status) =
+                html_segment_to_recipe(&entry, &segment_html, path, &resolved_epub_path);
+            match status {
+                IngredientStatus::AmbiguousStructure => {
+                    skipped_ambiguous.push(recipe.title);
+                }
+                IngredientStatus::Resolved => {
+                    if is_cookable(&recipe) {
+                        out.push(recipe);
+                    }
+                }
             }
         }
     }
@@ -107,6 +116,17 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
             if skipped_unresolved == 1 { "y" } else { "ies" }
         );
     }
+    if !skipped_ambiguous.is_empty() {
+        eprintln!(
+            "note: skipped {} recipe(s) with ambiguous ingredients \
+             (need an Ingredients: heading, or list-only ingredients with no measured paragraphs; \
+             enter manually if needed):",
+            skipped_ambiguous.len()
+        );
+        for title in &skipped_ambiguous {
+            eprintln!("  - {title}");
+        }
+    }
 
     if !loaded_any && missing_resources > 0 {
         bail!(
@@ -115,6 +135,13 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
     }
 
     if out.is_empty() {
+        if !skipped_ambiguous.is_empty() {
+            bail!(
+                "EPUB index/TOC produced entries but all had ambiguous or non-cookable ingredients \
+                 ({} skipped as structurally ambiguous)",
+                skipped_ambiguous.len()
+            );
+        }
         bail!(
             "EPUB index/TOC produced entries but none looked cookable \
              (need ≥2 ingredient lines with amounts)"
@@ -548,13 +575,22 @@ pub fn segment_html(html: &str, entries: &[IndexEntry]) -> Vec<(IndexEntry, Stri
     out
 }
 
+/// How ingredients were obtained for a segment (no guessing on the no-heading path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngredientStatus {
+    /// Explicit `Ingredients:` section, or unambiguous list-only structure.
+    Resolved,
+    /// No list structure, or list items coexisting with measured paragraphs.
+    AmbiguousStructure,
+}
+
 fn html_segment_to_recipe(
     entry: &IndexEntry,
     segment_html: &str,
     epub_path: &str,
     resolved_epub_path: &str,
-) -> Recipe {
-    let mut recipe = recipe_from_html(segment_html, &entry.title);
+) -> (Recipe, IngredientStatus) {
+    let (mut recipe, status) = recipe_from_html_status(segment_html, &entry.title);
     recipe.source = RecipeSource::Epub {
         path: epub_path.to_string(),
         href: entry.href.clone(),
@@ -569,7 +605,7 @@ fn html_segment_to_recipe(
         )),
         ..Default::default()
     };
-    recipe
+    (recipe, status)
 }
 
 /// HTML element role for a source line — used to separate headnotes (`<p>`) from
@@ -590,11 +626,17 @@ struct SourceLine {
     text: String,
 }
 
-/// Build a recipe from an HTML fragment, preserving element kinds so list items
-/// become ingredients and leading paragraphs become headnotes when there is no
-/// explicit `Ingredients:` heading.
-pub fn recipe_from_html(html: &str, fallback_title: &str) -> Recipe {
+/// Build a recipe from an HTML fragment, preserving element kinds.
+///
+/// On the no-`Ingredients:` path, only **unambiguous list-only** structure is
+/// promoted; ambiguous cases yield empty ingredients (see [`IngredientStatus`]).
+fn recipe_from_html_status(html: &str, fallback_title: &str) -> (Recipe, IngredientStatus) {
     recipe_from_source_lines(&html_to_source_lines(html, fallback_title), fallback_title)
+}
+
+#[cfg(test)]
+fn recipe_from_html(html: &str, fallback_title: &str) -> Recipe {
+    recipe_from_html_status(html, fallback_title).0
 }
 
 fn html_to_source_lines(html: &str, fallback_title: &str) -> Vec<SourceLine> {
@@ -798,8 +840,8 @@ fn html_visible_len(html: &str) -> usize {
 
 /// Same structure as file plain-text import (no HTML element kinds).
 ///
-/// All lines are [`LineKind::Plain`]; headnote stripping uses the text-shape
-/// fallback. Prefer [`recipe_from_html`] when source HTML is available.
+/// Without list structure, the no-`Ingredients:` path is **ambiguous** (no
+/// guessing). Prefer [`recipe_from_html`] when source HTML is available.
 #[cfg(test)]
 fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
     let mut lines = Vec::new();
@@ -808,8 +850,6 @@ fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
         if t.is_empty() {
             continue;
         }
-        // First non-empty line is the title slot; rest are structure-less Plain
-        // (text-shape headnote fallback applies on promote).
         let kind = if lines.is_empty() {
             LineKind::Heading
         } else {
@@ -820,17 +860,19 @@ fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
             text: t.to_string(),
         });
     }
-    recipe_from_source_lines(&lines, title_override)
+    recipe_from_source_lines(&lines, title_override).0
 }
 
-fn recipe_from_source_lines(lines: &[SourceLine], title_override: &str) -> Recipe {
+fn recipe_from_source_lines(
+    lines: &[SourceLine],
+    title_override: &str,
+) -> (Recipe, IngredientStatus) {
     let mut title = title_override.to_string();
     let mut ingredients = Vec::new();
     let mut steps = Vec::new();
     let mut section = "title";
     let mut saw_ingredients_header = false;
-    // Buffered body before Ingredients/Steps; promoted when no Ingredients:
-    // section (structure-aware when list items are present).
+    // Buffered body before Ingredients/Steps; promoted only when unambiguous.
     let mut pre_header_body: Vec<SourceLine> = Vec::new();
 
     for line in lines {
@@ -877,91 +919,61 @@ fn recipe_from_source_lines(lines: &[SourceLine], title_override: &str) -> Recip
         }
     }
 
-    // No Ingredients: section → promote buffered body.
-    // Prefer structural discrimination (list items = ingredients, paragraphs =
-    // headnotes). Text-shape heuristic only when the buffer has no list items.
+    let mut status = IngredientStatus::Resolved;
+    // No Ingredients: section → promote **only** when structure is unambiguous.
+    // Never invent ingredients from text shape or mixed list+measured-paragraph markup.
     if !saw_ingredients_header && ingredients.is_empty() && !pre_header_body.is_empty() {
-        let kept = promote_pre_header_as_ingredients(&pre_header_body);
-        ingredients = kept.iter().map(|s| normalize_line(s)).collect();
+        match resolve_pre_header_ingredients(&pre_header_body) {
+            PreHeaderIngredients::ListItems(items) => {
+                ingredients = items.iter().map(|s| normalize_line(s)).collect();
+            }
+            PreHeaderIngredients::Ambiguous => {
+                status = IngredientStatus::AmbiguousStructure;
+            }
+        }
     }
 
     let mut recipe = Recipe::new(sanitize(&title));
     recipe.ingredients = ingredients;
     recipe.steps = steps;
-    recipe
+    (recipe, status)
 }
 
-/// Choose ingredient lines from the pre-header buffer.
-///
-/// - If any [`LineKind::ListItem`] is present: keep **list items** and also
-///   **paragraphs that look like measured ingredients** (unit token or leading
-///   quantity). Prose paragraphs (headnotes / asides without amounts) are
-///   dropped. This handles mixed/inverted markup where real ingredients are
-///   `<p>2 cups flour</p>` while a tip lives in a stray `<li>`.
-/// - Otherwise (plain text or all-paragraph HTML): fall back to stripping
-///   leading sentence-shaped prose.
-fn promote_pre_header_as_ingredients(lines: &[SourceLine]) -> Vec<String> {
-    let has_list = lines.iter().any(|l| l.kind == LineKind::ListItem);
-    if has_list {
-        return lines
-            .iter()
-            .filter(|l| match l.kind {
-                LineKind::ListItem => true,
-                LineKind::Paragraph | LineKind::Plain => looks_like_measured_ingredient(&l.text),
-                LineKind::Heading => false,
-            })
-            .map(|l| l.text.clone())
-            .collect();
-    }
-    let texts: Vec<String> = lines
+/// Unambiguous list-only promote, or skip (no guessing).
+enum PreHeaderIngredients {
+    /// List items only; no non-heading paragraph carries unit/quantity.
+    ListItems(Vec<String>),
+    /// No list items, or list coexists with a measured paragraph/plain line.
+    Ambiguous,
+}
+
+/// On the no-`Ingredients:` path: import list items only when that is the sole
+/// structural ingredient source. Never guess from prose or merge mixed markup.
+fn resolve_pre_header_ingredients(lines: &[SourceLine]) -> PreHeaderIngredients {
+    let list_items: Vec<String> = lines
         .iter()
-        .filter(|l| l.kind != LineKind::Heading)
+        .filter(|l| l.kind == LineKind::ListItem)
         .map(|l| l.text.clone())
         .collect();
-    strip_leading_headnote_lines(&texts)
+    let has_measured_paragraph = lines.iter().any(|l| {
+        matches!(l.kind, LineKind::Paragraph | LineKind::Plain)
+            && looks_like_measured_ingredient(&l.text)
+    });
+
+    if list_items.is_empty() {
+        // Would require text-shape guessing — refuse.
+        return PreHeaderIngredients::Ambiguous;
+    }
+    if has_measured_paragraph {
+        // List tip coexisting with `<p>2 cups flour</p>`-style lines — refuse.
+        return PreHeaderIngredients::Ambiguous;
+    }
+    // Headnote paragraphs without measure/quantity are fine; list items win.
+    PreHeaderIngredients::ListItems(list_items)
 }
 
-/// Paragraph/plain line that carries a measure or leading quantity — treat as
-/// an ingredient even when list items also exist in the buffer.
 fn looks_like_measured_ingredient(line: &str) -> bool {
     has_measure_unit_token(line) || starts_with_quantity_token(line)
-}
-
-/// Text-shape fallback: drop leading sentence-shaped headnote lines.
-fn strip_leading_headnote_lines(lines: &[String]) -> Vec<String> {
-    let start = lines
-        .iter()
-        .position(|l| !looks_like_headnote_sentence(l))
-        .unwrap_or(lines.len());
-    lines[start..].to_vec()
-}
-
-/// True when a plain-text line looks like narrative headnote prose.
-///
-/// Used only when HTML provides no list structure. Sentence-shaped (several
-/// words, terminal punctuation, no measure/unit token); quantity-led short
-/// lines and unit-bearing lines are kept as ingredients.
-fn looks_like_headnote_sentence(line: &str) -> bool {
-    let t = line.trim();
-    if t.is_empty() || !ends_with_sentence_punct(t) {
-        return false;
-    }
-    let word_count = t.split_whitespace().count();
-    if word_count < 4 {
-        return false;
-    }
-    if has_measure_unit_token(t) {
-        return false;
-    }
-    if starts_with_quantity_token(t) && word_count <= 6 {
-        return false;
-    }
-    true
-}
-
-fn ends_with_sentence_punct(t: &str) -> bool {
-    let t = t.trim_end();
-    t.ends_with(['.', '!', '?', '…']) || t.ends_with("...")
 }
 
 /// Common culinary unit / measure tokens (word-boundary). Bare numbers do not count.
@@ -1338,9 +1350,8 @@ mod tests {
     }
 
     #[test]
-    fn mixed_list_tip_and_paragraph_ingredients_kept() {
-        // Round-7: list-only promote dropped measured `<p>` ingredients when a
-        // stray tip `<li>` made has_list true.
+    fn mixed_list_tip_and_paragraph_ingredients_is_ambiguous() {
+        // Owner bar: never guess. List tip + measured `<p>` ingredients = skip.
         let html = r#"
           <h1>Pancakes</h1>
           <p>A weekend treat with a tip:</p>
@@ -1351,61 +1362,71 @@ mod tests {
           <h2>Method</h2>
           <ol><li>Mix and griddle.</li></ol>
         "#;
-        let r = recipe_from_html(html, "Pancakes");
-        let ings: Vec<_> = r.ingredients.iter().map(|i| i.original.as_str()).collect();
+        let (r, status) = recipe_from_html_status(html, "Pancakes");
+        assert_eq!(status, IngredientStatus::AmbiguousStructure);
         assert!(
-            is_cookable(&r),
-            "mixed p-ingredients must stay cookable: {ings:?}"
-        );
-        assert!(
-            ings.iter().any(|i| i.contains("flour")),
-            "measured paragraph flour dropped: {ings:?}"
-        );
-        assert!(
-            ings.iter().any(|i| i.contains("egg")),
-            "measured paragraph egg dropped: {ings:?}"
-        );
-        assert!(
-            ings.iter().any(|i| i.contains("milk")),
-            "measured paragraph milk dropped: {ings:?}"
-        );
-        assert!(
-            !ings
-                .iter()
-                .any(|i| i.to_lowercase().contains("weekend treat")),
-            "prose headnote leaked: {ings:?}"
-        );
-        // Tip list item may still be present (list items are kept); real ingredients must not be lost.
-        assert!(
-            r.ingredients
-                .iter()
-                .filter(|i| {
-                    let o = i.original.to_lowercase();
-                    o.contains("flour") || o.contains("egg") || o.contains("milk")
-                })
-                .count()
-                >= 3
-        );
-    }
-
-    #[test]
-    fn headerless_strips_leading_headnote_keeps_amounts() {
-        let text = "\
-Simple Salad
-A bright summer side for picnics.
-2 cups lettuce
-1 cup tomatoes
-1 tbsp oil
-";
-        let r = plain_recipe_from_text(text, "Simple Salad");
-        assert!(
-            is_cookable(&r),
-            "headerless with headnote must stay cookable: ings={:?}",
+            r.ingredients.is_empty(),
+            "must not fabricate/partial ingredients: {:?}",
             r.ingredients
                 .iter()
                 .map(|i| &i.original)
                 .collect::<Vec<_>>()
         );
+        assert!(!is_cookable(&r));
+    }
+
+    #[test]
+    fn ingest_reports_ambiguous_skip_by_title() {
+        // End-to-end: book with one clean list recipe + one ambiguous mixed segment.
+        let dir = tempfile::tempdir().unwrap();
+        let epub_path = dir.path().join("mixed.epub");
+        write_ambiguous_mix_epub(&epub_path);
+        let recipes = ingest_epub(epub_path.to_str().unwrap()).expect("ingest");
+        // Only the unambiguous Method-style list recipe should import.
+        assert_eq!(
+            recipes.len(),
+            1,
+            "got: {:?}",
+            recipes.iter().map(|r| &r.title).collect::<Vec<_>>()
+        );
+        assert_eq!(recipes[0].title, "Tomato Soup");
+        assert!(is_cookable(&recipes[0]));
+        assert_eq!(recipes[0].ingredients.len(), 3);
+    }
+
+    #[test]
+    fn all_paragraph_no_list_is_ambiguous() {
+        // No list structure and no Ingredients: heading → refuse to text-guess.
+        let html = r#"
+          <h1>Simple Salad</h1>
+          <p>A bright summer side for picnics.</p>
+          <p>2 cups lettuce</p>
+          <p>1 cup tomatoes</p>
+          <p>1 tbsp oil</p>
+        "#;
+        let (r, status) = recipe_from_html_status(html, "Simple Salad");
+        assert_eq!(status, IngredientStatus::AmbiguousStructure);
+        assert!(r.ingredients.is_empty());
+        assert!(!is_cookable(&r));
+    }
+
+    #[test]
+    fn list_only_with_prose_headnote_imports() {
+        // Unambiguous: headnote `<p>` (no measure) + ingredient `<li>` only.
+        let html = r#"
+          <h1>Simple Salad</h1>
+          <p>A bright summer side for picnics.</p>
+          <ul>
+            <li>2 cups lettuce</li>
+            <li>1 cup tomatoes</li>
+            <li>1 tbsp oil</li>
+          </ul>
+          <h2>Directions</h2>
+          <ol><li>Toss.</li></ol>
+        "#;
+        let (r, status) = recipe_from_html_status(html, "Simple Salad");
+        assert_eq!(status, IngredientStatus::Resolved);
+        assert!(is_cookable(&r));
         assert_eq!(r.ingredients.len(), 3);
         assert!(
             !r.ingredients
@@ -1760,6 +1781,116 @@ A bright summer side for picnics.
       <li>Beat eggs.</li>
       <li>Cook in butter.</li>
     </ol>
+  </section>
+</body></html>"#,
+        )
+        .unwrap();
+
+        zip.finish().unwrap();
+    }
+
+    /// One unambiguous list+Directions recipe and one mixed tip-li + measured-p recipe.
+    fn write_ambiguous_mix_epub(path: &Path) {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let deflated =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+        zip.start_file("mimetype", stored).unwrap();
+        zip.write_all(b"application/epub+zip").unwrap();
+
+        zip.start_file("META-INF/container.xml", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/content.opf", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">urn:test:mixed</dc:identifier>
+    <dc:title>Mixed Cookbook</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="index" href="Text/index.xhtml" media-type="application/xhtml+xml"/>
+    <item id="recipes" href="Text/recipes.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="nav"/>
+    <itemref idref="index"/>
+    <itemref idref="recipes"/>
+  </spine>
+</package>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/nav.xhtml", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Nav</title></head>
+<body>
+  <nav epub:type="toc"><ol>
+    <li><a href="Text/index.xhtml">Recipe Index</a></li>
+  </ol></nav>
+</body></html>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/Text/index.xhtml", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Recipe Index</title></head>
+<body>
+  <h1>Recipe Index</h1>
+  <ul>
+    <li><a href="recipes.xhtml#soup">Tomato Soup</a></li>
+    <li><a href="recipes.xhtml#pancakes">Pancakes</a></li>
+  </ul>
+</body></html>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/Text/recipes.xhtml", deflated)
+            .unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Recipes</title></head>
+<body>
+  <section id="soup">
+    <h1>Tomato Soup</h1>
+    <ul>
+      <li>2 cups tomatoes</li>
+      <li>1 cup stock</li>
+      <li>1 tbsp olive oil</li>
+    </ul>
+    <h2>Directions</h2>
+    <ol>
+      <li>Simmer everything.</li>
+    </ol>
+  </section>
+  <section id="pancakes">
+    <h1>Pancakes</h1>
+    <p>A weekend treat with a tip:</p>
+    <ul><li>Use fresh berries if you can</li></ul>
+    <p>2 cups flour</p>
+    <p>1 egg</p>
+    <p>1 cup milk</p>
+    <h2>Method</h2>
+    <ol><li>Mix and griddle.</li></ol>
   </section>
 </body></html>"#,
         )
