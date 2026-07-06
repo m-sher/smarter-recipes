@@ -2,7 +2,7 @@
 
 use crate::domain::{IngredientKey, MealPlan, Recipe, RecipeSource, ShoppingList, UnitKind};
 use crate::ingest::{
-    ingest_from, normalize_url, read_manual_recipe, recipe_source_url, scrape_new_recipes,
+    ingest_many, normalize_url, read_manual_recipe, recipe_source_url, scrape_new_recipes,
     search_scrape_recipes, HtmlFetcher, HttpFetcher, RecipeSourceIngest, ScrapeEvent,
     ScrapeOutcome, ScrapeParams, UrlSource,
 };
@@ -37,11 +37,12 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Ingest a recipe from a source (file, url, image, auto, or manual)
+    /// Ingest a recipe from a source (file, url, image, epub, auto, or manual).
+    /// EPUB imports may save multiple recipes from a linked recipe index.
     Import {
-        /// Source kind: file | url | image | auto | manual
+        /// Source kind: file | url | image | epub | auto | manual
         source: String,
-        /// Path, URL, or image path. Omit for `manual` to enter interactively.
+        /// Path, URL, image path, or EPUB. Omit for `manual` to enter interactively.
         input: Option<String>,
         /// Print recipe as JSON instead of saving
         #[arg(long)]
@@ -322,32 +323,78 @@ pub fn run(cli: Cli) -> Result<()> {
         } => {
             let interactive = matches!(source.to_lowercase().as_str(), "manual" | "interactive")
                 && input.as_deref().is_none_or(|s| s.is_empty() || s == "-");
-            let mut recipe = if interactive {
-                read_manual_recipe(&mut std::io::stdin().lock(), &mut std::io::stderr())?
+            let input_path = input.clone();
+            let recipes = if interactive {
+                vec![read_manual_recipe(
+                    &mut std::io::stdin().lock(),
+                    &mut std::io::stderr(),
+                )?]
             } else {
                 let input = input
                     .ok_or_else(|| anyhow::anyhow!("input is required for source '{source}'"))?;
-                ingest_from(&source, &input)?
+                ingest_many(&source, &input)?
             };
-            // Clean scraped title text (entities, curly punctuation).
-            recipe.title = crate::text::sanitize(&recipe.title);
-            print_recipe_summary(&recipe);
-            if dry_run {
-                println!("{}", serde_json::to_string_pretty(&recipe)?);
-            } else if store.is_duplicate(recipe_source_url(&recipe).as_deref())? {
+            let multi = recipes.len() > 1
+                || matches!(source.to_lowercase().as_str(), "epub" | "ebook")
+                || input_path.as_deref().is_some_and(|p| {
+                    std::path::Path::new(p)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
+                });
+            let mut saved = 0usize;
+            let mut skipped_dup = 0usize;
+            let mut skipped_junk = 0usize;
+            for mut recipe in recipes {
+                recipe.title = crate::text::sanitize(&recipe.title);
+                if !multi {
+                    print_recipe_summary(&recipe);
+                } else {
+                    eprintln!(
+                        "  · {} ({} ingredients)",
+                        recipe.title,
+                        recipe.ingredients.len()
+                    );
+                }
+                if dry_run {
+                    println!("{}", serde_json::to_string_pretty(&recipe)?);
+                    continue;
+                }
+                if store.is_duplicate(recipe_source_url(&recipe).as_deref())? {
+                    if multi {
+                        skipped_dup += 1;
+                    } else {
+                        println!(
+                            "Skipped: already have a recipe with this source URL ({})",
+                            recipe.title
+                        );
+                    }
+                } else if prunable(&recipe) {
+                    if multi {
+                        skipped_junk += 1;
+                    } else {
+                        println!(
+                            "Skipped: not a cookable recipe and no published nutrition — {} ingredient line(s), too few carry amounts ({})",
+                            recipe.ingredients.len(),
+                            recipe.title
+                        );
+                    }
+                } else {
+                    store.save_recipe(&recipe)?;
+                    if multi {
+                        saved += 1;
+                    } else {
+                        println!("Saved recipe {} to {}", recipe.id, store.path().display());
+                    }
+                }
+            }
+            if multi && !dry_run {
                 println!(
-                    "Skipped: already have a recipe with this source URL ({})",
-                    recipe.title
+                    "EPUB import: saved {saved}, skipped {skipped_dup} duplicate URL(s), skipped {skipped_junk} non-cookable → {}",
+                    store.path().display()
                 );
-            } else if prunable(&recipe) {
-                println!(
-                    "Skipped: not a cookable recipe and no published nutrition — {} ingredient line(s), too few carry amounts ({})",
-                    recipe.ingredients.len(),
-                    recipe.title
-                );
-            } else {
-                store.save_recipe(&recipe)?;
-                println!("Saved recipe {} to {}", recipe.id, store.path().display());
+            } else if multi && dry_run {
+                println!("(dry run) nothing saved");
             }
         }
         Commands::Scrape {
