@@ -46,9 +46,20 @@ impl From<&str> for RecipeId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum RecipeSource {
-    File { path: String },
-    Url { url: String },
-    Image { path: String },
+    File {
+        path: String,
+    },
+    Url {
+        url: String,
+    },
+    Image {
+        path: String,
+    },
+    /// Cookbook EPUB; `href` is the index locator (path + optional fragment).
+    Epub {
+        path: String,
+        href: String,
+    },
     Manual,
     Unknown,
 }

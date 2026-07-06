@@ -28,7 +28,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 highs = "2.3.0"
+epub = "2.1.5"
 
 [dev-dependencies]
 tempfile = "3"
 pretty_assertions = "1"
+zip = "2"

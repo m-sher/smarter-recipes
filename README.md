@@ -6,7 +6,7 @@ CLI tool that ingests recipes from multiple sources, stores them in a local SQLi
 
 | Area | What you get |
 |------|----------------|
-| **Ingestion** | JSON / TOML / plain text files, web pages (schema.org `Recipe` JSON-LD with HTML fallback), images via Tesseract OCR or `.txt` sidecars |
+| **Ingestion** | JSON / TOML / plain text files, web pages (schema.org `Recipe` JSON-LD with HTML fallback), images via Tesseract OCR or `.txt` sidecars, **EPUB cookbooks** (linked recipe index or TOC fallback) |
 | **Normalization** | Free-text ingredient lines → name, quantity, unit; units converted to canonical g / ml / ea for aggregation |
 | **Storage** | Embedded SQLite; ingredients deduplicated by `(name, unit kind)`; pantry stock by same identity |
 | **Pantry** | Track on-hand ingredients; mark shopping results as purchased; plan and shop net of stock |
@@ -57,6 +57,13 @@ smarter-recipes import auto recipes/pancakes.json
 
 # Enter a recipe interactively (title, servings, ingredients, steps)
 smarter-recipes import manual
+
+# From an EPUB cookbook: uses a linked recipe index (or TOC fallback) to
+# segment recipes — no Calibre. Page-number-only indexes are not supported.
+# May import many recipes in one command.
+smarter-recipes import epub path/to/cookbook.epub
+smarter-recipes import auto path/to/cookbook.epub
+smarter-recipes import epub path/to/cookbook.epub --dry-run
 
 # Crawl a seed URL for same-host recipe pages (BFS). Works from a category page:
 # links may point at site-root posts (not only path descendants of the seed).
@@ -177,7 +184,7 @@ smarter-recipes nutrition clear-cache   # drop cached lookups to force a re-fetc
 src/
   domain/       Shared types: Recipe, IngredientLine, MealPlan, PantryItem, units
   normalize/    Ingredient parsing + unit tables (no I/O)
-  ingest/       Pluggable sources: file, url, ocr, crawl (index scraping)
+  ingest/       Pluggable sources: file, url, ocr, epub (index segmentation), crawl
   storage/      SQLite persistence + ingredient dedup + pantry stock
   planning/     Min-union meal planner (no repeats; pantry-aware)
   shopping/     Package purchase optimizer (nets against pantry)
