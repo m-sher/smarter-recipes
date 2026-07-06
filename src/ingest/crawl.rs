@@ -98,11 +98,44 @@ pub fn normalize_url(u: &str) -> String {
 }
 
 /// The source URL a recipe was ingested from, if any.
+///
+/// EPUB identity uses a query `href=` (not a URL fragment) so
+/// [`normalize_url`] does not collapse every recipe from the same book into one key.
 pub fn recipe_source_url(r: &Recipe) -> Option<String> {
     match &r.source {
         RecipeSource::Url { url } => Some(url.clone()),
+        RecipeSource::Epub { path, href } => Some(epub_source_key(path, href)),
         _ => r.meta.source_url.clone(),
     }
+}
+
+/// Stable identity for one recipe entry inside an EPUB file.
+///
+/// Form: `epub://local/<canonical-or-raw-path>?href=<encoded>`.
+/// Query is preserved by [`normalize_url`]; path is canonicalized when possible.
+pub fn epub_source_key(path: &str, href: &str) -> String {
+    let path = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.replace('\\', "/"));
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    format!("epub://local{path}?href={}", encode_query_component(href))
+}
+
+fn encode_query_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Path segments that are almost never recipe content.
