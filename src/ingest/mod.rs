@@ -10,9 +10,9 @@ mod search;
 mod url;
 
 pub use crawl::{
-    discover_recipe_links, discover_scoped_links, is_listing_url, normalize_url, recipe_source_url,
-    scrape_from_seeds, scrape_new_recipes, HtmlFetcher, HttpFetcher, ScrapeEvent, ScrapeOutcome,
-    ScrapeParams,
+    discover_recipe_links, discover_scoped_links, epub_source_key, is_listing_url, normalize_url,
+    recipe_source_url, scrape_from_seeds, scrape_new_recipes, HtmlFetcher, HttpFetcher, ScrapeEvent,
+    ScrapeOutcome, ScrapeParams,
 };
 pub use epub::ingest_epub;
 pub use file::FileSource;

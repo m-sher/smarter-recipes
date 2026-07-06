@@ -390,7 +390,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             if multi && !dry_run {
                 println!(
-                    "EPUB import: saved {saved}, skipped {skipped_dup} duplicate URL(s), skipped {skipped_junk} non-cookable → {}",
+                    "Batch import: saved {saved}, skipped {skipped_dup} duplicate(s), skipped {skipped_junk} non-cookable → {}",
                     store.path().display()
                 );
             } else if multi && dry_run {

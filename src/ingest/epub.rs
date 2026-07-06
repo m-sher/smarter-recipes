@@ -4,7 +4,7 @@
 //! segment HTML by fragment/spine order → Ingredients/Steps heuristics →
 //! [`Recipe`] values filtered by [`super::is_cookable`].
 
-use super::is_cookable;
+use super::{epub_source_key, is_cookable};
 use crate::domain::{Recipe, RecipeMeta, RecipeSource};
 use crate::normalize::normalize_line;
 use crate::text::sanitize;
@@ -54,21 +54,33 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
     path_keys.sort_by_key(|p| spine_order.get(p).copied().unwrap_or(usize::MAX));
 
     let mut out = Vec::new();
-    let mut seen_titles: HashSet<String> = HashSet::new();
+    let mut seen_href: HashSet<String> = HashSet::new();
+    let mut missing_resources = 0usize;
+    let mut loaded_any = false;
 
     for res_path in path_keys {
         let mut group = by_path.remove(&res_path).unwrap_or_default();
         let html = match doc.get_resource_str_by_path(Path::new(&res_path)) {
             Some(s) => s,
-            None => continue,
+            None => {
+                missing_resources += 1;
+                continue;
+            }
         };
-        // Order entries by first occurrence of fragment in HTML.
+        loaded_any = true;
+        // Order entries by first occurrence of fragment in HTML (unresolved last).
         group.sort_by_key(|e| fragment_offset(&html, e.fragment.as_deref()).unwrap_or(usize::MAX));
 
         let segments = segment_html(&html, &group);
         for (entry, segment_html) in segments {
-            let title_key = normalize_title_key(&entry.title);
-            if title_key.is_empty() || !seen_titles.insert(title_key) {
+            // Dedup by locator (path+fragment/href), not display title — cookbooks
+            // often reuse titles like "Vinaigrette".
+            let loc_key = format!(
+                "{}#{}",
+                entry.path,
+                entry.fragment.as_deref().unwrap_or(entry.href.as_str())
+            );
+            if !seen_href.insert(loc_key) {
                 continue;
             }
             let recipe = html_segment_to_recipe(&entry, &segment_html, path);
@@ -76,6 +88,12 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
                 out.push(recipe);
             }
         }
+    }
+
+    if !loaded_any && missing_resources > 0 {
+        bail!(
+            "EPUB index/TOC pointed at {missing_resources} resource path(s) that could not be read"
+        );
     }
 
     if out.is_empty() {
@@ -105,7 +123,7 @@ fn collect_entries<R: Read + Seek>(doc: &mut EpubDoc<R>) -> Result<Vec<IndexEntr
     Ok(entries_from_toc(doc))
 }
 
-fn find_index_path<R: Read + Seek>(doc: &EpubDoc<R>) -> Option<String> {
+fn find_index_path<R: Read + Seek>(doc: &mut EpubDoc<R>) -> Option<String> {
     // Prefer resources whose path or id suggests an index.
     let mut candidates: Vec<(i32, String)> = Vec::new();
     for item in &doc.spine {
@@ -119,15 +137,30 @@ fn find_index_path<R: Read + Seek>(doc: &EpubDoc<R>) -> Option<String> {
             candidates.push((score, path_str));
         }
     }
-    // Also check TOC leaves labeled like an index.
-    for np in flatten_nav(&doc.toc) {
-        let label = np.label.to_lowercase();
-        if label.contains("recipe index") || label == "index" || label.contains("index of recipes")
-        {
-            return Some(path_to_string(&np.content));
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // TOC label "Index" only wins if that document actually has linked entries.
+    let toc_index_paths: Vec<String> = flatten_nav(&doc.toc)
+        .into_iter()
+        .filter(|np| {
+            let label = np.label.to_lowercase();
+            label.contains("recipe index")
+                || label == "index"
+                || label.contains("index of recipes")
+        })
+        .map(|np| {
+            let path = path_to_string(&np.content);
+            split_path_fragment(&path).0
+        })
+        .collect();
+    for path in toc_index_paths {
+        if let Some(html) = doc.get_resource_str_by_path(Path::new(&path)) {
+            if !parse_index_entries(&html, &path).is_empty() {
+                return Some(path);
+            }
         }
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
     candidates.into_iter().map(|(_, p)| p).next()
 }
 
@@ -246,9 +279,12 @@ pub fn parse_index_entries(html: &str, base_path: &str) -> Vec<IndexEntry> {
         if title.is_empty() || is_noise_title(&title) {
             continue;
         }
-        // Skip pure page-number labels ("12", "xiv").
-        if title.chars().all(|c| c.is_ascii_digit() || c == 'x' || c == 'i' || c == 'v')
-            && title.len() < 6
+        // Skip pure page-number labels ("12", "xiv", "XII").
+        let title_lc = title.to_ascii_lowercase();
+        if title_lc
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 'x' | 'i' | 'v'))
+            && title_lc.len() < 6
         {
             continue;
         }
@@ -356,23 +392,28 @@ fn spine_path_order<R: Read + Seek>(doc: &EpubDoc<R>) -> HashMap<String, usize> 
     m
 }
 
+/// Byte offset of an element id/name attribute with an **exact** fragment value.
+/// Avoids prefix false-positives (`id="a"` matching inside `id="apple"`).
 fn fragment_offset(html: &str, fragment: Option<&str>) -> Option<usize> {
     let frag = fragment?;
-    // id="frag" or name="frag" or id='frag'
-    let patterns = [
-        format!("id=\"{frag}\""),
-        format!("id='{frag}'"),
-        format!("name=\"{frag}\""),
-        format!("name='{frag}'"),
-    ];
-    patterns.iter().filter_map(|p| html.find(p)).min()
+    if frag.is_empty() {
+        return None;
+    }
+    let escaped = regex::escape(frag);
+    let re = Regex::new(&format!(
+        r#"(?i)\b(?:id|name)\s*=\s*(?:["']{escaped}["']|{escaped}\b)"#
+    ))
+    .ok()?;
+    re.find(html).map(|m| m.start())
 }
 
 /// Split HTML into per-entry segments using fragment anchors.
 ///
-/// Entries without a fragment that share a file alone get the whole body.
-/// Multiple fragment-less entries on one file cannot be split — each gets the full body
-/// (later cookable/title dedup filters noise).
+/// - Single entry → whole document.
+/// - Multiple entries, **no** resolvable fragments → one segment only (first entry),
+///   to avoid N clones of the same chapter.
+/// - Multiple entries with some resolvable fragments → cut between resolved offsets;
+///   entries whose fragment never appears are dropped.
 pub fn segment_html(html: &str, entries: &[IndexEntry]) -> Vec<(IndexEntry, String)> {
     if entries.is_empty() {
         return Vec::new();
@@ -381,40 +422,31 @@ pub fn segment_html(html: &str, entries: &[IndexEntry]) -> Vec<(IndexEntry, Stri
         return vec![(entries[0].clone(), html.to_string())];
     }
 
-    // Build cut points: (byte offset, entry index). Missing fragments → offset 0.
-    let mut cuts: Vec<(usize, usize)> = entries
+    let mut resolved: Vec<(usize, usize)> = entries
         .iter()
         .enumerate()
-        .map(|(i, e)| {
-            let off = fragment_offset(html, e.fragment.as_deref()).unwrap_or(0);
-            (off, i)
-        })
+        .filter_map(|(i, e)| fragment_offset(html, e.fragment.as_deref()).map(|off| (off, i)))
         .collect();
-    cuts.sort_by_key(|(off, i)| (*off, *i));
+
+    if resolved.is_empty() {
+        // Cannot split: emit a single full-document candidate under the first title.
+        return vec![(entries[0].clone(), html.to_string())];
+    }
+
+    resolved.sort_by_key(|(off, i)| (*off, *i));
+    // Dedupe identical offsets (keep first entry at that cut).
+    resolved.dedup_by_key(|(off, _)| *off);
 
     let mut out = Vec::new();
-    for (pos, &(start, entry_i)) in cuts.iter().enumerate() {
-        let end = cuts
+    for (pos, &(start, entry_i)) in resolved.iter().enumerate() {
+        let end = resolved
             .get(pos + 1)
             .map(|(next, _)| *next)
             .unwrap_or(html.len());
-        // If start==end and not last, skip empty; if all share offset 0, still give full html to each
-        // only when no fragments were found at all.
-        let slice = if start < end {
-            html[start..end].to_string()
-        } else if start == 0 && end == 0 {
-            // degenerate
-            String::new()
-        } else {
-            String::new()
-        };
-        // When no fragments resolve, every entry would get empty or same — give full doc once-ish.
-        let slice = if slice.is_empty() && entries[entry_i].fragment.is_none() {
-            html.to_string()
-        } else {
-            slice
-        };
-        out.push((entries[entry_i].clone(), slice));
+        if start >= end {
+            continue;
+        }
+        out.push((entries[entry_i].clone(), html[start..end].to_string()));
     }
     out
 }
@@ -428,7 +460,8 @@ fn html_segment_to_recipe(entry: &IndexEntry, segment_html: &str, epub_path: &st
     };
     recipe.meta = RecipeMeta {
         notes: Some(format!("Imported from EPUB index entry: {}", entry.href)),
-        source_url: Some(format!("epub://{}#{}", epub_path, entry.href)),
+        // Query form — fragments would be stripped by normalize_url dedup.
+        source_url: Some(epub_source_key(epub_path, &entry.href)),
         ..Default::default()
     };
     recipe
@@ -702,6 +735,48 @@ mod tests {
     }
 
     #[test]
+    fn fragment_offset_exact_not_prefix() {
+        let html = r#"<section id="apple">x</section><section id="a">y</section>"#;
+        assert!(fragment_offset(html, Some("a")).unwrap() > fragment_offset(html, Some("apple")).unwrap());
+        // "a" must not resolve to the start of id="apple"
+        let off_a = fragment_offset(html, Some("a")).unwrap();
+        assert!(html[off_a..].starts_with("id=\"a\"") || html[off_a..].contains("id=\"a\""));
+        assert!(!html[off_a..off_a + 10.min(html.len() - off_a)].contains("apple"));
+    }
+
+    #[test]
+    fn segment_without_resolvable_fragments_emits_one() {
+        let html = "<html><body><p>whole chapter</p></body></html>";
+        let entries = vec![
+            IndexEntry {
+                title: "One".into(),
+                path: "x".into(),
+                fragment: Some("missing".into()),
+                href: "#missing".into(),
+            },
+            IndexEntry {
+                title: "Two".into(),
+                path: "x".into(),
+                fragment: Some("also-missing".into()),
+                href: "#also-missing".into(),
+            },
+        ];
+        let segs = segment_html(html, &entries);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].0.title, "One");
+        assert!(segs[0].1.contains("whole chapter"));
+    }
+
+    #[test]
+    fn epub_identity_keys_survive_normalize_url() {
+        use crate::ingest::normalize_url;
+        let a = epub_source_key("/tmp/book.epub", "recipes.xhtml#pancakes");
+        let b = epub_source_key("/tmp/book.epub", "recipes.xhtml#omelette");
+        assert_ne!(normalize_url(&a), normalize_url(&b));
+        assert!(normalize_url(&a).contains("href="));
+    }
+
+    #[test]
     fn html_segment_parses_ingredients_and_steps() {
         let html = r#"
           <section id="pancakes">
@@ -739,6 +814,39 @@ mod tests {
         for r in &recipes {
             assert!(matches!(r.source, RecipeSource::Epub { .. }));
             assert!(is_cookable(r));
+        }
+    }
+
+    #[test]
+    fn store_keeps_both_epub_recipes_not_collapsed_by_dedup() {
+        use crate::ingest::recipe_source_url;
+        use crate::storage::Store;
+
+        let dir = tempfile::tempdir().unwrap();
+        let epub_path = dir.path().join("cookbook.epub");
+        write_sample_epub(&epub_path);
+        let recipes = ingest_epub(epub_path.to_str().unwrap()).expect("ingest");
+        assert_eq!(recipes.len(), 2);
+
+        let db = dir.path().join("t.db");
+        let store = Store::open(&db).unwrap();
+        let mut saved = 0;
+        for r in &recipes {
+            let src = recipe_source_url(r);
+            assert!(!store.is_duplicate(src.as_deref()).unwrap(), "pre-save dup: {src:?}");
+            store.save_recipe(r).unwrap();
+            saved += 1;
+        }
+        assert_eq!(saved, 2);
+        assert_eq!(store.list_recipes(None).unwrap().len(), 2);
+
+        // Re-import: both should now be duplicates.
+        for r in &recipes {
+            assert!(
+                store
+                    .is_duplicate(recipe_source_url(r).as_deref())
+                    .unwrap()
+            );
         }
     }
 
