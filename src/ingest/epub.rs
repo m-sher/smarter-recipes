@@ -4,7 +4,7 @@
 //! segment HTML by fragment/spine order → Ingredients/Steps heuristics →
 //! [`Recipe`] values filtered by [`super::is_cookable`].
 
-use super::{epub_source_key_for_resolved, is_cookable, resolve_epub_path, text_has_amount};
+use super::{epub_source_key_for_resolved, is_cookable, resolve_epub_path};
 use crate::domain::{Recipe, RecipeMeta, RecipeSource};
 use crate::normalize::normalize_line;
 use crate::text::sanitize;
@@ -753,10 +753,11 @@ fn html_visible_len(html: &str) -> usize {
 /// **Headnotes:** prose before the first Ingredients header is not stored as
 /// ingredients. When the body is promoted to ingredients (no `Ingredients:`
 /// section — either headerless, or Steps/Method/Directions only), leading
-/// non-amount lines are stripped up to the first amount-bearing line (same
-/// heuristic as [`text_has_amount`] / `is_cookable`). That keeps common
-/// cookbook layouts like *title → bullets → Directions:* cookable while
-/// dropping leading headnote prose.
+/// **sentence-shaped** headnote lines are stripped (several words, terminal
+/// sentence punctuation, no measure/unit token). Stripping stops at the first
+/// list-like line (short, leading quantity, or unit token), so unquantified
+/// ingredients like "Salt and pepper to taste" are kept while numeric prose
+/// such as "Serves 4 as a hearty Sunday dinner." is dropped.
 pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
     let mut title = title_override.to_string();
     let mut ingredients = Vec::new();
@@ -808,9 +809,9 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
         }
     }
 
-    // No Ingredients: section → promote buffered body, stripping leading headnote
-    // prose (non-amount lines before the first amount-bearing line). Covers both
-    // headerless lists and title → [headnote] → bullets → Method/Directions.
+    // No Ingredients: section → promote buffered body, stripping leading
+    // sentence-shaped headnote prose. Covers headerless lists and
+    // title → [headnote] → bullets → Method/Directions.
     if !saw_ingredients_header && ingredients.is_empty() && !pre_header_body.is_empty() {
         let kept = strip_leading_headnote_lines(&pre_header_body);
         ingredients = kept.into_iter().map(normalize_line).collect();
@@ -822,13 +823,86 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
     recipe
 }
 
-/// Drop leading non-amount prose until the first amount-bearing line; keep the rest.
-/// If no line has an amount signal, keep all lines (cannot find a headnote boundary).
+/// Drop leading sentence-shaped headnote lines; keep from the first list-like line.
 fn strip_leading_headnote_lines(lines: &[String]) -> Vec<&str> {
-    match lines.iter().position(|l| text_has_amount(l)) {
-        Some(i) => lines[i..].iter().map(String::as_str).collect(),
-        None => lines.iter().map(String::as_str).collect(),
+    let start = lines
+        .iter()
+        .position(|l| !looks_like_headnote_sentence(l))
+        .unwrap_or(lines.len());
+    lines[start..].iter().map(String::as_str).collect()
+}
+
+/// True when a line looks like narrative headnote prose rather than an ingredient.
+///
+/// Heuristic (prose shape, not pure amount): several words, ends with sentence
+/// punctuation, and carries no unit/measure token. Numeric headnotes like
+/// "Serves 4 as a hearty Sunday dinner." match; list items like "2 lb chicken"
+/// or short unquantified "Salt and pepper to taste" do not.
+fn looks_like_headnote_sentence(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() || !ends_with_sentence_punct(t) {
+        return false;
     }
+    let word_count = t.split_whitespace().count();
+    // "Several words" — short label-ish lines with a period stay ingredients.
+    if word_count < 4 {
+        return false;
+    }
+    // Measure/unit tokens mark list items even when they end in a period
+    // (e.g. "2 cups flour, sifted.").
+    if has_measure_unit_token(t) {
+        return false;
+    }
+    // Leading quantity with no unit is still usually a list item ("3 avocados.")
+    // rather than headnote prose — only treat as headnote when it does *not*
+    // look quantity-led.
+    if starts_with_quantity_token(t) && word_count <= 6 {
+        return false;
+    }
+    true
+}
+
+fn ends_with_sentence_punct(t: &str) -> bool {
+    let t = t.trim_end();
+    t.ends_with(['.', '!', '?', '…']) || t.ends_with("...")
+}
+
+/// Common culinary unit / measure tokens (word-boundary). Intentionally does
+/// **not** treat a bare number as a measure — "Serves 4 …" is still a headnote.
+fn has_measure_unit_token(line: &str) -> bool {
+    static UNIT: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?i)\b(?:cups?|tbsps?|tsps?|teaspoons?|tablespoons?|lbs?|pounds?|oz|ounces?|kg|kilograms?|g|grams?|ml|milliliters?|l|liters?|litres?|pints?|quarts?|gallons?|cloves?|pinches?|dashes?|cans?|packages?|pkg|sticks?|bunches?|heads?|slices?|pieces?|sprigs?|handfuls?|scoops?|drops?)\b",
+        )
+        .expect("unit re")
+    });
+    UNIT.is_match(line)
+}
+
+/// Leading digit or vulgar fraction (not bare "a"/"an", which opens many headnotes).
+fn starts_with_quantity_token(line: &str) -> bool {
+    let t = line.trim_start();
+    let Some(first) = t.chars().next() else {
+        return false;
+    };
+    first.is_ascii_digit()
+        || matches!(
+            first,
+            '½' | '¼'
+                | '¾'
+                | '⅓'
+                | '⅔'
+                | '⅕'
+                | '⅖'
+                | '⅗'
+                | '⅘'
+                | '⅙'
+                | '⅚'
+                | '⅛'
+                | '⅜'
+                | '⅝'
+                | '⅞'
+        )
 }
 
 fn normalize_title_key(s: &str) -> String {
@@ -1117,6 +1191,91 @@ A bright summer side for picnics.
             !r.ingredients
                 .iter()
                 .any(|i| i.original.to_lowercase().contains("picnic")),
+            "headnote leaked: {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn numeric_headnote_sentence_not_kept_as_ingredient() {
+        // Pure amount heuristic would keep "Serves 4 …" because of the digit.
+        let text = "\
+Roast Chicken
+Serves 4 as a hearty Sunday dinner.
+2 lb chicken
+1 tbsp salt
+Method:
+Roast until done.
+";
+        let r = plain_recipe_from_text(text, "Roast Chicken");
+        assert!(
+            is_cookable(&r),
+            "expected cookable: ings={:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(r.ingredients.len(), 2);
+        assert!(
+            !r.ingredients.iter().any(|i| {
+                let o = i.original.to_lowercase();
+                o.contains("serves") || o.contains("sunday")
+            }),
+            "numeric headnote leaked: {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert!(r.ingredients.iter().any(|i| i.original.contains("chicken")));
+        assert!(r.ingredients.iter().any(|i| i.original.contains("salt")));
+    }
+
+    #[test]
+    fn leading_unquantified_ingredient_kept_before_amounts() {
+        // Pure amount strip wrongly dropped "Salt and pepper to taste".
+        let text = "\
+Guacamole
+A party favorite from our summer cookouts.
+Salt and pepper to taste
+3 avocados
+1 lime
+Directions:
+Mash and mix.
+";
+        let r = plain_recipe_from_text(text, "Guacamole");
+        assert!(
+            is_cookable(&r),
+            "expected cookable: ings={:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            r.ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("salt")
+                    && i.original.to_lowercase().contains("pepper")),
+            "unquantified leading ingredient dropped: {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert!(r
+            .ingredients
+            .iter()
+            .any(|i| i.original.contains("avocados")));
+        assert!(r.ingredients.iter().any(|i| i.original.contains("lime")));
+        assert!(
+            !r.ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("cookout")),
             "headnote leaked: {:?}",
             r.ingredients
                 .iter()
