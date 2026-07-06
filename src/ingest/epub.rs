@@ -705,13 +705,15 @@ fn html_segment_to_recipe(
 }
 
 /// HTML element role for a source line — used to separate headnotes (`<p>`) from
-/// ingredient bullets (`<li>`) without guessing from text shape.
+/// ingredient bullets (`<li>`) and class-tagged ingredient blocks without text-shape guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineKind {
     Heading,
     Paragraph,
-    /// `<li>`, `<dt>`/`<dd>`, or `.ingredient` nodes — preferred ingredient source.
+    /// Generic `<li>` / `<dt>` / `<dd>` — structural, but may co-exist with tip-only lists.
     ListItem,
+    /// Publisher CSS ingredient blocks (`p.hang`, `.ingredient`, …) — trusted complete set.
+    ClassIngredient,
     /// No HTML structure (plain-text import / tag-strip fallback).
     Plain,
 }
@@ -845,9 +847,9 @@ fn element_lines(html: &str) -> Vec<SourceLine> {
 fn line_kind_for_element(el: ElementRef<'_>) -> LineKind {
     let name = el.value().name();
     let class_attr = el.value().attr("class").unwrap_or("");
-    // Publisher CSS ingredient blocks (e.g. Agate `p.hang`) are structural, like `<li>`.
+    // Publisher CSS ingredient blocks (e.g. Agate `p.hang`) are a distinct structural source.
     if is_ingredient_class_attr(class_attr) {
-        return LineKind::ListItem;
+        return LineKind::ClassIngredient;
     }
     match name {
         "h1" | "h2" | "h3" | "h4" => LineKind::Heading,
@@ -855,7 +857,7 @@ fn line_kind_for_element(el: ElementRef<'_>) -> LineKind {
         "p" => LineKind::Paragraph,
         "div" | "span" => {
             // Only matched via `.ingredient` in the selector (also covered by class check).
-            LineKind::ListItem
+            LineKind::ClassIngredient
         }
         _ => LineKind::Paragraph,
     }
@@ -1090,77 +1092,81 @@ fn recipe_from_source_lines(
     (recipe, status)
 }
 
-/// Unambiguous list-only promote, or skip (no guessing).
+/// Unambiguous structural promote, or skip (no guessing).
 enum PreHeaderIngredients {
-    /// List items only; no competing ingredient-shaped paragraph/plain lines.
+    /// Class- or list-derived ingredients only.
     ListItems(Vec<String>),
-    /// No list items, or list coexists with a measured paragraph/plain line.
+    /// No structural ingredients, or generic list coexists with measured paragraphs.
     Ambiguous,
 }
 
-/// On the no-`Ingredients:` path: import list items only when that is the sole
-/// structural ingredient source. Never guess from prose or merge mixed markup.
+/// On the no-`Ingredients:` path: import structural ingredients only when unambiguous.
 ///
-/// Headnote prose that merely mentions unit words (`can` as a modal, `slices` of
-/// potato, etc.) is **not** competing measured content. Only ingredient-shaped
-/// Paragraph/Plain lines (leading quantity **and** a unit token) count as
-/// ambiguous co-sources alongside list/class items.
+/// **Class-tagged ingredients** (`p.hang`, `.ingredient`, …) are treated as the
+/// complete ingredient set — coexisting headnote/yield/nutrition paragraphs are
+/// different classes and do **not** run the measured-paragraph guard.
+///
+/// **Generic `<li>` only:** coexisting Paragraph/Plain lines with a leading
+/// quantity (e.g. `6 eggs`, `2 cups flour`) make the structure **Ambiguous**
+/// (never-guess; tip-li alone must not import as the sole ingredients).
 fn resolve_pre_header_ingredients(lines: &[SourceLine]) -> PreHeaderIngredients {
+    let class_items: Vec<String> = lines
+        .iter()
+        .filter(|l| l.kind == LineKind::ClassIngredient)
+        .map(|l| l.text.clone())
+        .collect();
+    if !class_items.is_empty() {
+        // Publisher class markup is authoritative; do not text-guess coexisting `<p>`.
+        return PreHeaderIngredients::ListItems(class_items);
+    }
+
     let list_items: Vec<String> = lines
         .iter()
         .filter(|l| l.kind == LineKind::ListItem)
         .map(|l| l.text.clone())
         .collect();
-    let has_measured_paragraph = lines.iter().any(|l| {
-        matches!(l.kind, LineKind::Paragraph | LineKind::Plain)
-            && looks_like_measured_ingredient(&l.text)
-    });
-
     if list_items.is_empty() {
         // Would require text-shape guessing — refuse.
         return PreHeaderIngredients::Ambiguous;
     }
-    if has_measured_paragraph {
-        // List tip coexisting with `<p>2 cups flour</p>`-style lines — refuse.
+
+    let has_competing_paragraph = lines.iter().any(|l| {
+        matches!(l.kind, LineKind::Paragraph | LineKind::Plain)
+            && looks_like_competing_ingredient_paragraph(&l.text)
+    });
+    if has_competing_paragraph {
+        // Tip-li coexisting with bare measured `<p>6 eggs</p>` / `2 cups flour` — refuse.
         return PreHeaderIngredients::Ambiguous;
     }
-    // Ordinary headnotes (incl. modal "can", unquantified "slices") are fine;
-    // list / hang-class items win.
+    // Headnote prose without a leading quantity is fine; generic list items win.
     PreHeaderIngredients::ListItems(list_items)
 }
 
-/// True only for **ingredient-shaped** lines: leading quantity + unit token.
+/// Broader never-guess guard for coexisting Paragraph/Plain next to generic `<li>`.
 ///
-/// Bare unit words mid-prose (modal "can", "sweet potato slices", …) must not
-/// trigger the measured-paragraph ambiguity guard against hang/li ingredients.
-fn looks_like_measured_ingredient(line: &str) -> bool {
-    // Yield lines co-exist with real ingredient lists; they are not competing `<p>` ingredients.
+/// Leading quantity alone counts (`6 eggs`, `3 avocados`) — not only qty+unit lines.
+/// Yield / servings lines are excluded. Mid-prose unit words without a leading
+/// quantity (modal "can", unquantified "slices") do not compete.
+fn looks_like_competing_ingredient_paragraph(line: &str) -> bool {
     if looks_like_yield_line(line) {
         return false;
     }
-    starts_with_quantity_token(line) && has_measure_unit_token(line)
+    starts_with_quantity_token(line)
 }
 
-/// `16 servings`, `Serves 4`, `Makes about 2 cups` — not an ingredient paragraph.
+/// `16 servings`, `Serves 4`, `Makes about 2 cups`, short `8 slices` yield lines.
+///
+/// Defense in depth for non-class yield paragraphs; class-ingredient trust is primary.
 pub fn looks_like_yield_line(line: &str) -> bool {
     static RE: Lazy<Regex> = Lazy::new(|| {
+        // Allow a few words between the count and "servings" (e.g. "4 first-course servings",
+        // "6 entrée servings"). Also match a sole short "N slices" yield line.
         Regex::new(
-            r"(?i)^(?:\d[\d./\-–to\s]*\s+servings?\b|serves\b|makes\b|yield(?:s|ed)?\b|about\s+\d+\s+servings?\b)",
+            r"(?i)^(?:\d[\d./\-–to\s]*\s+(?:\S+\s+){0,4}servings?\b|serves\b|makes\b|yield(?:s|ed)?\b|about\s+\d+\s+servings?\b|\d[\d./]*\s+slices?\s*(?:\([^)]*\))?\s*$)",
         )
         .expect("yield re")
     });
     RE.is_match(line.trim())
-}
-
-/// Common culinary unit / measure tokens (word-boundary). Bare numbers do not count.
-fn has_measure_unit_token(line: &str) -> bool {
-    static UNIT: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"(?i)\b(?:cups?|tbsps?|tsps?|teaspoons?|tablespoons?|lbs?|pounds?|oz|ounces?|kg|kilograms?|g|grams?|ml|milliliters?|l|liters?|litres?|pints?|quarts?|gallons?|cloves?|pinches?|dashes?|cans?|packages?|pkg|sticks?|bunches?|heads?|slices?|pieces?|sprigs?|handfuls?|scoops?|drops?)\b",
-        )
-        .expect("unit re")
-    });
-    UNIT.is_match(line)
 }
 
 fn starts_with_quantity_token(line: &str) -> bool {
@@ -1409,7 +1415,7 @@ mod tests {
     #[test]
     fn hang_ingredients_with_modal_can_and_slices_headnote_resolve() {
         // many.epub-style false positives: headnote prose with modal "can" / "slices"
-        // must not compete with p.hang ListItems.
+        // must not compete with p.hang ClassIngredient lines.
         let html = r#"
         <html><body>
           <p class="subheadingr">SWEET POTATO CASSEROLE</p>
@@ -1460,6 +1466,98 @@ mod tests {
             recipe.ingredients
         );
         assert!(is_cookable(&recipe));
+    }
+
+    #[test]
+    fn hang_ingredients_with_hangms_yield_variants_resolve() {
+        // hangms yield variants must not compete with p.hang ClassIngredients.
+        for yield_text in [
+            "8 slices",
+            "4 first-course servings (about 1 cup each)",
+            "6 entrée servings (about 1½ cups each)",
+        ] {
+            let html = format!(
+                r#"
+                <html><body>
+                  <p class="subheadingr">RECIPE</p>
+                  <p class="normalr"><i>A headnote with can and slices words.</i></p>
+                  <p class="hangms"><b>{yield_text}</b></p>
+                  <p class="hang">2 cups flour</p>
+                  <p class="hang">1 teaspoon salt</p>
+                  <p class="hang">1 cup milk</p>
+                  <p class="hangss"><b>Per Serving:</b></p>
+                  <p class="hangsr">Calories: 99</p>
+                  <p class="normal-ts1"><b>1.</b> Mix.</p>
+                </body></html>
+                "#
+            );
+            let (recipe, status) = recipe_from_html_status(&html, "Recipe");
+            assert_eq!(
+                status,
+                IngredientStatus::Resolved,
+                "yield {yield_text:?} must not force ambiguous: ingredients={:?}",
+                recipe.ingredients
+            );
+            assert_eq!(
+                recipe.ingredients.len(),
+                3,
+                "yield {yield_text:?}: expected hang ingredients only, got {:?}",
+                recipe.ingredients
+            );
+            assert!(
+                !recipe.ingredients.iter().any(|i| {
+                    let o = i.original.to_lowercase();
+                    o.contains("serving") || o == "8 slices" || o.contains("first-course")
+                }),
+                "yield line leaked for {yield_text:?}: {:?}",
+                recipe.ingredients
+            );
+            assert!(is_cookable(&recipe), "yield {yield_text:?}");
+        }
+    }
+
+    #[test]
+    fn tip_li_with_bare_quantity_paragraphs_is_ambiguous() {
+        // Never-guess restored: tip-only <li> + bare-qty <p> (no unit) must not import tip alone.
+        let html = r#"
+          <h1>Guacamole</h1>
+          <p>A party favorite with a tip:</p>
+          <ul><li>Use ripe fruit if you can</li></ul>
+          <p>6 eggs</p>
+          <p>3 avocados</p>
+          <h2>Method</h2>
+          <ol><li>Mash and serve.</li></ol>
+        "#;
+        let (r, status) = recipe_from_html_status(html, "Guacamole");
+        assert_eq!(
+            status,
+            IngredientStatus::AmbiguousStructure,
+            "bare-qty paragraphs must compete with tip-li"
+        );
+        assert!(
+            r.ingredients.is_empty(),
+            "must not import tip alone: {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert!(!is_cookable(&r));
+    }
+
+    #[test]
+    fn looks_like_yield_line_covers_hangms_variants() {
+        assert!(looks_like_yield_line("16 servings"));
+        assert!(looks_like_yield_line("8 slices"));
+        assert!(looks_like_yield_line(
+            "4 first-course servings (about 1 cup each)"
+        ));
+        assert!(looks_like_yield_line(
+            "6 entrée servings (about 1½ cups each)"
+        ));
+        assert!(looks_like_yield_line("Serves 4"));
+        assert!(!looks_like_yield_line("8 slices bacon, cooked"));
+        assert!(!looks_like_yield_line("2 cups flour"));
     }
 
     #[test]
