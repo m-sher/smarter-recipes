@@ -714,16 +714,20 @@ fn html_visible_len(html: &str) -> usize {
 /// as ingredients. Cookbook headnotes are common; treating them as ingredients
 /// pollutes the list and can push `is_cookable` under its amount ratio (silent drop).
 ///
-/// **Headerless fallback:** if the document never declares Ingredients or Steps
-/// sections, pre-header body lines are treated as the ingredient list (legacy
-/// plain-text behaviour for simple lists).
+/// **Headerless fallback:** if the document never declares **either** an
+/// Ingredients **or** a Steps/Method section, pre-header body lines are treated
+/// as the ingredient list (legacy plain-text behaviour for simple lists). If a
+/// Steps/Method header appears without an Ingredients header, the pre-header
+/// buffer is discarded rather than flushed — otherwise headnotes would leak into
+/// the ingredient list (title → headnote → bullets → `Method:`).
 pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
     let mut title = title_override.to_string();
     let mut ingredients = Vec::new();
     let mut steps = Vec::new();
     let mut section = "title";
     let mut saw_ingredients_header = false;
-    // Buffered only; discarded when an Ingredients: header is seen (headnotes).
+    let mut saw_steps_header = false;
+    // Buffered only; discarded when any Ingredients/Steps header is seen (headnotes).
     let mut pre_header_body: Vec<String> = Vec::new();
 
     for line in text.lines() {
@@ -743,6 +747,7 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
             || lower.starts_with("directions")
         {
             section = "steps";
+            saw_steps_header = true;
             continue;
         }
         match section {
@@ -767,9 +772,14 @@ pub fn plain_recipe_from_text(text: &str, title_override: &str) -> Recipe {
         }
     }
 
-    // Headerless (or no Ingredients: section): use buffered body as ingredients.
-    // When Ingredients: was present, headnote buffer is intentionally discarded.
-    if !saw_ingredients_header && ingredients.is_empty() && !pre_header_body.is_empty() {
+    // Truly headerless only: flush buffered body as ingredients. If either an
+    // Ingredients or a Steps/Method header was seen, the buffer is discarded so
+    // headnotes cannot leak (including the Steps-only case).
+    if !saw_ingredients_header
+        && !saw_steps_header
+        && ingredients.is_empty()
+        && !pre_header_body.is_empty()
+    {
         ingredients = pre_header_body
             .into_iter()
             .map(|line| normalize_line(&line))
@@ -971,6 +981,45 @@ mod tests {
             .ingredients
             .iter()
             .any(|i| i.original.contains("weeknight")));
+    }
+
+    #[test]
+    fn headnote_not_flushed_when_only_method_header() {
+        // title → headnote → bulleted-looking body → Method: (no Ingredients:).
+        // Previously the Steps-only path flushed the whole pre-header buffer as
+        // ingredients, so the headnote leaked. Buffer is discarded when any
+        // section header was seen (Ingredients or Steps/Method).
+        let text = "\
+Tomato Soup
+A quick weeknight soup.
+2 cups tomatoes
+1 cup stock
+1 tbsp olive oil
+Method:
+Simmer everything.
+";
+        let r = plain_recipe_from_text(text, "Tomato Soup");
+        assert!(
+            !r.ingredients
+                .iter()
+                .any(|i| i.original.to_lowercase().contains("weeknight")),
+            "headnote leaked into ingredients: {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(r.steps.len(), 1);
+        assert!(r.steps[0].contains("Simmer"));
+        // No Ingredients: section ⇒ pre-header not promoted (avoids headnote leak).
+        assert!(
+            r.ingredients.is_empty(),
+            "expected empty ingredients without Ingredients header, got {:?}",
+            r.ingredients
+                .iter()
+                .map(|i| &i.original)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
