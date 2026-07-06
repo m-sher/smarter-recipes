@@ -49,8 +49,6 @@ pub enum RecipeSource {
     File { path: String },
     Url { url: String },
     Image { path: String },
-    /// Cookbook EPUB; `href` is the index locator (path + optional fragment).
-    Epub { path: String, href: String },
     Manual,
     Unknown,
 }
