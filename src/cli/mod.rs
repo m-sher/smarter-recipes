@@ -324,17 +324,20 @@ pub fn run(cli: Cli) -> Result<()> {
             let interactive = matches!(source.to_lowercase().as_str(), "manual" | "interactive")
                 && input.as_deref().is_none_or(|s| s.is_empty() || s == "-");
             let input_path = input.clone();
-            let recipes = if interactive {
-                vec![read_manual_recipe(
+            let batch = if interactive {
+                crate::ingest::IngestBatch::recipes_only(vec![read_manual_recipe(
                     &mut std::io::stdin().lock(),
                     &mut std::io::stderr(),
-                )?]
+                )?])
             } else {
                 let input = input
                     .ok_or_else(|| anyhow::anyhow!("input is required for source '{source}'"))?;
                 ingest_many(&source, &input)?
             };
+            let recipes = batch.recipes;
+            let skipped_ambiguous = batch.skipped_ambiguous.len();
             let multi = recipes.len() > 1
+                || skipped_ambiguous > 0
                 || matches!(source.to_lowercase().as_str(), "epub" | "ebook")
                 || input_path.as_deref().is_some_and(|p| {
                     std::path::Path::new(p)
@@ -390,11 +393,17 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             if multi && !dry_run {
                 println!(
-                    "Batch import: saved {saved}, skipped {skipped_dup} duplicate(s), skipped {skipped_junk} non-cookable → {}",
-                    store.path().display()
+                    "{}",
+                    format_batch_import_summary(
+                        saved,
+                        skipped_dup,
+                        skipped_junk,
+                        skipped_ambiguous,
+                        &store.path().display().to_string(),
+                    )
                 );
             } else if multi && dry_run {
-                println!("(dry run) nothing saved");
+                println!("(dry run) nothing saved (would skip {skipped_ambiguous} ambiguous)");
             }
         }
         Commands::Scrape {
@@ -1145,6 +1154,19 @@ fn recipe_macros_for_pool(
     (macros, low_coverage)
 }
 
+/// Final one-line tally for multi-recipe import (includes EPUB ambiguous skips).
+fn format_batch_import_summary(
+    saved: usize,
+    skipped_dup: usize,
+    skipped_junk: usize,
+    skipped_ambiguous: usize,
+    store_path: &str,
+) -> String {
+    format!(
+        "Batch import: saved {saved}, skipped {skipped_dup} duplicate(s), skipped {skipped_junk} non-cookable, skipped {skipped_ambiguous} ambiguous → {store_path}"
+    )
+}
+
 /// True when a recipe should be pruned as a non-meal: it is not structurally
 /// cookable AND carries no usable source nutrition.
 fn prunable(recipe: &Recipe) -> bool {
@@ -1586,6 +1608,16 @@ fn print_shopping_list(list: &crate::domain::ShoppingList) {
 mod tests {
     use super::*;
     use crate::domain::IngredientLine;
+
+    #[test]
+    fn batch_import_summary_includes_ambiguous_count() {
+        let line = format_batch_import_summary(1, 0, 0, 3, "/tmp/recipes.db");
+        assert_eq!(
+            line,
+            "Batch import: saved 1, skipped 0 duplicate(s), skipped 0 non-cookable, skipped 3 ambiguous → /tmp/recipes.db"
+        );
+        assert!(line.contains("skipped 3 ambiguous"));
+    }
 
     #[test]
     fn recipe_macros_for_pool_gates_on_coverage_ratio() {

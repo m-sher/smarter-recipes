@@ -14,7 +14,7 @@ pub use crawl::{
     is_listing_url, normalize_url, recipe_source_url, resolve_epub_path, scrape_from_seeds,
     scrape_new_recipes, HtmlFetcher, HttpFetcher, ScrapeEvent, ScrapeOutcome, ScrapeParams,
 };
-pub use epub::ingest_epub;
+pub use epub::{ingest_epub, EpubIngestOutcome};
 pub use file::FileSource;
 pub use manual::read_manual_recipe;
 pub use ocr::ImageOcrSource;
@@ -36,6 +36,23 @@ pub trait RecipeSourceIngest {
     fn name(&self) -> &'static str;
 }
 
+/// Outcome of [`ingest_many`]: recipes to save plus batch-level skip metadata.
+#[derive(Debug, Clone, Default)]
+pub struct IngestBatch {
+    pub recipes: Vec<Recipe>,
+    /// Titles skipped under EPUB never-guess ambiguous-structure policy.
+    pub skipped_ambiguous: Vec<String>,
+}
+
+impl IngestBatch {
+    pub fn recipes_only(recipes: Vec<Recipe>) -> Self {
+        Self {
+            recipes,
+            skipped_ambiguous: Vec::new(),
+        }
+    }
+}
+
 /// Dispatch on source kind: `file`, `url`, `image` / `ocr`, `epub`, or auto-detect.
 ///
 /// EPUB books can yield multiple recipes — use [`ingest_epub`] / [`ingest_many`] instead.
@@ -52,10 +69,16 @@ pub fn ingest_from(source: &str, input: &str) -> Result<Recipe> {
 }
 
 /// Ingest one or many recipes (EPUB batch, or a single recipe for other sources).
-pub fn ingest_many(source: &str, input: &str) -> Result<Vec<Recipe>> {
+pub fn ingest_many(source: &str, input: &str) -> Result<IngestBatch> {
     let source = source.to_lowercase();
     match source.as_str() {
-        "epub" | "ebook" => ingest_epub(input),
+        "epub" | "ebook" => {
+            let o = ingest_epub(input)?;
+            Ok(IngestBatch {
+                recipes: o.recipes,
+                skipped_ambiguous: o.skipped_ambiguous,
+            })
+        }
         "auto" => {
             let path = Path::new(input.trim());
             if path
@@ -63,11 +86,17 @@ pub fn ingest_many(source: &str, input: &str) -> Result<Vec<Recipe>> {
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
             {
-                return ingest_epub(input.trim());
+                let o = ingest_epub(input.trim())?;
+                return Ok(IngestBatch {
+                    recipes: o.recipes,
+                    skipped_ambiguous: o.skipped_ambiguous,
+                });
             }
-            Ok(vec![auto_detect(input)?])
+            Ok(IngestBatch::recipes_only(vec![auto_detect(input)?]))
         }
-        _ => Ok(vec![ingest_from(&source, input)?]),
+        _ => Ok(IngestBatch::recipes_only(vec![ingest_from(
+            &source, input,
+        )?])),
     }
 }
 

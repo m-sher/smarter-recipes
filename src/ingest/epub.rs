@@ -28,13 +28,23 @@ pub struct IndexEntry {
     pub href: String,
 }
 
+/// Outcome of an EPUB batch ingest: cookable recipes plus titles skipped under
+/// the never-guess ambiguous-structure policy.
+#[derive(Debug, Clone, Default)]
+pub struct EpubIngestOutcome {
+    pub recipes: Vec<Recipe>,
+    /// Titles not imported because ingredients could not be identified
+    /// unambiguously from structure (no fabricated lists).
+    pub skipped_ambiguous: Vec<String>,
+}
+
 /// Ingest all cookable recipes from an EPUB path.
-pub fn ingest_epub(path: &str) -> Result<Vec<Recipe>> {
+pub fn ingest_epub(path: &str) -> Result<EpubIngestOutcome> {
     let doc = EpubDoc::new(path).with_context(|| format!("opening EPUB {path}"))?;
     ingest_epub_doc(doc, path)
 }
 
-fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Vec<Recipe>> {
+fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<EpubIngestOutcome> {
     let entries = collect_entries(&mut doc)?;
     if entries.is_empty() {
         bail!(
@@ -147,7 +157,10 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ve
              (need ≥2 ingredient lines with amounts)"
         );
     }
-    Ok(out)
+    Ok(EpubIngestOutcome {
+        recipes: out,
+        skipped_ambiguous,
+    })
 }
 
 fn collect_entries<R: Read + Seek>(doc: &mut EpubDoc<R>) -> Result<Vec<IndexEntry>> {
@@ -1381,17 +1394,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let epub_path = dir.path().join("mixed.epub");
         write_ambiguous_mix_epub(&epub_path);
-        let recipes = ingest_epub(epub_path.to_str().unwrap()).expect("ingest");
+        let outcome = ingest_epub(epub_path.to_str().unwrap()).expect("ingest");
         // Only the unambiguous Method-style list recipe should import.
         assert_eq!(
-            recipes.len(),
+            outcome.recipes.len(),
             1,
             "got: {:?}",
-            recipes.iter().map(|r| &r.title).collect::<Vec<_>>()
+            outcome.recipes.iter().map(|r| &r.title).collect::<Vec<_>>()
         );
-        assert_eq!(recipes[0].title, "Tomato Soup");
-        assert!(is_cookable(&recipes[0]));
-        assert_eq!(recipes[0].ingredients.len(), 3);
+        assert_eq!(outcome.recipes[0].title, "Tomato Soup");
+        assert!(is_cookable(&outcome.recipes[0]));
+        assert_eq!(outcome.recipes[0].ingredients.len(), 3);
+        assert_eq!(outcome.skipped_ambiguous, vec!["Pancakes".to_string()]);
     }
 
     #[test]
@@ -1625,17 +1639,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let epub_path = dir.path().join("cookbook.epub");
         write_sample_epub(&epub_path);
-        let recipes = ingest_epub(epub_path.to_str().unwrap()).expect("ingest");
+        let outcome = ingest_epub(epub_path.to_str().unwrap()).expect("ingest");
+        assert!(outcome.skipped_ambiguous.is_empty());
         assert_eq!(
-            recipes.len(),
+            outcome.recipes.len(),
             2,
             "got: {:?}",
-            recipes.iter().map(|r| &r.title).collect::<Vec<_>>()
+            outcome.recipes.iter().map(|r| &r.title).collect::<Vec<_>>()
         );
-        let titles: HashSet<_> = recipes.iter().map(|r| r.title.as_str()).collect();
+        let titles: HashSet<_> = outcome.recipes.iter().map(|r| r.title.as_str()).collect();
         assert!(titles.contains("Fluffy Pancakes"));
         assert!(titles.contains("Simple Omelette"));
-        for r in &recipes {
+        for r in &outcome.recipes {
             assert!(matches!(r.source, RecipeSource::Epub { .. }));
             assert!(is_cookable(r));
         }
@@ -1649,7 +1664,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let epub_path = dir.path().join("cookbook.epub");
         write_sample_epub(&epub_path);
-        let recipes = ingest_epub(epub_path.to_str().unwrap()).expect("ingest");
+        let recipes = ingest_epub(epub_path.to_str().unwrap())
+            .expect("ingest")
+            .recipes;
         assert_eq!(recipes.len(), 2);
 
         let db = dir.path().join("t.db");
