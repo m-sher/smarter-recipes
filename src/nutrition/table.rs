@@ -178,14 +178,18 @@ const PER_100G: &[(&str, f64, f64, f64, f64)] = &[
     ("sesame seeds", 573.0, 17.7, 49.7, 23.4),
 ];
 
+/// Culinary average grams per discrete piece (count unit). Longer / more specific
+/// keys should appear before shorter aliases that `name_candidates` may try.
 const PER_EACH_G: &[(&str, f64)] = &[
     ("egg", 50.0),
     ("eggs", 50.0),
     ("egg yolk", 17.0),
     ("egg white", 33.0),
+    // Garlic — must stay before bare "cloves" (spice) for candidate fallback order.
     ("garlic", 3.0),
     ("garlic clove", 3.0),
     ("garlic cloves", 3.0),
+    ("minced garlic", 3.0),
     ("onion", 110.0),
     ("onions", 110.0),
     ("red onion", 110.0),
@@ -201,6 +205,9 @@ const PER_EACH_G: &[(&str, f64)] = &[
     ("tomatoes", 123.0),
     ("potato", 213.0),
     ("potatoes", 213.0),
+    ("russet", 213.0),
+    ("russet potato", 213.0),
+    ("russet potatoes", 213.0),
     ("sweet potato", 130.0),
     ("carrot", 61.0),
     ("carrots", 61.0),
@@ -211,6 +218,59 @@ const PER_EACH_G: &[(&str, f64)] = &[
     ("green onion", 15.0),
     ("green onions", 15.0),
     ("jalapeno", 14.0),
+    ("jalapeño", 14.0),
+    // Fresh chiles (serrano-class default ~15 g; dried pods much lighter).
+    ("green chile pepper", 15.0),
+    ("green chile peppers", 15.0),
+    ("green chili pepper", 15.0),
+    ("green chili peppers", 15.0),
+    ("green chilli", 15.0),
+    ("green chillies", 15.0),
+    ("green chilies", 15.0),
+    ("fresh green chile pepper", 15.0),
+    ("serrano", 15.0),
+    ("serrano pepper", 15.0),
+    ("serrano peppers", 15.0),
+    ("dried red chile pepper", 2.0),
+    ("dried red chile peppers", 2.0),
+    ("dried red chili", 2.0),
+    ("dried red chilies", 2.0),
+    ("dried red chilli", 2.0),
+    ("dried red chillies", 2.0),
+    ("chile de arbol", 2.0),
+    ("red chile pepper", 15.0),
+    ("red chile peppers", 15.0),
+    // Whole spices / aromatics (counts).
+    ("black cardamom pod", 1.0),
+    ("black cardamom pods", 1.0),
+    ("green cardamom pod", 0.3),
+    ("green cardamom pods", 0.3),
+    ("cardamom pod", 0.3),
+    ("cardamom pods", 0.3),
+    ("green cardamom seeds", 0.05),
+    ("bay leaf", 0.4),
+    ("bay leaves", 0.4),
+    ("curry leaf", 0.15),
+    ("curry leaves", 0.15),
+    // Spice cloves (not garlic) — shorter key after garlic entries above.
+    ("whole cloves", 0.1),
+    ("cloves", 0.1),
+    ("stick cinnamon", 3.0),
+    ("sticks cinnamon", 3.0),
+    ("cinnamon stick", 3.0),
+    ("cinnamon sticks", 3.0),
+    ("star anise", 0.5),
+    ("black peppercorn", 0.05),
+    ("black peppercorns", 0.05),
+    ("peppercorn", 0.05),
+    ("peppercorns", 0.05),
+    // Ginger pieces / slices (count of slices or chunks).
+    ("quarter-size slices peeled fresh ginger", 5.0),
+    ("slice peeled fresh ginger", 5.0),
+    ("slices peeled fresh ginger", 5.0),
+    ("cm/1in root ginger", 8.0),
+    ("inch ginger root", 8.0),
+    ("inch fresh ginger", 8.0),
     ("avocado", 136.0),
     ("banana", 118.0),
     ("apple", 182.0),
@@ -281,6 +341,20 @@ mod tests {
         assert_eq!(grams_per_each("eggs"), Some(50.0));
         assert_eq!(grams_per_each("large eggs"), Some(50.0));
         assert!(grams_per_each("mystery item").is_none());
+    }
+
+    #[test]
+    fn spice_and_chile_each_weights() {
+        assert_eq!(grams_per_each("green chile peppers"), Some(15.0));
+        assert_eq!(grams_per_each("green chillies"), Some(15.0));
+        assert_eq!(grams_per_each("dried red chile peppers"), Some(2.0));
+        assert_eq!(grams_per_each("bay leaves"), Some(0.4));
+        assert_eq!(grams_per_each("green cardamom pods"), Some(0.3));
+        assert_eq!(grams_per_each("black cardamom pods"), Some(1.0));
+        // Garlic must not pick up the tiny spice-clove weight.
+        assert_eq!(grams_per_each("garlic cloves"), Some(3.0));
+        assert_eq!(grams_per_each("cloves"), Some(0.1));
+        assert_eq!(grams_per_each("stick cinnamon"), Some(3.0));
     }
 
     #[test]

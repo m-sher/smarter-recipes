@@ -799,6 +799,52 @@ mod tests {
     }
 
     #[test]
+    fn spice_volume_with_profile_and_density_is_covered() {
+        // Indian-pantry pattern: tsp of ground spice — needs density, not 1 g/ml liquid rule.
+        let mut extra = HashMap::new();
+        extra.insert(
+            "garam masala".into(),
+            Macros {
+                kcal: 379.0,
+                protein_g: 15.0,
+                fat_g: 15.0,
+                carbs_g: 50.0,
+            },
+        );
+        let r = rec("T", &["1 tsp garam masala", "100 g chicken"]);
+        let n = recipe_nutrition(&r, &extra);
+        assert!(
+            n.covered.contains("garam masala"),
+            "covered={:?} uncovered={:?}",
+            n.covered,
+            n.uncovered
+        );
+        assert!(n.macros.kcal > 0.0);
+    }
+
+    #[test]
+    fn chile_count_with_profile_and_each_weight_is_covered() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "green chile peppers".into(),
+            Macros {
+                kcal: 40.0,
+                protein_g: 2.0,
+                fat_g: 0.2,
+                carbs_g: 9.0,
+            },
+        );
+        let r = rec("T", &["3 green chile peppers", "100 g onion"]);
+        let n = recipe_nutrition(&r, &extra);
+        assert!(
+            n.covered.contains("green chile peppers"),
+            "covered={:?} uncovered={:?}",
+            n.covered,
+            n.uncovered
+        );
+    }
+
+    #[test]
     fn count_of_containers_is_uncovered() {
         // "2 cans tomatoes" must not be 2 × one-tomato weight.
         let r = rec("T", &["2 cans tomatoes"]);
