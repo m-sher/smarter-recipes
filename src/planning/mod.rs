@@ -26,7 +26,11 @@
 //! in-day meal index to breakfast/lunch/dinner/any and prefers recipes whose
 //! `meta.tags` or `meta.category` carry a matching label. Mismatches are soft
 //! (counted after nutrition magnitude, before net union). When enabled, the
-//! exact solver uses per-slot variables so assignment respects slot identity.
+//! exact solver uses **per-slot** binaries (`pool × slots`, solved over three
+//! lex phases vs the flat model's `pool` binaries × two phases). On a large
+//! uncapped catalog that is materially heavier and more likely to exhaust the
+//! solve-time budget and fall back to greedy — acceptable for household-scale
+//! pools; consider a candidate cap if planning against entire large libraries.
 //!
 //! When [`PlanOptions::recipe_macros`] contains an estimate for a recipe with
 //! `kcal <= 0`, that recipe is dropped from the pool entirely (not a meal).
@@ -853,29 +857,26 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
 
 /// TOD slot mismatches for a saved plan (empty when every constrained slot
 /// matched or a meal's recipe is missing from `pool`).
+///
+/// Delegates to [`tod_mismatches`] so reporting logic lives in one place.
 pub fn plan_tod_mismatches(pool: &[Recipe], plan: &MealPlan) -> Vec<TodMismatch> {
-    let by_id: HashMap<&str, &Recipe> = pool.iter().map(|r| (r.id.as_str(), r)).collect();
-    let mpd = plan.meals_per_day.max(1);
-    let mut out = Vec::new();
-    for m in &plan.meals {
-        let Some(expected) = slot_requirement(mpd, m.meal) else {
-            continue;
-        };
-        let Some(r) = by_id.get(m.recipe_id.as_str()) else {
-            continue;
-        };
-        let labels = recipe_tod_labels(r);
-        if !labels.contains(expected) {
-            out.push(TodMismatch {
-                day: m.day,
-                meal: m.meal,
-                expected,
-                recipe_title: r.title.clone(),
-                labels,
-            });
-        }
-    }
-    out
+    let by_id: HashMap<&str, usize> = pool
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.id.as_str(), i))
+        .collect();
+    let labels: Vec<TodLabels> = pool.iter().map(recipe_tod_labels).collect();
+    let refs: Vec<&Recipe> = pool.iter().collect();
+    let schedule: Vec<(u32, u32, usize)> = plan
+        .meals
+        .iter()
+        .filter_map(|m| {
+            by_id
+                .get(m.recipe_id.as_str())
+                .map(|&ri| (m.day, m.meal, ri))
+        })
+        .collect();
+    tod_mismatches(&refs, &labels, &schedule, plan.meals_per_day)
 }
 
 /// Ingredient keys introduced by recipes in order (for analysis/tests).

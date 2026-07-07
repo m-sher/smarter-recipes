@@ -699,6 +699,11 @@ enum SlotPhase {
 
 /// Slot-indexed model used when time-of-day steering is on: one binary per
 /// `(recipe, slot)` so breakfast/lunch/dinner identity is explicit.
+///
+/// Cost note: variables scale as `pool × slots` over **3** lex phases (nutrition
+/// → TOD misses → union), vs flat `pool` binaries × 2 phases. Large catalogs can
+/// hit the solve-time budget more readily and fall back to greedy; no candidate
+/// cap is applied here (pool is already the caller's selected set).
 fn solve_slots(
     input: &GreedyInput<'_>,
     order: &[usize],

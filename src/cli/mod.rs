@@ -573,6 +573,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 time_of_day: tod,
             };
             let plan = plan_meals(&recipes, &opts);
+            let tod_misses = if tod {
+                plan_tod_mismatches(&recipes, &plan)
+            } else {
+                Vec::new()
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -587,15 +592,16 @@ pub fn run(cli: Cli) -> Result<()> {
                     print_plan_constraints(&violations);
                 }
                 if tod {
-                    let misses = plan_tod_mismatches(&recipes, &plan);
-                    print_plan_tod(&misses);
-                    if !misses.is_empty() {
-                        eprintln!(
-                            "warning: time-of-day: {} slot(s) could not be matched to labeled recipes",
-                            misses.len()
-                        );
-                    }
+                    print_plan_tod(&tod_misses);
                 }
+            }
+            // Emit regardless of --json so machine consumers still see soft misses
+            // (structured per-slot detail remains in the rationale / human summary).
+            if tod && !tod_misses.is_empty() {
+                eprintln!(
+                    "warning: time-of-day: {} slot(s) could not be matched to labeled recipes",
+                    tod_misses.len()
+                );
             }
             if !dry_run {
                 store.save_plan(&plan)?;

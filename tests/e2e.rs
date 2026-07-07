@@ -170,17 +170,29 @@ fn plan_tod_uses_fixture_tags() {
     assert_eq!(plan.meals.len(), 2);
     assert!(plan.rationale.to_lowercase().contains("time-of-day"));
     let misses = plan_tod_mismatches(&pool, &plan);
+    assert!(
+        misses.is_empty(),
+        "expected full TOD match on labeled fixtures, got {misses:?}"
+    );
     let breakfast = &plan.meals[0];
     let dinner = &plan.meals[1];
     let b = pool.iter().find(|r| r.id == breakfast.recipe_id).unwrap();
     let d = pool.iter().find(|r| r.id == dinner.recipe_id).unwrap();
-    let b_ok = b
-        .meta
-        .tags
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case("breakfast"));
-    let d_ok = d.meta.tags.iter().any(|t| t.eq_ignore_ascii_case("dinner"));
-    if b_ok && d_ok {
-        assert!(misses.is_empty(), "expected full TOD match, got {misses:?}");
-    }
+    // Fixtures: pancakes/french_toast = breakfast, tomato_pasta/chicken_rice = dinner.
+    // Assert labels directly so a regression that ignores --tod cannot pass.
+    assert!(
+        b.meta
+            .tags
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("breakfast")),
+        "meal 0 should be breakfast-labeled, got title={:?} tags={:?}",
+        b.title,
+        b.meta.tags
+    );
+    assert!(
+        d.meta.tags.iter().any(|t| t.eq_ignore_ascii_case("dinner")),
+        "meal 1 should be dinner-labeled, got title={:?} tags={:?}",
+        d.title,
+        d.meta.tags
+    );
 }

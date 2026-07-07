@@ -79,6 +79,11 @@ fn kind_bit(kind: TodKind) -> u8 {
     }
 }
 
+/// Map one tag/category token onto TOD bits.
+///
+/// Matching is **exact-token only** after [`normalize_title_key`]: `"dinner"` and
+/// `"supper"` match, but `"Dinners"` or `"Quick Dinner"` do not. Comma-split
+/// category handles `"Main Course, Dinner"` (each segment is its own token).
 fn apply_token(labels: &mut TodLabels, token: &str) {
     let key = normalize_title_key(token);
     if key.is_empty() {
@@ -170,28 +175,30 @@ pub struct TodMismatch {
     pub labels: TodLabels,
 }
 
-/// List TOD mismatches for a schedule in plan order.
+/// List TOD mismatches for an explicit schedule of `(day, meal_in_day, pool_index)`.
+///
+/// Shared by the index-based unit path and [`crate::planning::plan_tod_mismatches`]
+/// so CLI reporting and tests cannot drift.
 pub fn tod_mismatches(
     pool: &[&Recipe],
     labels: &[TodLabels],
-    indices: &[usize],
+    schedule: &[(u32, u32, usize)],
     meals_per_day: u32,
 ) -> Vec<TodMismatch> {
     let mpd = meals_per_day.max(1);
     let mut out = Vec::new();
-    for (slot, &ri) in indices.iter().enumerate() {
-        let day = slot as u32 / mpd;
-        let meal = slot as u32 % mpd;
-        if let Some(expected) = slot_requirement(mpd, meal) {
-            if !labels[ri].contains(expected) {
-                out.push(TodMismatch {
-                    day,
-                    meal,
-                    expected,
-                    recipe_title: pool[ri].title.clone(),
-                    labels: labels[ri],
-                });
-            }
+    for &(day, meal, ri) in schedule {
+        let Some(expected) = slot_requirement(mpd, meal) else {
+            continue;
+        };
+        if !labels[ri].contains(expected) {
+            out.push(TodMismatch {
+                day,
+                meal,
+                expected,
+                recipe_title: pool[ri].title.clone(),
+                labels: labels[ri],
+            });
         }
     }
     out
@@ -299,7 +306,8 @@ mod tests {
         assert_eq!(count_tod_misses(&labels, &[1, 0], 2), 2);
         // unlabeled in breakfast.
         assert_eq!(count_tod_misses(&labels, &[2], 2), 1);
-        let miss = tod_mismatches(&refs, &labels, &[2, 1], 2);
+        // schedule: breakfast slot gets unlabeled (2), dinner slot gets dinner (1).
+        let miss = tod_mismatches(&refs, &labels, &[(0, 0, 2), (0, 1, 1)], 2);
         assert_eq!(miss.len(), 1);
         assert_eq!(miss[0].day, 0);
         assert_eq!(miss[0].meal, 0);
