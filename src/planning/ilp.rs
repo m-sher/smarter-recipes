@@ -28,11 +28,16 @@
 //! Returns `None` (caller falls back to the greedy planner) when the exact model
 //! yields nothing usable — the problem is infeasible, or the time budget elapsed
 //! before any feasible plan was found. Otherwise returns the proven optimum, or
-//! the best feasible plan found within the budget. HiGHS handles the full pool:
-//! every recipe is a candidate, no size cap, no shortlist.
+//! the best feasible plan found within the budget.
+//!
+//! Multi-day **per-day** bounds on large pools use a sequential day-pack path
+//! ([`solve_days_sequential`]): each day is a small flat MIP (proven-optimal on
+//! household pools). A single joint partition MIP over `pool × days` binaries is
+//! only attempted when the cell count is small enough to finish within the time
+//! budget — otherwise a timed-out incumbent can look “exact” while badly
+//! violating soft day caps (e.g. one day at 2× the kcal max).
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use backend::{ComparisonOp, OptimizationDirection, Problem, Solution, Variable};
 
@@ -43,10 +48,22 @@ use super::{
 use crate::domain::{Macros, UnitKind};
 use crate::shopping::pantry_quantity_for;
 
-/// Wall-clock backstop per solve.
-const SOLVE_TIME_LIMIT: Duration = Duration::from_secs(5);
+/// Base wall-clock backstop per solve phase on small models.
+const SOLVE_TIME_LIMIT_BASE_SECS: f64 = 5.0;
+/// Hard cap per solve phase (seconds).
+const SOLVE_TIME_LIMIT_MAX_SECS: f64 = 45.0;
+/// Joint `(recipe, day)` partition MIP is only attempted at or below this many
+/// binary cells. Above it, sequential day packing is the reliable path.
+const PARTITION_CELL_LIMIT: usize = 2_500;
 /// Slack allowed above the phase-1 optimum when minimizing the union in phase 2.
 const VIOLATION_EPS: f64 = 1e-6;
+
+/// Scale the per-phase time limit with problem size (binary columns).
+fn solve_time_secs(num_binaries: usize) -> f64 {
+    // ~2ms per binary as a soft guide, floored at the base and capped.
+    let scaled = SOLVE_TIME_LIMIT_BASE_SECS + (num_binaries as f64) * 0.002;
+    scaled.clamp(SOLVE_TIME_LIMIT_BASE_SECS, SOLVE_TIME_LIMIT_MAX_SECS)
+}
 
 /// Thin adapter over the HiGHS MILP solver presenting the small building-block
 /// API the models below use (binary/continuous columns, linear rows, a solve
@@ -285,14 +302,31 @@ fn add_ratio_slacks(
     }
 }
 
-fn solve_checked(prob: Problem) -> Option<Solution> {
-    prob.solve(SOLVE_TIME_LIMIT.as_secs_f64())
+fn solve_checked(prob: Problem, num_binaries: usize) -> Option<Solution> {
+    prob.solve(solve_time_secs(num_binaries))
+}
+
+/// Canonical (title, id) order of every pool index.
+fn canonical_order(input: &GreedyInput<'_>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..input.pool.len()).collect();
+    order.sort_by(|&a, &b| {
+        input.pool[a]
+            .title
+            .as_str()
+            .cmp(input.pool[b].title.as_str())
+            .then(input.pool[a].id.as_str().cmp(input.pool[b].id.as_str()))
+    });
+    order
 }
 
 /// Exactly select `target` recipes from `input.pool` under configured nutrition
 /// bounds and/or time-of-day steering (feasible-first, then min TOD misses, then
 /// min union), returning pool indices in plan (row-major) order. `None` means
 /// the caller should fall back to greedy.
+///
+/// For multi-day **per-day** bounds this may return a joint partition MIP on
+/// small pools, or [`None`] so the caller can prefer [`solve_days_sequential`]
+/// (which scales). TOD still uses the slot model.
 pub(super) fn solve_constrained(input: &GreedyInput<'_>, target: usize) -> Option<Vec<usize>> {
     let p = input.pool.len();
     // Nothing to solve, or more meals requested than distinct recipes exist.
@@ -301,18 +335,7 @@ pub(super) fn solve_constrained(input: &GreedyInput<'_>, target: usize) -> Optio
     }
     let mpd = input.meals_per_day.max(1) as usize;
     let used_days = target.div_ceil(mpd);
-
-    // Canonical recipe order (title, id): deterministic, pool-order independent.
-    let canonical = |a: usize, b: usize| {
-        input.pool[a]
-            .title
-            .as_str()
-            .cmp(input.pool[b].title.as_str())
-            .then(input.pool[a].id.as_str().cmp(input.pool[b].id.as_str()))
-    };
-    // Every recipe is a candidate — HiGHS solves the full pool exactly.
-    let mut order: Vec<usize> = (0..p).collect();
-    order.sort_by(|&a, &b| canonical(a, b));
+    let order = canonical_order(input);
 
     if input.time_of_day {
         return solve_slots(input, &order, target, mpd);
@@ -320,20 +343,97 @@ pub(super) fn solve_constrained(input: &GreedyInput<'_>, target: usize) -> Optio
 
     let needs_partition = !input.bounds.per_day.is_empty() && used_days >= 2 && mpd >= 2;
     if needs_partition {
+        // Large joint models time out with poor soft-constraint incumbents.
+        // Leave them to sequential day packing (caller).
+        if p.saturating_mul(used_days) > PARTITION_CELL_LIMIT {
+            return None;
+        }
         solve_partition(input, &order, target, mpd, used_days)
     } else {
-        solve_flat(input, &order, target, used_days)
+        solve_flat(input, &order, target, used_days, true)
     }
+}
+
+/// Pack each day with its own flat exact MIP on the **remaining** pool.
+///
+/// Each day uses `used_days = 1` so per-day min/max/ratio apply to that day's
+/// meals alone (the path that already works for single-day plans). Recipes are
+/// removed after each day so the plan never repeats. Scales as
+/// `O(days × flat(pool))` instead of one `pool × days` joint MIP.
+///
+/// Nutrition feasibility is preferred over a globally minimal shopping list:
+/// each day runs a **nutrition-only** flat MIP (no union phase) so multi-day
+/// plans on multi-thousand pools stay within memory/time budgets.
+pub(super) fn solve_days_sequential(input: &GreedyInput<'_>, target: usize) -> Option<Vec<usize>> {
+    let p = input.pool.len();
+    if target == 0 || p == 0 || target > p {
+        return None;
+    }
+    let mpd = input.meals_per_day.max(1) as usize;
+    let used_days = target.div_ceil(mpd);
+    let mut remaining = canonical_order(input);
+    // Recipes that alone exceed the day kcal max can never join a zero-violation
+    // day; drop them from the sequential pool (kept only if that would leave too
+    // few candidates to fill the plan — best-effort fallback).
+    if let Some(day_max) = input.bounds.per_day.kcal.max {
+        let filtered: Vec<usize> = remaining
+            .iter()
+            .copied()
+            .filter(|&ri| input.macros[ri].kcal <= day_max)
+            .collect();
+        if filtered.len() >= target {
+            remaining = filtered;
+        }
+    }
+    let mut plan: Vec<usize> = Vec::with_capacity(target);
+
+    for _ in 0..used_days {
+        let cap = mpd.min(target - plan.len());
+        if cap == 0 {
+            break;
+        }
+        if remaining.len() < cap {
+            return None;
+        }
+        // Flat single-day nutrition MIP (no union phase — keeps large pools safe).
+        let day = solve_flat(input, &remaining, cap, 1, false)?;
+        if day.len() != cap {
+            return None;
+        }
+        // Deterministic within-day order (title, id).
+        let mut day = day;
+        day.sort_by(|&a, &b| {
+            input.pool[a]
+                .title
+                .as_str()
+                .cmp(input.pool[b].title.as_str())
+                .then(input.pool[a].id.as_str().cmp(input.pool[b].id.as_str()))
+        });
+        for &ri in &day {
+            remaining.retain(|&x| x != ri);
+        }
+        plan.extend(day);
+    }
+
+    if plan.len() != target {
+        return None;
+    }
+    Some(plan)
 }
 
 /// Non-partition model: one binary per recipe. Per-day bounds either collapse to
 /// a per-recipe constant (`mpd == 1`, each recipe is its own day) or apply to the
 /// whole selection (`used_days == 1`, a single day).
+///
+/// When `with_union` is false, only the nutrition-violation phase runs (used by
+/// sequential multi-day packing on large pools to avoid the heavy ingredient-union
+/// MIP that can exhaust memory).
 fn solve_flat(
     input: &GreedyInput<'_>,
     order: &[usize],
     target: usize,
     used_days: usize,
+    with_union: bool,
 ) -> Option<Vec<usize>> {
     let bounds = input.bounds;
     let macros = input.macros;
@@ -450,10 +550,19 @@ fn solve_flat(
         (prob, xs)
     };
 
-    let (prob1, _) = build(Phase::One, None);
-    let vstar = solve_checked(prob1)?.objective();
+    let (prob1, xs1) = build(Phase::One, None);
+    let sol1 = solve_checked(prob1, p)?;
+    if !with_union {
+        let selected: Vec<usize> = (0..p)
+            .filter(|&j| sol1[xs1[j]] > 0.5)
+            .map(|j| order[j])
+            .collect();
+        return (selected.len() == target).then_some(selected);
+    }
+
+    let vstar = sol1.objective();
     let (prob2, xs2) = build(Phase::Two, Some(vstar));
-    let sol2 = solve_checked(prob2)?;
+    let sol2 = solve_checked(prob2, p)?;
 
     let selected: Vec<usize> = (0..p)
         .filter(|&j| sol2[xs2[j]] > 0.5)
@@ -607,10 +716,11 @@ fn solve_partition(
         (prob, xs)
     };
 
+    let n_binaries = p.saturating_mul(used_days);
     let (prob1, _) = build(Phase::One, None);
-    let vstar = solve_checked(prob1)?.objective();
+    let vstar = solve_checked(prob1, n_binaries)?.objective();
     let (prob2, xs2) = build(Phase::Two, Some(vstar));
-    let sol2 = solve_checked(prob2)?;
+    let sol2 = solve_checked(prob2, n_binaries)?;
 
     // Collect each day's selected recipes (canonical order within a day).
     let mut days: Vec<Vec<usize>> = vec![Vec::new(); used_days];
@@ -896,12 +1006,13 @@ fn solve_slots(
         (prob, xs, nut_viol, tod_viol)
     };
 
+    let n_binaries = p.saturating_mul(slots);
     let (prob1, _, _, _) = build(SlotPhase::Nutrition, None, None);
-    let v_nut = solve_checked(prob1)?.objective();
+    let v_nut = solve_checked(prob1, n_binaries)?.objective();
     let (prob2, _, _, _) = build(SlotPhase::Tod, Some(v_nut), None);
-    let v_tod = solve_checked(prob2)?.objective();
+    let v_tod = solve_checked(prob2, n_binaries)?.objective();
     let (prob3, xs3, _, _) = build(SlotPhase::Union, Some(v_nut), Some(v_tod));
-    let sol3 = solve_checked(prob3)?;
+    let sol3 = solve_checked(prob3, n_binaries)?;
 
     let mut plan_order = vec![0usize; slots];
     let mut filled = vec![false; slots];

@@ -571,12 +571,27 @@ fn better_scored(pool: &[&Recipe], a: &ScoredSchedule, b: &ScoredSchedule) -> bo
     lex_better_schedule(pool, &a.indices, &b.indices)
 }
 
+/// Cap multi-start seeds on large pools. Full multi-start is O(P²·S) and can
+/// take minutes on multi-thousand recipe catalogs for little gain over a
+/// well-spaced seed sample once the exact path already produced a plan.
+const GREEDY_CONSTRAINED_MAX_SEEDS: usize = 64;
+
 /// Greedy fallback for the constrained path: multi-start greedy ranked by
 /// [`better_scored`]. Used when the exact solver declines (too large, error, or
-/// time budget).
+/// time budget) or still has residual violations.
 fn greedy_constrained_scored(input: &GreedyInput<'_>, target: usize) -> ScoredSchedule {
+    let n = input.pool.len();
+    let seeds: Vec<usize> = if n <= GREEDY_CONSTRAINED_MAX_SEEDS {
+        (0..n).collect()
+    } else {
+        // Evenly spaced seeds over the pool (canonical order not required —
+        // pool order is already normalized upstream).
+        (0..GREEDY_CONSTRAINED_MAX_SEEDS)
+            .map(|i| i * n / GREEDY_CONSTRAINED_MAX_SEEDS)
+            .collect()
+    };
     let mut best: Option<ScoredSchedule> = None;
-    for seed in 0..input.pool.len() {
+    for seed in seeds {
         let indices = greedy_from_seed(input, seed, target);
         let candidate = score_schedule(input, indices);
         let take = match &best {
@@ -713,7 +728,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         tod_labels: &tod_labels,
     };
 
-    // Track whether the exact solver produced the constrained plan.
+    // Track whether an exact (ILP / sequential-day) solver produced the plan.
     let mut planner_ilp = false;
     let scored = if target == pool.len() && !constrained {
         let indices = order_full_pool(&input);
@@ -734,15 +749,54 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         let indices = best.map(|(s, _)| s).unwrap_or_default();
         score_schedule(&input, indices)
     } else {
-        // Nutrition bounds and/or time-of-day: solve exactly, falling back to
-        // multi-start greedy when the solver declines.
-        match ilp::solve_constrained(&input, target) {
-            Some(indices) => {
-                planner_ilp = true;
-                score_schedule(&input, indices)
+        // Compete exact strategies and keep the best-scored plan. A joint
+        // multi-day partition MIP can time out with a terrible soft-constraint
+        // incumbent; sequential day packing (one flat MIP per day) scales and
+        // reliably meets per-day bounds when the pool allows it.
+        let mut best: Option<ScoredSchedule> = None;
+        let mut consider = |indices: Vec<usize>, from_ilp: bool| {
+            let candidate = score_schedule(&input, indices);
+            let take = match &best {
+                None => true,
+                Some(b) => better_scored(&pool, &candidate, b),
+            };
+            if take {
+                planner_ilp = from_ilp;
+                best = Some(candidate);
             }
-            None => greedy_constrained_scored(&input, target),
+        };
+
+        if let Some(indices) = ilp::solve_constrained(&input, target) {
+            consider(indices, true);
         }
+
+        // Multi-day per-day bounds: always also try sequential day packing.
+        let used_days = target.div_ceil(mpd as usize);
+        let multi_day_per_day = !bounds.per_day.is_empty()
+            && used_days >= 2
+            && (mpd as usize) >= 2
+            && !opts.time_of_day;
+        if multi_day_per_day {
+            if let Some(indices) = ilp::solve_days_sequential(&input, target) {
+                consider(indices, true);
+            }
+        }
+
+        // Greedy only when every exact strategy declined. Re-running multi-start
+        // greedy on multi-thousand pools to shave a residual soft violation is
+        // O(P²·S) and rarely beats sequential day packing on per-day bounds.
+        if best.is_none() {
+            best = Some(greedy_constrained_scored(&input, target));
+            planner_ilp = false;
+        }
+
+        best.unwrap_or_else(|| ScoredSchedule {
+            indices: Vec::new(),
+            net_union: 0,
+            magnitude: 0.0,
+            tod_misses: 0,
+            violations: Vec::new(),
+        })
     };
 
     let selected = &scored.indices;
@@ -2082,6 +2136,137 @@ mod tests {
             titles(&plan),
             titles(&plan2),
             "partition output must be pool-order independent"
+        );
+    }
+
+    #[test]
+    fn multi_day_per_day_kcal_max_met_when_feasible() {
+        // Regression: multi-day per-day *max* must be met when the pool allows
+        // it. A joint pool×days MIP that times out on a bad incumbent used to
+        // leave one day at ~2× the cap; sequential day packing should not.
+        //
+        // 12 light (400 kcal) + 6 heavy (900 kcal). Three heavies on one day
+        // = 2700 > 1500. Three lights = 1200, in range [800, 1500].
+        let mut pool = Vec::new();
+        let mut macros = HashMap::new();
+        for i in 0..12 {
+            let id = format!("L{i}");
+            pool.push(rec_with_id(
+                &id,
+                &format!("Light {i}"),
+                &[&format!("{} g protein", 100 + i)],
+            ));
+            macros.insert(
+                RecipeId::from(id.as_str()),
+                Macros {
+                    kcal: 400.0,
+                    protein_g: 30.0,
+                    fat_g: 15.0,
+                    carbs_g: 20.0,
+                },
+            );
+        }
+        for i in 0..6 {
+            let id = format!("H{i}");
+            pool.push(rec_with_id(
+                &id,
+                &format!("Heavy {i}"),
+                &[&format!("{} g sugar", 200 + i)],
+            ));
+            macros.insert(
+                RecipeId::from(id.as_str()),
+                Macros {
+                    kcal: 900.0,
+                    protein_g: 10.0,
+                    fat_g: 40.0,
+                    carbs_g: 80.0,
+                },
+            );
+        }
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                kcal: MacroRange {
+                    min: Some(800.0),
+                    max: Some(1500.0),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = PlanOptions {
+            days: 3,
+            meals_per_day: 3,
+            nutrition: nutrition.clone(),
+            recipe_macros: macros.clone(),
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 9, "{}", plan.rationale);
+        let violations = plan_bound_violations(&pool, &plan, &nutrition, &macros);
+        assert!(
+            violations.is_empty(),
+            "expected all days within 800–1500 kcal, got {violations:?}\nplan: {:?}\n{}",
+            titles(&plan),
+            plan.rationale
+        );
+        assert!(
+            plan.rationale.contains("Exact ILP planner")
+                || plan.rationale.contains("Nutrition constraints satisfied"),
+            "{}",
+            plan.rationale
+        );
+    }
+
+    #[test]
+    fn sequential_day_pack_scales_past_joint_partition_limit() {
+        // Enough recipes × days to exceed PARTITION_CELL_LIMIT (2500): joint
+        // partition is skipped; sequential must still meet per-day max.
+        // 200 recipes, 5 days × 3 meals = 15 slots; 200×5 = 1000 cells is under
+        // limit. Use 600 recipes × 5 days = 3000 cells to force sequential-only.
+        let mut pool = Vec::new();
+        let mut macros = HashMap::new();
+        for i in 0..600 {
+            let id = format!("R{i:04}");
+            // Distinct primary ingredient so union is well-defined.
+            pool.push(rec_with_id(
+                &id,
+                &format!("Recipe {i:04}"),
+                &[&format!("{} g item{i}", 50 + (i % 20))],
+            ));
+            // All mid-cal so any 3-meal day is ~1200 kcal.
+            macros.insert(
+                RecipeId::from(id.as_str()),
+                Macros {
+                    kcal: 400.0,
+                    protein_g: 25.0,
+                    fat_g: 15.0,
+                    carbs_g: 30.0,
+                },
+            );
+        }
+        let nutrition = NutritionBounds {
+            per_day: MacroBounds {
+                kcal: MacroRange {
+                    min: Some(800.0),
+                    max: Some(1500.0),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let opts = PlanOptions {
+            days: 5,
+            meals_per_day: 3,
+            nutrition: nutrition.clone(),
+            recipe_macros: macros.clone(),
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 15, "{}", plan.rationale);
+        let violations = plan_bound_violations(&pool, &plan, &nutrition, &macros);
+        assert!(
+            violations.is_empty(),
+            "sequential path must meet per-day kcal on large pools: {violations:?}"
         );
     }
 
