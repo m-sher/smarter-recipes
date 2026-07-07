@@ -95,25 +95,27 @@ fn ingest_epub_doc<R: Read + Seek>(mut doc: EpubDoc<R>, path: &str) -> Result<Ep
             skipped_unresolved += entry_count - segments.len();
         }
         for (entry, segment_html) in segments {
-            // Dedup by locator (path+fragment/href), not display title — cookbooks
-            // often reuse titles like "Vinaigrette".
-            let loc_key = format!(
-                "{}#{}",
-                entry.path,
-                entry.fragment.as_deref().unwrap_or(entry.href.as_str())
-            );
-            if !seen_href.insert(loc_key) {
-                continue;
-            }
-            let (recipe, status) =
-                html_segment_to_recipe(&entry, &segment_html, path, &resolved_epub_path);
-            match status {
-                IngredientStatus::AmbiguousStructure => {
-                    skipped_ambiguous.push(recipe.title);
+            for (entry, segment_html) in expand_segment_recipes(&entry, &segment_html) {
+                // Dedup by locator (path+fragment/href), not display title — cookbooks
+                // often reuse titles like "Vinaigrette".
+                let loc_key = format!(
+                    "{}#{}",
+                    entry.path,
+                    entry.fragment.as_deref().unwrap_or(entry.href.as_str())
+                );
+                if !seen_href.insert(loc_key) {
+                    continue;
                 }
-                IngredientStatus::Resolved => {
-                    if is_cookable(&recipe) {
-                        out.push(recipe);
+                let (recipe, status) =
+                    html_segment_to_recipe(&entry, &segment_html, path, &resolved_epub_path);
+                match status {
+                    IngredientStatus::AmbiguousStructure => {
+                        skipped_ambiguous.push(recipe.title);
+                    }
+                    IngredientStatus::Resolved => {
+                        if is_cookable(&recipe) {
+                            out.push(recipe);
+                        }
                     }
                 }
             }
@@ -246,6 +248,13 @@ pub fn catalog_quality_score(parsed: &IndexParseResult, path_hint: &str) -> Opti
     if is_subject_index_stats(parsed.page_number_link_count, parsed.titled_link_count) {
         return None;
     }
+    // Reject bodies full of repeated cross-ref labels ("here", "*", …) that survived
+    // filtering as near-duplicates pointing at different fragments.
+    // Threshold 0.5 (not 0.4) so a small legitimate contents page where two of five
+    // recipes share a name (2/5 = 0.4) is not false-rejected.
+    if parsed.entries.len() >= 5 && catalog_max_title_share(&parsed.entries) >= 0.5 {
+        return None;
+    }
     let mut score = parsed.entries.len() as i64 * 1000;
     // Prefer deep links (path#fragment) over top-level spine nav ("Recipes" → whole file).
     let with_fragment = parsed
@@ -368,12 +377,12 @@ pub fn parse_index_document(html: &str, base_path: &str) -> IndexParseResult {
             page_number_link_count += 1;
             continue;
         }
-        if is_noise_title(&title) {
+        if is_noise_title(&title) || is_generic_link_title(&title) {
             continue;
         }
 
         let (path, fragment) = resolve_href(base_path, href);
-        if path.is_empty() {
+        if path.is_empty() || path_looks_like_cross_ref(&path) {
             continue;
         }
         let key = format!(
@@ -406,12 +415,15 @@ fn entries_from_toc<R: Read + Seek>(doc: &EpubDoc<R>) -> Vec<IndexEntry> {
     let mut seen = HashSet::new();
     for np in flatten_nav(&doc.toc) {
         let title = sanitize(np.label.trim());
-        if title.is_empty() || is_noise_title(&title) {
+        if title.is_empty() || is_noise_title(&title) || is_generic_link_title(&title) {
             continue;
         }
         let path = path_to_string(&np.content);
         // Nav content may include a fragment already in the PathBuf display.
         let (path, fragment) = split_path_fragment(&path);
+        if path_looks_like_cross_ref(&path) {
+            continue;
+        }
         let href = match &fragment {
             Some(f) => format!("{path}#{f}"),
             None => path.clone(),
@@ -466,6 +478,73 @@ fn is_noise_title(title: &str) -> bool {
         return true;
     }
     NOISE.is_match(t)
+}
+
+/// Cross-reference / footnote link text that must never become a recipe title
+/// (`see <a>here</a>`, glossary `*`, …).
+pub fn is_generic_link_title(title: &str) -> bool {
+    let t = normalize_title_key(title);
+    if t.is_empty() {
+        return true;
+    }
+    if matches!(t.as_str(), "*" | "•" | "·" | "†" | "‡" | "※") {
+        return true;
+    }
+    matches!(
+        t.as_str(),
+        "here"
+            | "there"
+            | "above"
+            | "below"
+            | "this"
+            | "link"
+            | "more"
+            | "top"
+            | "back"
+            | "click here"
+            | "see here"
+            | "see above"
+            | "see below"
+            | "see over"
+            | "this page"
+            | "this recipe"
+            | "read more"
+            | "continue"
+            | "continued"
+            | "previous"
+            | "next"
+    )
+}
+
+/// Glossary / technique appendix targets used as in-body cross-refs, not catalogs.
+///
+/// Intentionally does **not** match bare stems `cook` / `cooking` — those can be
+/// real recipe-chapter filenames in cookbooks. Technique appendices are caught via
+/// stems that contain `"technique"` (e.g. `techniques`, `cooking-techniques`).
+fn path_looks_like_cross_ref(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let file = Path::new(&lower)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    matches!(
+        file,
+        "glossary" | "glossaries" | "appendix" | "bibliography" | "endnotes" | "footnotes"
+    ) || file.contains("glossary")
+        || file.contains("technique")
+}
+
+/// Fraction of entries sharing the single most common normalized title.
+pub fn catalog_max_title_share(entries: &[IndexEntry]) -> f64 {
+    if entries.is_empty() {
+        return 0.0;
+    }
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for e in entries {
+        *counts.entry(normalize_title_key(&e.title)).or_insert(0) += 1;
+    }
+    let max = counts.values().copied().max().unwrap_or(0);
+    max as f64 / entries.len() as f64
 }
 
 /// Resolve a relative href against the index document path.
@@ -678,6 +757,101 @@ enum IngredientStatus {
     Resolved,
     /// No list structure, or list items coexisting with measured paragraphs.
     AmbiguousStructure,
+}
+
+/// Split a chapter (or oversized segment) on `h1`/`h2` headings that introduce an
+/// explicit Ingredients section. Returns `(title, html_slice)` in document order.
+///
+/// Used when the catalog only points at whole chapters (commercial multi-recipe
+/// XHTML files) so each dish becomes its own segment instead of one mega-recipe.
+pub fn split_recipes_by_heading(html: &str) -> Vec<(String, String)> {
+    static RE_H1: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<h1\b[^>]*>(.*?)</h1>").expect("h1 split re"));
+    static RE_H2: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?is)<h2\b[^>]*>(.*?)</h2>").expect("h2 split re"));
+    let mut headings: Vec<(usize, String)> = Vec::new();
+    for re in [&RE_H1, &RE_H2] {
+        for caps in re.captures_iter(html) {
+            let full = caps.get(0).expect("full match");
+            let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let title = sanitize(&strip_tags(inner));
+            let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+            if title.is_empty() || is_noise_title(&title) || is_generic_link_title(&title) {
+                continue;
+            }
+            if is_ingredients_header(&title.to_ascii_lowercase())
+                || is_steps_header(&title.to_ascii_lowercase())
+            {
+                continue;
+            }
+            headings.push((full.start(), title));
+        }
+    }
+    headings.sort_by_key(|(start, _)| *start);
+    headings.dedup_by_key(|(start, _)| *start);
+    if headings.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, (start, title)) in headings.iter().enumerate() {
+        let end = headings.get(i + 1).map(|(s, _)| *s).unwrap_or(html.len());
+        if *start >= end {
+            continue;
+        }
+        let slice = &html[*start..end];
+        if !segment_has_ingredients_header(slice) {
+            continue;
+        }
+        out.push((title.clone(), slice.to_string()));
+    }
+    out
+}
+
+fn segment_has_ingredients_header(html: &str) -> bool {
+    static RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?is)<h[1-4]\b[^>]*>\s*(?:<[^>]+>\s*)*(ingredients?|you will need|what you need|shopping list)\s*(?:<[^>]+>\s*)*</h[1-4]>",
+        )
+        .expect("ingredients header re")
+    });
+    if RE.is_match(html) {
+        return true;
+    }
+    // Plain-text fallback after tag strip (some exporters omit heading tags).
+    strip_tags(html).lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        is_ingredients_header(&lower)
+    })
+}
+
+/// Expand a catalog segment into per-recipe slices when the HTML embeds multiple
+/// headed recipes; otherwise return the segment unchanged.
+fn expand_segment_recipes(entry: &IndexEntry, segment_html: &str) -> Vec<(IndexEntry, String)> {
+    let pieces = split_recipes_by_heading(segment_html);
+    if pieces.is_empty() {
+        return vec![(entry.clone(), segment_html.to_string())];
+    }
+    pieces
+        .into_iter()
+        .enumerate()
+        .map(|(i, (title, slice))| {
+            let mut e = entry.clone();
+            e.title = title;
+            // Distinguish identity when many recipes share one chapter path.
+            // Always include the split index so same-title dishes in one chapter
+            // (e.g. two "Coconut Chutney" variants) do not collide on path#slug
+            // and get silently dropped by the locator dedup below.
+            let base = normalize_title_key(&e.title).replace(' ', "-");
+            let slug = if base.is_empty() {
+                format!("recipe-{i}")
+            } else {
+                format!("{base}-{i}")
+            };
+            e.href = format!("{}#{}", e.path, slug);
+            e.fragment = Some(slug);
+            (e, slice)
+        })
+        .collect()
 }
 
 fn html_segment_to_recipe(
@@ -1628,6 +1802,13 @@ mod tests {
         assert!(is_noise_title("Acknowledgements"));
         assert!(is_noise_title("Acknowledgments"));
         assert!(!is_noise_title("Fluffy Pancakes"));
+        assert!(is_generic_link_title("here"));
+        assert!(is_generic_link_title("HERE"));
+        assert!(is_generic_link_title("*"));
+        assert!(is_generic_link_title("see here"));
+        assert!(is_generic_link_title("click here"));
+        assert!(!is_generic_link_title("Green Chilli Pickle"));
+        assert!(!is_generic_link_title("Pickles and Chutneys"));
     }
 
     #[test]
@@ -2153,6 +2334,225 @@ mod tests {
     }
 
     #[test]
+    fn splits_multi_recipe_chapter_on_h2_ingredients_blocks() {
+        let html = r#"
+        <p class="bhead">PICKLES</p>
+        <p class="noindent">Intro prose with a link <a href="ch010.html#page519">here</a>.</p>
+        <h2 class="h2">Green Chilli Pickle</h2>
+        <h3 class="h35"><b>Ingredients</b></h3>
+        <p class="hang">10 green chillies, slit</p>
+        <p class="hang">1 tsp salt</p>
+        <h3 class="h35"><b>Method</b></h3>
+        <ul><li>Mix and jar.</li></ul>
+        <h2 class="h2">Sweet Tomato Chutney</h2>
+        <h3 class="h35"><b>Ingredients</b></h3>
+        <p class="hang">4 tomatoes, chopped</p>
+        <p class="hang">125g sugar</p>
+        <p class="hang">1 tsp turmeric</p>
+        <h3 class="h35"><b>Method</b></h3>
+        <ul><li>Cook until thick.</li></ul>
+        "#;
+        let pieces = split_recipes_by_heading(html);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[0].0, "Green Chilli Pickle");
+        assert_eq!(pieces[1].0, "Sweet Tomato Chutney");
+        let r0 = recipe_from_html(&pieces[0].1, &pieces[0].0);
+        let r1 = recipe_from_html(&pieces[1].1, &pieces[1].0);
+        assert!(is_cookable(&r0));
+        assert!(is_cookable(&r1));
+        assert_eq!(r0.ingredients.len(), 2);
+        assert_eq!(r1.ingredients.len(), 3);
+        assert!(!r0.title.eq_ignore_ascii_case("here"));
+    }
+
+    #[test]
+    fn expand_segment_keeps_same_title_variants_with_distinct_locators() {
+        let html = r#"
+        <h2 class="h2">Coconut Chutney</h2>
+        <h3 class="h35"><b>Ingredients</b></h3>
+        <p class="hang">1 cup grated coconut</p>
+        <p class="hang">2 green chillies</p>
+        <h3 class="h35"><b>Method</b></h3>
+        <ul><li>Grind fresh.</li></ul>
+        <h2 class="h2">Coconut Chutney</h2>
+        <h3 class="h35"><b>Ingredients</b></h3>
+        <p class="hang">1 cup desiccated coconut</p>
+        <p class="hang">1 tsp tamarind paste</p>
+        <p class="hang">1 dried red chilli</p>
+        <h3 class="h35"><b>Method</b></h3>
+        <ul><li>Soak and grind.</li></ul>
+        <h2 class="h2">Naan</h2>
+        <h3 class="h35"><b>Ingredients</b></h3>
+        <p class="hang">250g flour</p>
+        <p class="hang">1 tsp yeast</p>
+        <h3 class="h35"><b>Method</b></h3>
+        <ul><li>Knead and bake.</li></ul>
+        "#;
+        let parent = IndexEntry {
+            title: "Chutneys".into(),
+            path: "OEBPS/ch001.html".into(),
+            fragment: None,
+            href: "ch001.html".into(),
+        };
+        let expanded = expand_segment_recipes(&parent, html);
+        assert_eq!(expanded.len(), 3);
+        let frags: Vec<_> = expanded
+            .iter()
+            .map(|(e, _)| e.fragment.as_deref().unwrap_or(""))
+            .collect();
+        // Indexed slugs must differ even when display titles match.
+        assert_eq!(frags[0], "coconut-chutney-0");
+        assert_eq!(frags[1], "coconut-chutney-1");
+        assert_eq!(frags[2], "naan-2");
+        let mut seen = HashSet::new();
+        for (e, _) in &expanded {
+            let key = format!(
+                "{}#{}",
+                e.path,
+                e.fragment.as_deref().unwrap_or(e.href.as_str())
+            );
+            assert!(seen.insert(key), "locator collision for {:?}", e.href);
+        }
+        assert_eq!(expanded[0].0.title, "Coconut Chutney");
+        assert_eq!(expanded[1].0.title, "Coconut Chutney");
+        assert_eq!(expanded[2].0.title, "Naan");
+    }
+
+    #[test]
+    fn path_cross_ref_skips_technique_appendices_not_bare_cook_stems() {
+        assert!(path_looks_like_cross_ref("OEBPS/glossary.html"));
+        assert!(path_looks_like_cross_ref("OEBPS/techniques.html"));
+        assert!(path_looks_like_cross_ref("OEBPS/cooking-techniques.html"));
+        assert!(path_looks_like_cross_ref("OEBPS/appendix.html"));
+        // Bare cook/cooking stems can be real chapter files — do not exclude.
+        assert!(!path_looks_like_cross_ref("OEBPS/cook.html"));
+        assert!(!path_looks_like_cross_ref("OEBPS/cooking.html"));
+        assert!(!path_looks_like_cross_ref("OEBPS/ch001.html"));
+    }
+
+    #[test]
+    fn parse_index_drops_here_star_and_glossary_cross_refs() {
+        let html = r#"
+        <html><body>
+          <a href="ch001.html#page8">here</a>
+          <a href="ch001.html#page9">here</a>
+          <a href="glossary.html#a4">*</a>
+          <a href="techniques.html">cooking techniques</a>
+          <a href="ch001.html">Pickles and Chutneys</a>
+          <a href="ch002.html">Salads</a>
+        </body></html>"#;
+        let parsed = parse_index_document(html, "OEBPS/ch004.html");
+        let titles: Vec<_> = parsed.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, vec!["Pickles and Chutneys", "Salads"]);
+        assert!(catalog_quality_score(&parsed, "OEBPS/toc.html").is_some());
+    }
+
+    #[test]
+    fn catalog_rejects_duplicate_generic_title_dominance() {
+        let mut entries = Vec::new();
+        for i in 0..10 {
+            entries.push(IndexEntry {
+                title: "Sauce".into(),
+                path: "OEBPS/ch001.html".into(),
+                fragment: Some(format!("page{i}")),
+                href: format!("ch001.html#page{i}"),
+            });
+        }
+        entries.push(IndexEntry {
+            title: "Other".into(),
+            path: "OEBPS/ch002.html".into(),
+            fragment: None,
+            href: "ch002.html".into(),
+        });
+        let parsed = IndexParseResult {
+            titled_link_count: entries.len(),
+            page_number_link_count: 0,
+            entries,
+        };
+        assert!(catalog_max_title_share(&parsed.entries) >= 0.5);
+        assert!(catalog_quality_score(&parsed, "OEBPS/ch004.html").is_none());
+    }
+
+    #[test]
+    fn catalog_keeps_small_contents_with_one_shared_title_pair() {
+        // 2 of 5 share a name (share = 0.4) — legitimate small contents, not "here" spam.
+        let entries = vec![
+            IndexEntry {
+                title: "Vinaigrette".into(),
+                path: "OEBPS/ch001.html".into(),
+                fragment: Some("a".into()),
+                href: "ch001.html#a".into(),
+            },
+            IndexEntry {
+                title: "Vinaigrette".into(),
+                path: "OEBPS/ch001.html".into(),
+                fragment: Some("b".into()),
+                href: "ch001.html#b".into(),
+            },
+            IndexEntry {
+                title: "Soup".into(),
+                path: "OEBPS/ch002.html".into(),
+                fragment: None,
+                href: "ch002.html".into(),
+            },
+            IndexEntry {
+                title: "Stew".into(),
+                path: "OEBPS/ch003.html".into(),
+                fragment: None,
+                href: "ch003.html".into(),
+            },
+            IndexEntry {
+                title: "Bread".into(),
+                path: "OEBPS/ch004.html".into(),
+                fragment: None,
+                href: "ch004.html".into(),
+            },
+        ];
+        let share = catalog_max_title_share(&entries);
+        assert!((share - 0.4).abs() < f64::EPSILON, "share={share}");
+        let parsed = IndexParseResult {
+            titled_link_count: entries.len(),
+            page_number_link_count: 0,
+            entries,
+        };
+        assert!(
+            catalog_quality_score(&parsed, "OEBPS/toc.html").is_some(),
+            "must not false-reject 2/5 shared title"
+        );
+    }
+
+    #[test]
+    fn chapter_toc_epub_splits_into_named_recipes_not_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let epub_path = dir.path().join("indian-style.epub");
+        write_chapter_toc_epub(&epub_path);
+        let outcome = ingest_epub(epub_path.to_str().unwrap()).expect("ingest");
+        let titles: Vec<_> = outcome.recipes.iter().map(|r| r.title.as_str()).collect();
+        assert!(
+            titles.contains(&"Green Chilli Pickle"),
+            "got titles: {titles:?}"
+        );
+        assert!(
+            titles.contains(&"Sweet Tomato Chutney"),
+            "got titles: {titles:?}"
+        );
+        assert!(
+            titles.iter().all(|t| !t.eq_ignore_ascii_case("here")),
+            "must not import cross-ref label as title: {titles:?}"
+        );
+        for r in &outcome.recipes {
+            assert!(
+                r.ingredients.len() <= 20,
+                "{} blew up to {} ingredients",
+                r.title,
+                r.ingredients.len()
+            );
+            assert!(is_cookable(r));
+        }
+        assert!(outcome.recipes.len() >= 2);
+    }
+
+    #[test]
     fn store_keeps_both_epub_recipes_not_collapsed_by_dedup() {
         use crate::ingest::recipe_source_url;
         use crate::storage::Store;
@@ -2296,6 +2696,125 @@ mod tests {
     </ol>
   </section>
 </body></html>"#,
+        )
+        .unwrap();
+
+        zip.finish().unwrap();
+    }
+
+    /// Chapter-level TOC only, multi-recipe XHTML with `here` cross-refs and hang ingredients
+    /// (shape of *1000 Indian Recipe Cookbook*).
+    fn write_chapter_toc_epub(path: &Path) {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let deflated =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+        zip.start_file("mimetype", stored).unwrap();
+        zip.write_all(b"application/epub+zip").unwrap();
+
+        zip.start_file("META-INF/container.xml", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/volume.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/volume.opf", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="uid">urn:test:indian-style</dc:identifier>
+    <dc:title>Indian Style Test</dc:title>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="toc" href="toc.html" media-type="application/xhtml+xml"/>
+    <item id="ch1" href="ch001.html" media-type="application/xhtml+xml"/>
+    <item id="cook" href="cook.html" media-type="application/xhtml+xml"/>
+    <item id="gloss" href="glossary.html" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine toc="ncx">
+    <itemref idref="toc"/>
+    <itemref idref="ch1"/>
+    <itemref idref="cook"/>
+    <itemref idref="gloss"/>
+  </spine>
+</package>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/toc.ncx", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <docTitle><text>Indian Style Test</text></docTitle>
+  <navMap>
+    <navPoint id="np1" playOrder="1"><navLabel><text>Contents</text></navLabel><content src="toc.html"/></navPoint>
+    <navPoint id="np2" playOrder="2"><navLabel><text>Pickles and Chutneys</text></navLabel><content src="ch001.html"/></navPoint>
+    <navPoint id="np3" playOrder="3"><navLabel><text>Cooking techniques</text></navLabel><content src="cook.html"/></navPoint>
+  </navMap>
+</ncx>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/toc.html", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+  <h2>Contents</h2>
+  <p class="toc"><a href="ch001.html">Pickles and Chutneys</a></p>
+  <p class="toc"><a href="cook.html">Cooking techniques</a></p>
+  <p class="toc"><a href="glossary.html">Glossary</a></p>
+</body></html>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/ch001.html", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+  <p class="bhead">PICKLES AND CHUTNEYS</p>
+  <p class="noindent">See rice <a href="ch010.html#page519">here</a> and note <a href="glossary.html#a4">*</a>.</p>
+  <p>Also try <a href="ch001.html#page8">here</a> and <a href="ch001.html#page9">here</a>.</p>
+  <h2 class="h2">Green Chilli Pickle</h2>
+  <h3 class="h35"><b>Ingredients</b></h3>
+  <p class="hang">10 green chillies, slit</p>
+  <p class="hang">1 tsp salt</p>
+  <p class="hang">4 tsp ground mustard</p>
+  <h3 class="h35"><b>Method</b></h3>
+  <ul><li><span class="black">Mix all the ingredients together.</span></li></ul>
+  <h2 class="h2">Sweet Tomato Chutney</h2>
+  <h3 class="h35"><b>Ingredients</b></h3>
+  <p class="hang">4 tomatoes, chopped</p>
+  <p class="hang">125g sugar</p>
+  <p class="hang">1 tsp turmeric</p>
+  <p class="hang">2 tsp refined vegetable oil</p>
+  <h3 class="h35"><b>Method</b></h3>
+  <ul><li><span class="black">Cook until thick. See technique in <a href="cook.html">cooking techniques</a>.</span></li></ul>
+</body></html>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/cook.html", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Fry, steam, grind.</p></body></html>"#,
+        )
+        .unwrap();
+
+        zip.start_file("OEBPS/glossary.html", deflated).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body><p id="a4">Asafoetida</p></body></html>"#,
         )
         .unwrap();
 

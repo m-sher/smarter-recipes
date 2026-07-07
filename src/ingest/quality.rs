@@ -38,19 +38,28 @@ fn line_has_amount(line: &crate::domain::IngredientLine) -> bool {
     text_has_amount(&line.original)
 }
 
+/// Upper bound on ingredient lines for a single dish. Larger lists are almost
+/// always a chapter/index mis-segmentation (hundreds of lines), not one recipe.
+/// Set high enough for elaborate multi-component dishes (biryani, thali-style
+/// feasts, spice-heavy curries) while still rejecting mis-segmented chapters.
+pub const MAX_COOKABLE_INGREDIENTS: usize = 100;
+
 /// True when a recipe looks like a real, cookable dish rather than a roundup,
 /// index page, how-to guide, or extraction failure.
 ///
-/// The rule: at least two ingredient lines, at least one carrying an amount, and
-/// amounts at least a fifth of the lines.
+/// The rule: at least two ingredient lines, at least one carrying an amount,
+/// amounts at least a fifth of the lines, and not an implausibly huge list.
 pub fn is_cookable(recipe: &Recipe) -> bool {
     let ing = recipe.ingredients.len();
+    if !(2..=MAX_COOKABLE_INGREDIENTS).contains(&ing) {
+        return false;
+    }
     let amt = recipe
         .ingredients
         .iter()
         .filter(|l| line_has_amount(l))
         .count();
-    ing >= 2 && amt >= 1 && (amt as f64) >= 0.2 * (ing as f64)
+    amt >= 1 && (amt as f64) >= 0.2 * (ing as f64)
 }
 
 #[cfg(test)]
@@ -109,6 +118,24 @@ mod tests {
         assert!(!is_cookable(&rec(&["1 large onion"])));
         // Extraction failure with no ingredients.
         assert!(!is_cookable(&rec(&[])));
+    }
+
+    #[test]
+    fn rejects_implausibly_huge_ingredient_lists() {
+        let lines: Vec<String> = (0..MAX_COOKABLE_INGREDIENTS + 1)
+            .map(|i| format!("{} g spice{i}", i + 1))
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        assert!(!is_cookable(&rec(&refs)));
+        // Elaborate multi-component dishes (well above the old 48 cap) stay cookable.
+        let ok_lines: Vec<String> = (0..60).map(|i| format!("{} g spice{i}", i + 1)).collect();
+        let ok_refs: Vec<&str> = ok_lines.iter().map(|s| s.as_str()).collect();
+        assert!(is_cookable(&rec(&ok_refs)));
+        let at_cap: Vec<String> = (0..MAX_COOKABLE_INGREDIENTS)
+            .map(|i| format!("{} g spice{i}", i + 1))
+            .collect();
+        let at_cap_refs: Vec<&str> = at_cap.iter().map(|s| s.as_str()).collect();
+        assert!(is_cookable(&rec(&at_cap_refs)));
     }
 
     #[test]
