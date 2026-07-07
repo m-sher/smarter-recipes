@@ -171,11 +171,16 @@ pub fn density_g_per_ml(name: &str) -> Option<f64> {
             return Some(*d);
         }
     }
-    // 4) Narrow fallbacks for common *spice* phrasing only (avoid turning any
-    //    "… powder" into a mass ingredient for shopping).
-    if n.contains("masala") || n.starts_with("ground ") {
+    // 4) Spice-only fallbacks. Do **not** use a bare `ground ` prefix: that
+    //    falsely assigns spice density to ground meats/nuts (ground beef,
+    //    ground almonds, …), which corrupts nutrition coverage and shopping.
+    //    Unlisted `ground X` spices must be added to the table explicitly.
+    if n.contains("masala") {
         return Some(0.48);
     }
+    // Culinary pastes are semi-solids near water density (~1.1–1.25 g/ml). This
+    // intentionally covers tomato/curry/miso/almond/shrimp/etc. paste as well as
+    // ginger-garlic paste; same shopping path as other densities.
     if n.ends_with(" paste") || n.contains("-garlic paste") || n.contains(" garlic paste") {
         return Some(1.15);
     }
@@ -212,10 +217,10 @@ mod tests {
 
     #[test]
     fn spice_volumes_resolve() {
+        // Names arrive already normalized (quantity stripped); these are clean keys.
         for name in [
             "garam masala",
             "ground turmeric",
-            "1 tsp ground coriander", // won't match full string as name — use clean keys
             "ground coriander",
             "cumin seeds",
             "ginger paste",
@@ -235,11 +240,27 @@ mod tests {
     }
 
     #[test]
-    fn generic_ground_and_masala_fallback() {
-        assert!(density_g_per_ml("ground mystery spice").is_some());
+    fn masala_and_paste_fallback_not_ground_meat() {
         assert!(density_g_per_ml("some masala blend").is_some());
-        // Bare "… powder" / "… seeds" stay unknown unless listed — shopping must
-        // not convert arbitrary powders to mass packages.
+        assert!(density_g_per_ml("tomato paste").is_some()); // intentional paste ≈1.15
+                                                             // Unlisted ground *spices* stay None (add them to the table explicitly).
+        assert!(density_g_per_ml("ground mystery spice").is_none());
+        // Ground meats/nuts must never get the spice density (honest unknown).
+        for name in [
+            "ground beef",
+            "ground turkey",
+            "ground pork",
+            "ground lamb",
+            "ground chicken",
+            "ground almonds",
+            "lean ground beef",
+        ] {
+            assert!(
+                density_g_per_ml(name).is_none(),
+                "{name} must not use spice density fallback"
+            );
+        }
+        // Bare "… powder" / "… seeds" stay unknown unless listed.
         assert!(density_g_per_ml("mystery powder").is_none());
         assert!(density_g_per_ml("weird seeds").is_none());
     }

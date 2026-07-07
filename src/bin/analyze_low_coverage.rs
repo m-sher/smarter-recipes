@@ -1,16 +1,25 @@
-use smarter_recipes::nutrition::{recipe_nutrition, source_recipe_macros};
-use smarter_recipes::planning::MIN_INGREDIENT_COVERAGE;
-use smarter_recipes::storage::Store;
+//! Report how many recipes are high/low coverage under the planner threshold.
+//!
+//! Usage:
+//!   cargo run --release --bin analyze_low_coverage
+//!   SMARTER_RECIPES_DB=/path/to/db cargo run --release --bin analyze_low_coverage
+
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
-fn main() -> anyhow::Result<()> {
-    let db = env::var("SMARTER_RECIPES_DB")
+use smarter_recipes::nutrition::{recipe_nutrition, source_recipe_macros};
+use smarter_recipes::planning::MIN_INGREDIENT_COVERAGE;
+use smarter_recipes::storage::Store;
+
+fn db_path() -> PathBuf {
+    env::var("SMARTER_RECIPES_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env::var("HOME").unwrap()).join(".local/share/smarter-recipes/recipes.db")
-        });
+        .unwrap_or_else(|_| Store::default_path())
+}
+
+fn main() -> anyhow::Result<()> {
+    let db = db_path();
     let store = Store::open(&db)?;
     let recipes = store.list_recipes(None)?;
     let extra: HashMap<_, _> = store
@@ -18,6 +27,9 @@ fn main() -> anyhow::Result<()> {
         .into_iter()
         .filter_map(|(k, v)| v.map(|m| (k, m)))
         .collect();
+    println!("DB: {}", db.display());
+    println!("Loaded {} positive cache profiles", extra.len());
+
     let mut low = 0usize;
     let mut high = 0usize;
     let mut source = 0usize;

@@ -189,7 +189,6 @@ const PER_EACH_G: &[(&str, f64)] = &[
     ("garlic", 3.0),
     ("garlic clove", 3.0),
     ("garlic cloves", 3.0),
-    ("minced garlic", 3.0),
     ("onion", 110.0),
     ("onions", 110.0),
     ("red onion", 110.0),
@@ -252,9 +251,9 @@ const PER_EACH_G: &[(&str, f64)] = &[
     ("bay leaves", 0.4),
     ("curry leaf", 0.15),
     ("curry leaves", 0.15),
-    // Spice cloves (not garlic) — shorter key after garlic entries above.
+    // Whole spice cloves only (not bare "cloves" — that is common garlic shorthand
+    // and would under-weigh badly if mapped to ~0.1 g spice cloves).
     ("whole cloves", 0.1),
-    ("cloves", 0.1),
     ("stick cinnamon", 3.0),
     ("sticks cinnamon", 3.0),
     ("cinnamon stick", 3.0),
@@ -351,9 +350,11 @@ mod tests {
         assert_eq!(grams_per_each("bay leaves"), Some(0.4));
         assert_eq!(grams_per_each("green cardamom pods"), Some(0.3));
         assert_eq!(grams_per_each("black cardamom pods"), Some(1.0));
-        // Garlic must not pick up the tiny spice-clove weight.
+        // Garlic must not pick up a spice-clove weight; bare "cloves" stays unknown
+        // (ambiguous garlic shorthand vs whole spice).
         assert_eq!(grams_per_each("garlic cloves"), Some(3.0));
-        assert_eq!(grams_per_each("cloves"), Some(0.1));
+        assert_eq!(grams_per_each("whole cloves"), Some(0.1));
+        assert!(grams_per_each("cloves").is_none());
         assert_eq!(grams_per_each("stick cinnamon"), Some(3.0));
     }
 
