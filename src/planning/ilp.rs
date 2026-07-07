@@ -1,7 +1,8 @@
-//! Exact integer-program selection for nutrition-constrained meal plans.
+//! Exact integer-program selection for nutrition- and/or time-of-day-constrained
+//! meal plans.
 //!
-//! When bounds are configured, the selection is solved exactly with a MILP
-//! (HiGHS):
+//! When bounds are configured **without** time-of-day steering, the selection is
+//! solved with a MILP (HiGHS):
 //!
 //! * **Variables** — one binary `x` per candidate recipe (flat model) or per
 //!   `(recipe, day)` cell when a per-day bound must partition meals across days.
@@ -13,6 +14,11 @@
 //!   optimum (`V ≤ V* + ε`) and minimizes the net ingredient union `Σ y`. This
 //!   matches the ranking contract in [`super::better_scored`] (feasible-first,
 //!   then min weighted violation, then min union).
+//!
+//! When **time-of-day** steering is on, a slot-indexed model is used instead:
+//! one binary per `(recipe, slot)` so assignment respects breakfast/lunch/dinner
+//! identity. A three-phase lex solve minimizes nutrition violation, then TOD
+//! miss count, then net union.
 //!
 //! The violation objective reproduces [`super::weighted_magnitude`] exactly:
 //! per-meal bounds are a per-recipe constant, per-day/plan bounds are slacks on
@@ -31,8 +37,8 @@ use std::time::Duration;
 use backend::{ComparisonOp, OptimizationDirection, Problem, Solution, Variable};
 
 use super::{
-    evaluate_macros, weighted_magnitude, BoundScope, GreedyInput, MacroBounds, MacroRange,
-    MacroRatio, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
+    evaluate_macros, slot_requirement, tod_fits, weighted_magnitude, BoundScope, GreedyInput,
+    MacroBounds, MacroRange, MacroRatio, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
 };
 use crate::domain::{Macros, UnitKind};
 use crate::shopping::pantry_quantity_for;
@@ -283,9 +289,10 @@ fn solve_checked(prob: Problem) -> Option<Solution> {
     prob.solve(SOLVE_TIME_LIMIT.as_secs_f64())
 }
 
-/// Exactly select `target` recipes from `input.pool` to satisfy the configured
-/// nutrition bounds (feasible-first, then min union), returning pool indices in
-/// plan (row-major) order. `None` means the caller should fall back to greedy.
+/// Exactly select `target` recipes from `input.pool` under configured nutrition
+/// bounds and/or time-of-day steering (feasible-first, then min TOD misses, then
+/// min union), returning pool indices in plan (row-major) order. `None` means
+/// the caller should fall back to greedy.
 pub(super) fn solve_constrained(input: &GreedyInput<'_>, target: usize) -> Option<Vec<usize>> {
     let p = input.pool.len();
     // Nothing to solve, or more meals requested than distinct recipes exist.
@@ -294,7 +301,6 @@ pub(super) fn solve_constrained(input: &GreedyInput<'_>, target: usize) -> Optio
     }
     let mpd = input.meals_per_day.max(1) as usize;
     let used_days = target.div_ceil(mpd);
-    let needs_partition = !input.bounds.per_day.is_empty() && used_days >= 2 && mpd >= 2;
 
     // Canonical recipe order (title, id): deterministic, pool-order independent.
     let canonical = |a: usize, b: usize| {
@@ -308,6 +314,11 @@ pub(super) fn solve_constrained(input: &GreedyInput<'_>, target: usize) -> Optio
     let mut order: Vec<usize> = (0..p).collect();
     order.sort_by(|&a, &b| canonical(a, b));
 
+    if input.time_of_day {
+        return solve_slots(input, &order, target, mpd);
+    }
+
+    let needs_partition = !input.bounds.per_day.is_empty() && used_days >= 2 && mpd >= 2;
     if needs_partition {
         solve_partition(input, &order, target, mpd, used_days)
     } else {
@@ -674,4 +685,239 @@ fn build_union(
         ys.push(y);
     }
     ys
+}
+
+#[derive(Clone, Copy)]
+enum SlotPhase {
+    /// Minimize total nutrition-violation magnitude.
+    Nutrition,
+    /// Fix nutrition optimum; minimize TOD miss count.
+    Tod,
+    /// Fix nutrition + TOD optima; minimize net ingredient union.
+    Union,
+}
+
+/// Slot-indexed model used when time-of-day steering is on: one binary per
+/// `(recipe, slot)` so breakfast/lunch/dinner identity is explicit.
+///
+/// Cost note: variables scale as `pool × slots` over **3** lex phases (nutrition
+/// → TOD misses → union), vs flat `pool` binaries × 2 phases. Large catalogs can
+/// hit the solve-time budget more readily and fall back to greedy; no candidate
+/// cap is applied here (pool is already the caller's selected set).
+fn solve_slots(
+    input: &GreedyInput<'_>,
+    order: &[usize],
+    target: usize,
+    mpd: usize,
+) -> Option<Vec<usize>> {
+    let bounds = input.bounds;
+    let macros = input.macros;
+    let p = order.len();
+    let slots = target;
+    let used_days = target.div_ceil(mpd);
+    let mpd_u = mpd as u32;
+
+    let const_r: Vec<f64> = order
+        .iter()
+        .map(|&r| recipe_violation(&bounds.per_meal, &macros[r]))
+        .collect();
+
+    let miss: Vec<Vec<bool>> = (0..p)
+        .map(|j| {
+            let labels = input.tod_labels[order[j]];
+            (0..slots)
+                .map(|s| {
+                    let meal = (s as u32) % mpd_u;
+                    let req = slot_requirement(mpd_u, meal);
+                    !tod_fits(labels, req)
+                })
+                .collect()
+        })
+        .collect();
+
+    type SlotBuild = (
+        Problem,
+        Vec<Vec<Variable>>,
+        Vec<(Variable, f64)>,
+        Vec<(Variable, f64)>,
+    );
+    let build = |phase: SlotPhase, v_nut: Option<f64>, v_tod: Option<f64>| -> SlotBuild {
+        let mut prob = Problem::new(OptimizationDirection::Minimize);
+        let nutrition_obj = matches!(phase, SlotPhase::Nutrition);
+        let tod_obj = matches!(phase, SlotPhase::Tod);
+        let union_phase = matches!(phase, SlotPhase::Union);
+
+        let xs: Vec<Vec<Variable>> = (0..p)
+            .map(|j| {
+                (0..slots)
+                    .map(|s| {
+                        let mut obj = 0.0;
+                        if nutrition_obj {
+                            obj += const_r[j];
+                        }
+                        if tod_obj && miss[j][s] {
+                            obj += 1.0;
+                        }
+                        prob.add_binary_var(obj)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut nut_viol: Vec<(Variable, f64)> = Vec::new();
+        for (j, cells) in xs.iter().enumerate() {
+            if const_r[j] != 0.0 {
+                for &v in cells {
+                    nut_viol.push((v, const_r[j]));
+                }
+            }
+        }
+
+        let mut tod_viol: Vec<(Variable, f64)> = Vec::new();
+        for (j, cells) in xs.iter().enumerate() {
+            for (s, &v) in cells.iter().enumerate() {
+                if miss[j][s] {
+                    tod_viol.push((v, 1.0));
+                }
+            }
+        }
+
+        // Each recipe at most once.
+        for cells in &xs {
+            let terms: Vec<(Variable, f64)> = cells.iter().map(|&v| (v, 1.0)).collect();
+            prob.add_constraint(&terms, ComparisonOp::Le, 1.0);
+        }
+        // Each slot exactly one recipe.
+        #[allow(clippy::needless_range_loop)]
+        for s in 0..slots {
+            let terms: Vec<(Variable, f64)> = (0..p).map(|j| (xs[j][s], 1.0)).collect();
+            prob.add_constraint(&terms, ComparisonOp::Eq, 1.0);
+        }
+
+        let slack_obj = if nutrition_obj { 1.0 } else { 0.0 };
+        for i in 0..4 {
+            let day_range = nutrient_range(&bounds.per_day, i);
+            if !bounds.per_day.is_empty() && !day_range.is_empty() {
+                let mut day_terms: Vec<Vec<(Variable, f64)>> = vec![Vec::new(); used_days];
+                for (j, cells) in xs.iter().enumerate() {
+                    let val = nutrient_val(&macros[order[j]], i);
+                    for (s, &v) in cells.iter().enumerate() {
+                        day_terms[s / mpd].push((v, val));
+                    }
+                }
+                for terms in &day_terms {
+                    if terms.is_empty() {
+                        continue;
+                    }
+                    add_range_slacks(
+                        &mut prob,
+                        terms,
+                        &day_range,
+                        slack_obj,
+                        range_weight(i),
+                        &mut nut_viol,
+                    );
+                }
+            }
+            let plan_range = nutrient_range(&bounds.plan, i);
+            if !bounds.plan.is_empty() && !plan_range.is_empty() {
+                let mut terms: Vec<(Variable, f64)> = Vec::with_capacity(p * slots);
+                for (j, cells) in xs.iter().enumerate() {
+                    let val = nutrient_val(&macros[order[j]], i);
+                    for &v in cells {
+                        terms.push((v, val));
+                    }
+                }
+                add_range_slacks(
+                    &mut prob,
+                    &terms,
+                    &plan_range,
+                    slack_obj,
+                    range_weight(i),
+                    &mut nut_viol,
+                );
+            }
+        }
+
+        if !bounds.per_day.ratio.is_empty() {
+            let mut buckets: Vec<Vec<(Variable, f64, f64, f64)>> = vec![Vec::new(); used_days];
+            for (j, cells) in xs.iter().enumerate() {
+                let m = &macros[order[j]];
+                for (s, &v) in cells.iter().enumerate() {
+                    buckets[s / mpd].push((v, m.protein_g, m.fat_g, m.carbs_g));
+                }
+            }
+            for bucket in &buckets {
+                if bucket.is_empty() {
+                    continue;
+                }
+                add_ratio_slacks(
+                    &mut prob,
+                    bucket,
+                    &bounds.per_day.ratio,
+                    slack_obj,
+                    &mut nut_viol,
+                );
+            }
+        }
+        if !bounds.plan.ratio.is_empty() {
+            let mut all: Vec<(Variable, f64, f64, f64)> = Vec::with_capacity(p * slots);
+            for (j, cells) in xs.iter().enumerate() {
+                let m = &macros[order[j]];
+                for &v in cells {
+                    all.push((v, m.protein_g, m.fat_g, m.carbs_g));
+                }
+            }
+            add_ratio_slacks(
+                &mut prob,
+                &all,
+                &bounds.plan.ratio,
+                slack_obj,
+                &mut nut_viol,
+            );
+        }
+
+        if let Some(vstar) = v_nut {
+            if !nut_viol.is_empty() {
+                prob.add_constraint(&nut_viol, ComparisonOp::Le, vstar + VIOLATION_EPS);
+            }
+        }
+        if let Some(tstar) = v_tod {
+            if !tod_viol.is_empty() {
+                prob.add_constraint(&tod_viol, ComparisonOp::Le, tstar + VIOLATION_EPS);
+            }
+        }
+
+        if union_phase {
+            let cell_refs: Vec<&[Variable]> = xs.iter().map(|c| c.as_slice()).collect();
+            build_union(&mut prob, input, order, &cell_refs);
+        }
+
+        (prob, xs, nut_viol, tod_viol)
+    };
+
+    let (prob1, _, _, _) = build(SlotPhase::Nutrition, None, None);
+    let v_nut = solve_checked(prob1)?.objective();
+    let (prob2, _, _, _) = build(SlotPhase::Tod, Some(v_nut), None);
+    let v_tod = solve_checked(prob2)?.objective();
+    let (prob3, xs3, _, _) = build(SlotPhase::Union, Some(v_nut), Some(v_tod));
+    let sol3 = solve_checked(prob3)?;
+
+    let mut plan_order = vec![0usize; slots];
+    let mut filled = vec![false; slots];
+    for (j, cells) in xs3.iter().enumerate() {
+        for (s, &v) in cells.iter().enumerate() {
+            if sol3[v] > 0.5 {
+                if filled[s] {
+                    return None;
+                }
+                plan_order[s] = order[j];
+                filled[s] = true;
+            }
+        }
+    }
+    if filled.iter().any(|f| !f) {
+        return None;
+    }
+    Some(plan_order)
 }

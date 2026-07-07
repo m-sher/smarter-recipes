@@ -119,6 +119,13 @@ smarter-recipes plan --days 5 --per-day 2 --min-protein-g 50 --max-kcal 3000
 smarter-recipes plan --days 5 --nutrition-config examples/nutrition_bounds.toml
 smarter-recipes plan --days 5 --nutrition-config examples/nutrition_bounds.toml --min-protein-g 60
 
+# Steer slots by time of day using recipe tags and schema.org categories
+# (breakfast / lunch / dinner; brunch→breakfast+lunch, supper→dinner).
+# 1 meal/day: any; 2: breakfast then dinner; 3: B/L/D; 4+: first breakfast,
+# last dinner, lunch near the middle, other slots unrestricted. Soft mismatches
+# when the pool lacks labels; combines with nutrition bounds (nutrition ranks first).
+smarter-recipes plan --days 3 --per-day 3 --tod
+smarter-recipes plan --days 5 --per-day 2 --tod --min-protein-g 50
 
 # Shopping list with package recommendations + leftover flags
 # (amounts already in the pantry are subtracted / omitted)
@@ -207,7 +214,9 @@ src/
 
 **Unconstrained:** multi-start greedy — for each possible first recipe, repeatedly append the unused candidate that adds the fewest new **to-buy** keys after quantity-aware pantry consumption (shared with shopping’s stock ledger); keep the schedule with the smallest net to-buy count. Partial stock does not fully exempt a key. Recipes are never repeated; if the pool is smaller than the requested slots, the plan is partial. Recipes whose estimate reports no calories, or calories with no protein/fat/carbs at all (e.g. an alcohol-only recipe), are dropped from the pool (not treated as meals).
 
-**With nutrition bounds:** the selection is solved as an integer program over the **whole recipe pool** (no candidate cap) by [HiGHS](https://highs.dev/), with a two-phase lexicographic objective — first minimize total bound-violation magnitude (so a feasible plan is returned whenever one exists), then minimize the net to-buy count. When a solve can't be proven optimal within its time budget, the best feasible plan found so far is used; the greedy scheduler is the fallback only if the solver returns nothing usable. Recipes whose **ingredient coverage** falls below a threshold (default 90% of estimable ingredients resolved; `MIN_INGREDIENT_COVERAGE`) are excluded from the pool here, since an understated estimate can't be trusted against a constraint — run `nutrition fetch` to cover more ingredients and unlock more recipes. Unconstrained planning keeps them. See module docs in `src/planning/mod.rs` and `src/planning/ilp.rs`.
+**With nutrition bounds:** the selection is solved as an integer program over the **whole recipe pool** (no candidate cap) by [HiGHS](https://highs.dev/), with a two-phase lexicographic objective — first minimize total bound-violation magnitude (so a feasible plan is returned whenever one exists), then minimize the net to-buy count. When a solve can't be proven optimal within its time budget, the best feasible plan found so far is used; the greedy scheduler is the fallback only if the solver returns nothing usable. Recipes whose **ingredient coverage** falls below a threshold (default 90% of estimable ingredients resolved; `MIN_INGREDIENT_COVERAGE`) are excluded from the pool here, since an understated estimate can't be trusted against a constraint — run `nutrition fetch` to cover more ingredients and unlock more recipes. Unconstrained planning keeps them.
+
+**With `--tod`:** each in-day meal index maps to breakfast, lunch, dinner, or any. Labels come from `meta.tags` and comma-split `meta.category` (`brunch` counts as breakfast and lunch, `supper` as dinner). Matching is **exact token** after title-key normalization (`dinner` / `supper` yes; `Dinners` or `Quick Dinner` no — use a dedicated tag or comma-split category). Unlabeled recipes fit only unrestricted slots. Enforcement is soft and ranks after nutrition magnitude (miss count, then net to-buy). The exact solver switches to per-slot variables (`pool × slots`, three lex phases) so assignment respects slot identity; on very large pools this is heavier than the flat model and more likely to time out to greedy. See module docs in `src/planning/mod.rs`, `src/planning/tod.rs`, and `src/planning/ilp.rs`.
 
 ### Nutrition bounds TOML
 

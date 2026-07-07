@@ -8,7 +8,8 @@ use crate::ingest::{
 };
 use crate::normalize::normalize_line;
 use crate::planning::{
-    load_nutrition_bounds, plan_bound_violations, plan_meals, CliPerDayNutrition, PlanOptions,
+    load_nutrition_bounds, plan_bound_violations, plan_meals, plan_tod_mismatches,
+    CliPerDayNutrition, PlanOptions, TodMismatch,
 };
 use crate::pricing::{
     enrich_catalog_from_source, FixtureStoreSource, OpenFoodFactsSource, PackageCatalog,
@@ -161,6 +162,10 @@ pub enum Commands {
         /// Per-day maximum carbs grams (overrides config file)
         #[arg(long)]
         max_carbs_g: Option<f64>,
+        /// Steer slots toward breakfast/lunch/dinner using recipe tags and
+        /// schema.org categories (soft mismatches; see rationale)
+        #[arg(long)]
+        tod: bool,
         /// Print plan as JSON
         #[arg(long)]
         json: bool,
@@ -536,6 +541,7 @@ pub fn run(cli: Cli) -> Result<()> {
             max_fat_g,
             min_carbs_g,
             max_carbs_g,
+            tod,
             json,
             dry_run,
         } => {
@@ -564,8 +570,14 @@ pub fn run(cli: Cli) -> Result<()> {
                 nutrition: nutrition.clone(),
                 recipe_macros: recipe_macros.clone(),
                 recipe_low_coverage,
+                time_of_day: tod,
             };
             let plan = plan_meals(&recipes, &opts);
+            let tod_misses = if tod {
+                plan_tod_mismatches(&recipes, &plan)
+            } else {
+                Vec::new()
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -579,6 +591,17 @@ pub fn run(cli: Cli) -> Result<()> {
                         plan_bound_violations(&recipes, &plan, &nutrition, &recipe_macros);
                     print_plan_constraints(&violations);
                 }
+                if tod {
+                    print_plan_tod(&tod_misses);
+                }
+            }
+            // Emit regardless of --json so machine consumers still see soft misses
+            // (structured per-slot detail remains in the rationale / human summary).
+            if tod && !tod_misses.is_empty() {
+                eprintln!(
+                    "warning: time-of-day: {} slot(s) could not be matched to labeled recipes",
+                    tod_misses.len()
+                );
             }
             if !dry_run {
                 store.save_plan(&plan)?;
@@ -1182,6 +1205,25 @@ fn print_plan_constraints(violations: &[crate::planning::BoundViolation]) {
     println!("  Best effort; {} bound(s) not met:", violations.len());
     for v in violations {
         println!("  - {v}");
+    }
+}
+
+fn print_plan_tod(misses: &[TodMismatch]) {
+    println!("\nTime of day:");
+    if misses.is_empty() {
+        println!("  All slots matched.");
+        return;
+    }
+    println!("  Best effort; {} slot(s) mismatched:", misses.len());
+    for m in misses {
+        println!(
+            "  - day {} meal {}: expected {}, got {} ({})",
+            m.day + 1,
+            m.meal + 1,
+            m.expected,
+            m.recipe_title,
+            m.labels.describe()
+        );
     }
 }
 
