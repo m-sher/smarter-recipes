@@ -40,7 +40,9 @@ fn line_has_amount(line: &crate::domain::IngredientLine) -> bool {
 
 /// Upper bound on ingredient lines for a single dish. Larger lists are almost
 /// always a chapter/index mis-segmentation (hundreds of lines), not one recipe.
-pub const MAX_COOKABLE_INGREDIENTS: usize = 48;
+/// Set high enough for elaborate multi-component dishes (biryani, thali-style
+/// feasts, spice-heavy curries) while still rejecting mis-segmented chapters.
+pub const MAX_COOKABLE_INGREDIENTS: usize = 100;
 
 /// True when a recipe looks like a real, cookable dish rather than a roundup,
 /// index page, how-to guide, or extraction failure.
@@ -125,9 +127,15 @@ mod tests {
             .collect();
         let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
         assert!(!is_cookable(&rec(&refs)));
-        let ok_lines: Vec<String> = (0..10).map(|i| format!("{} g spice{i}", i + 1)).collect();
+        // Elaborate multi-component dishes (well above the old 48 cap) stay cookable.
+        let ok_lines: Vec<String> = (0..60).map(|i| format!("{} g spice{i}", i + 1)).collect();
         let ok_refs: Vec<&str> = ok_lines.iter().map(|s| s.as_str()).collect();
         assert!(is_cookable(&rec(&ok_refs)));
+        let at_cap: Vec<String> = (0..MAX_COOKABLE_INGREDIENTS)
+            .map(|i| format!("{} g spice{i}", i + 1))
+            .collect();
+        let at_cap_refs: Vec<&str> = at_cap.iter().map(|s| s.as_str()).collect();
+        assert!(is_cookable(&rec(&at_cap_refs)));
     }
 
     #[test]

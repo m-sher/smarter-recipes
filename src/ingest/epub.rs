@@ -250,7 +250,9 @@ pub fn catalog_quality_score(parsed: &IndexParseResult, path_hint: &str) -> Opti
     }
     // Reject bodies full of repeated cross-ref labels ("here", "*", …) that survived
     // filtering as near-duplicates pointing at different fragments.
-    if parsed.entries.len() >= 5 && catalog_max_title_share(&parsed.entries) >= 0.4 {
+    // Threshold 0.5 (not 0.4) so a small legitimate contents page where two of five
+    // recipes share a name (2/5 = 0.4) is not false-rejected.
+    if parsed.entries.len() >= 5 && catalog_max_title_share(&parsed.entries) >= 0.5 {
         return None;
     }
     let mut score = parsed.entries.len() as i64 * 1000;
@@ -515,6 +517,10 @@ pub fn is_generic_link_title(title: &str) -> bool {
 }
 
 /// Glossary / technique appendix targets used as in-body cross-refs, not catalogs.
+///
+/// Intentionally does **not** match bare stems `cook` / `cooking` — those can be
+/// real recipe-chapter filenames in cookbooks. Technique appendices are caught via
+/// stems that contain `"technique"` (e.g. `techniques`, `cooking-techniques`).
 fn path_looks_like_cross_ref(path: &str) -> bool {
     let lower = path.to_lowercase();
     let file = Path::new(&lower)
@@ -523,19 +529,9 @@ fn path_looks_like_cross_ref(path: &str) -> bool {
         .unwrap_or("");
     matches!(
         file,
-        "glossary"
-            | "glossaries"
-            | "cook"
-            | "cooking"
-            | "techniques"
-            | "technique"
-            | "appendix"
-            | "bibliography"
-            | "endnotes"
-            | "footnotes"
+        "glossary" | "glossaries" | "appendix" | "bibliography" | "endnotes" | "footnotes"
     ) || file.contains("glossary")
-        || file.ends_with("-glossary")
-        || file.starts_with("glossary")
+        || file.contains("technique")
 }
 
 /// Fraction of entries sharing the single most common normalized title.
@@ -842,11 +838,14 @@ fn expand_segment_recipes(entry: &IndexEntry, segment_html: &str) -> Vec<(IndexE
             let mut e = entry.clone();
             e.title = title;
             // Distinguish identity when many recipes share one chapter path.
-            let slug = normalize_title_key(&e.title).replace(' ', "-");
-            let slug = if slug.is_empty() {
+            // Always include the split index so same-title dishes in one chapter
+            // (e.g. two "Coconut Chutney" variants) do not collide on path#slug
+            // and get silently dropped by the locator dedup below.
+            let base = normalize_title_key(&e.title).replace(' ', "-");
+            let slug = if base.is_empty() {
                 format!("recipe-{i}")
             } else {
-                slug
+                format!("{base}-{i}")
             };
             e.href = format!("{}#{}", e.path, slug);
             e.fragment = Some(slug);
@@ -2367,13 +2366,78 @@ mod tests {
     }
 
     #[test]
+    fn expand_segment_keeps_same_title_variants_with_distinct_locators() {
+        let html = r#"
+        <h2 class="h2">Coconut Chutney</h2>
+        <h3 class="h35"><b>Ingredients</b></h3>
+        <p class="hang">1 cup grated coconut</p>
+        <p class="hang">2 green chillies</p>
+        <h3 class="h35"><b>Method</b></h3>
+        <ul><li>Grind fresh.</li></ul>
+        <h2 class="h2">Coconut Chutney</h2>
+        <h3 class="h35"><b>Ingredients</b></h3>
+        <p class="hang">1 cup desiccated coconut</p>
+        <p class="hang">1 tsp tamarind paste</p>
+        <p class="hang">1 dried red chilli</p>
+        <h3 class="h35"><b>Method</b></h3>
+        <ul><li>Soak and grind.</li></ul>
+        <h2 class="h2">Naan</h2>
+        <h3 class="h35"><b>Ingredients</b></h3>
+        <p class="hang">250g flour</p>
+        <p class="hang">1 tsp yeast</p>
+        <h3 class="h35"><b>Method</b></h3>
+        <ul><li>Knead and bake.</li></ul>
+        "#;
+        let parent = IndexEntry {
+            title: "Chutneys".into(),
+            path: "OEBPS/ch001.html".into(),
+            fragment: None,
+            href: "ch001.html".into(),
+        };
+        let expanded = expand_segment_recipes(&parent, html);
+        assert_eq!(expanded.len(), 3);
+        let frags: Vec<_> = expanded
+            .iter()
+            .map(|(e, _)| e.fragment.as_deref().unwrap_or(""))
+            .collect();
+        // Indexed slugs must differ even when display titles match.
+        assert_eq!(frags[0], "coconut-chutney-0");
+        assert_eq!(frags[1], "coconut-chutney-1");
+        assert_eq!(frags[2], "naan-2");
+        let mut seen = HashSet::new();
+        for (e, _) in &expanded {
+            let key = format!(
+                "{}#{}",
+                e.path,
+                e.fragment.as_deref().unwrap_or(e.href.as_str())
+            );
+            assert!(seen.insert(key), "locator collision for {:?}", e.href);
+        }
+        assert_eq!(expanded[0].0.title, "Coconut Chutney");
+        assert_eq!(expanded[1].0.title, "Coconut Chutney");
+        assert_eq!(expanded[2].0.title, "Naan");
+    }
+
+    #[test]
+    fn path_cross_ref_skips_technique_appendices_not_bare_cook_stems() {
+        assert!(path_looks_like_cross_ref("OEBPS/glossary.html"));
+        assert!(path_looks_like_cross_ref("OEBPS/techniques.html"));
+        assert!(path_looks_like_cross_ref("OEBPS/cooking-techniques.html"));
+        assert!(path_looks_like_cross_ref("OEBPS/appendix.html"));
+        // Bare cook/cooking stems can be real chapter files — do not exclude.
+        assert!(!path_looks_like_cross_ref("OEBPS/cook.html"));
+        assert!(!path_looks_like_cross_ref("OEBPS/cooking.html"));
+        assert!(!path_looks_like_cross_ref("OEBPS/ch001.html"));
+    }
+
+    #[test]
     fn parse_index_drops_here_star_and_glossary_cross_refs() {
         let html = r#"
         <html><body>
           <a href="ch001.html#page8">here</a>
           <a href="ch001.html#page9">here</a>
           <a href="glossary.html#a4">*</a>
-          <a href="cook.html">cooking techniques</a>
+          <a href="techniques.html">cooking techniques</a>
           <a href="ch001.html">Pickles and Chutneys</a>
           <a href="ch002.html">Salads</a>
         </body></html>"#;
@@ -2405,8 +2469,56 @@ mod tests {
             page_number_link_count: 0,
             entries,
         };
-        assert!(catalog_max_title_share(&parsed.entries) >= 0.4);
+        assert!(catalog_max_title_share(&parsed.entries) >= 0.5);
         assert!(catalog_quality_score(&parsed, "OEBPS/ch004.html").is_none());
+    }
+
+    #[test]
+    fn catalog_keeps_small_contents_with_one_shared_title_pair() {
+        // 2 of 5 share a name (share = 0.4) — legitimate small contents, not "here" spam.
+        let entries = vec![
+            IndexEntry {
+                title: "Vinaigrette".into(),
+                path: "OEBPS/ch001.html".into(),
+                fragment: Some("a".into()),
+                href: "ch001.html#a".into(),
+            },
+            IndexEntry {
+                title: "Vinaigrette".into(),
+                path: "OEBPS/ch001.html".into(),
+                fragment: Some("b".into()),
+                href: "ch001.html#b".into(),
+            },
+            IndexEntry {
+                title: "Soup".into(),
+                path: "OEBPS/ch002.html".into(),
+                fragment: None,
+                href: "ch002.html".into(),
+            },
+            IndexEntry {
+                title: "Stew".into(),
+                path: "OEBPS/ch003.html".into(),
+                fragment: None,
+                href: "ch003.html".into(),
+            },
+            IndexEntry {
+                title: "Bread".into(),
+                path: "OEBPS/ch004.html".into(),
+                fragment: None,
+                href: "ch004.html".into(),
+            },
+        ];
+        let share = catalog_max_title_share(&entries);
+        assert!((share - 0.4).abs() < f64::EPSILON, "share={share}");
+        let parsed = IndexParseResult {
+            titled_link_count: entries.len(),
+            page_number_link_count: 0,
+            entries,
+        };
+        assert!(
+            catalog_quality_score(&parsed, "OEBPS/toc.html").is_some(),
+            "must not false-reject 2/5 shared title"
+        );
     }
 
     #[test]
