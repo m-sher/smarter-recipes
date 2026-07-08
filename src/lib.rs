@@ -12,6 +12,7 @@
 //! - [`storage`] — SQLite persistence with ingredient dedup and pantry stock
 //! - [`pricing`] — package catalog (offline defaults + optional scrape)
 
+pub mod categorize;
 pub mod cli;
 pub mod domain;
 pub mod dotenv;

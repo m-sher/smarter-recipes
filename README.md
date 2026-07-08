@@ -155,6 +155,20 @@ smarter-recipes delete <id>
 smarter-recipes reparse <id>
 smarter-recipes reparse --all
 
+# Category labels for planning filters (blacklist/whitelist in nutrition TOML).
+# With any filter configured, recipes with no category are excluded (same as
+# blacklisted). Unsure model output stays empty → stays excluded from the pool.
+# Plan rationale splits "blacklisted: N" vs "no category: M" so gaps are visible.
+# URL recipes: refresh first to pull schema.org recipeCategory when present.
+# EPUB / gaps: categorize uses Gemini Flash-Lite (cheap) to fill missing categories.
+# Dry-run by default; --apply writes. API key: SMARTER_RECIPES_GEMINI_API_KEY
+# or GEMINI_API_KEY (https://aistudio.google.com/apikey).
+smarter-recipes refresh --all --apply
+smarter-recipes categorize                    # dry-run + sample labels
+smarter-recipes categorize --sample 0         # counts only (no network)
+smarter-recipes categorize --limit 50 --apply # small first write
+smarter-recipes categorize --apply --yes      # full backfill
+
 # Nutrition: `plan` prints estimated per-day macros with explicit coverage
 # ("N/M ingredients"); `show` prints per-serving nutrition when the source
 # site published it. Estimates use a built-in USDA-style per-100 g table;

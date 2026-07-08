@@ -107,17 +107,30 @@ fn expand_tokens(list: &[String]) -> Vec<String> {
 ///
 /// A recipe's stored category may list several values joined by ", "; a recipe
 /// matches a list when any of its tokens equals a list entry (compared on the
-/// normalized key). Not counted by [`NutritionBounds::is_empty`].
+/// normalized key). Whenever either list is non-empty, recipes with **no**
+/// category tokens are excluded (same strictness as a non-empty whitelist).
+/// Not counted by [`NutritionBounds::is_empty`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct CategoryFilter {
     /// When non-empty, ONLY recipes whose category matches one of these are
-    /// eligible (strict): uncategorized recipes are excluded.
+    /// eligible. Uncategorized recipes are excluded whenever any filter list
+    /// is configured (see [`Self::allows`]).
     #[serde(default)]
     pub whitelist: Vec<String>,
     /// Recipes whose category matches one of these are always excluded.
-    /// Takes precedence over the whitelist.
+    /// Takes precedence over the whitelist. A non-empty blacklist alone also
+    /// excludes uncategorized recipes.
     #[serde(default)]
     pub blacklist: Vec<String>,
+}
+
+/// Why a recipe was excluded by a non-empty category filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoryDrop {
+    /// No category tokens (missing / blank). Suggest re-running `categorize`.
+    NoCategory,
+    /// Has tokens but failed blacklist and/or whitelist.
+    Filtered,
 }
 
 impl CategoryFilter {
@@ -149,24 +162,43 @@ impl CategoryFilter {
     }
 
     /// Whether a recipe with this (optional, possibly comma-joined) category is
-    /// eligible for the meal pool. Blacklist wins; a non-empty whitelist is
-    /// strict (uncategorized recipes are excluded).
+    /// eligible for the meal pool.
+    ///
+    /// - Empty filter → everything is allowed.
+    /// - Any non-empty blacklist and/or whitelist → recipes with no category
+    ///   tokens are excluded.
+    /// - Blacklist wins: any black token drops the recipe.
+    /// - Non-empty whitelist then requires at least one white token.
     pub fn allows(&self, category: Option<&str>) -> bool {
+        self.drop_reason(category).is_none()
+    }
+
+    /// `None` if allowed; otherwise why it was excluded.
+    pub fn drop_reason(&self, category: Option<&str>) -> Option<CategoryDrop> {
+        if self.is_empty() {
+            return None;
+        }
         let tokens: Vec<String> = category
             .into_iter()
             .flat_map(|c| c.split(','))
             .map(category_key)
             .filter(|t| !t.is_empty())
             .collect();
+        // Configured filter is strict: no category means we can't classify it.
+        if tokens.is_empty() {
+            return Some(CategoryDrop::NoCategory);
+        }
         let black = expand_tokens(&self.blacklist);
         if tokens.iter().any(|t| black.contains(t)) {
-            return false;
+            return Some(CategoryDrop::Filtered);
         }
         if !self.whitelist.is_empty() {
             let white = expand_tokens(&self.whitelist);
-            return tokens.iter().any(|t| white.contains(t));
+            if !tokens.iter().any(|t| white.contains(t)) {
+                return Some(CategoryDrop::Filtered);
+            }
         }
-        true
+        None
     }
 }
 
@@ -700,8 +732,21 @@ mod tests {
         assert!(!f.allows(Some("sauce"))); // case-insensitive
         assert!(!f.allows(Some("Main Course, Sauce"))); // any token matches
         assert!(f.allows(Some("Main Course")));
-        assert!(f.allows(None)); // blacklist alone does not exclude uncategorized
+        assert!(!f.allows(None)); // any configured list excludes uncategorized
+        assert!(!f.allows(Some("")));
+        assert!(!f.allows(Some("  ,  ")));
         assert!(f.allows(Some("Applesauce Cake"))); // token equality, not substring
+    }
+
+    #[test]
+    fn category_blacklist_alone_excludes_uncategorized() {
+        let f = CategoryFilter {
+            blacklist: vec!["Sauce".into()],
+            ..Default::default()
+        };
+        assert!(!f.allows(None));
+        assert!(!f.allows(Some("")));
+        assert!(f.allows(Some("Dinner")));
     }
 
     #[test]

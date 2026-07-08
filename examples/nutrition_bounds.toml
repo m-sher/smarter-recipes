@@ -14,15 +14,21 @@ ratio = { protein = 40, fat = 30, carb = 30 }
 # Optional category filter for the candidate pool, matched against the
 # publisher's schema.org recipeCategory. Keeps standalone meals and drops
 # components / building blocks. Matching is case-insensitive on each
-# comma-separated token; blacklist wins if any token matches. A non-empty
-# whitelist is strict (uncategorized recipes are excluded).
+# comma-separated token; blacklist wins if any token matches.
+#
+# If either blacklist or whitelist is non-empty, recipes with no category
+# are excluded (uncategorized drinks/components from EPUB import, etc.).
+# A non-empty whitelist is additionally strict: only matching tokens stay.
+#
+# Backfill categories before planning a filtered pool:
+#   smarter-recipes refresh --all --apply   # schema.org on URL recipes
+#   smarter-recipes categorize --apply      # Gemini labels for remaining gaps
 #
 # Blacklist is exhaustive against tokens currently present in the local
 # catalog (~8.8k recipes) that label sauces, dressings, condiments, dips,
 # spice mixes, pantry building blocks, and how-to/component pages — not
 # meal types (Dinner, Lunch, Side Dish, …). "Pantry" is listed; "Pantry Meal"
 # is not. Re-scan after large imports if new component labels appear.
-# Run `smarter-recipes refresh --all --apply` first to backfill categories.
 [category]
 # whitelist = ["Main Course", "Dinner", "Entree"]
 blacklist = [
@@ -37,6 +43,8 @@ blacklist = [
   "Condiments and Sauces",
   "Dip",
   "Dips and Appetizers",
+  "Appetizer",
+  "Appetizers",
   "Salsa",
   # Components / building blocks / seasoning
   "Component",

@@ -233,6 +233,45 @@ pub enum Commands {
         #[arg(long, default_value_t = 6)]
         jobs: usize,
     },
+    /// Label missing recipe categories with a cheap Gemini model so the plan
+    /// category filter can keep meals and drop drinks/components.
+    ///
+    /// Dry-run by default (counts + optional live sample). Re-run with `--apply`
+    /// to write. Prefer `refresh --all --apply` first for URL recipes that publish
+    /// schema.org categories; this fills the rest (especially EPUB imports).
+    ///
+    /// API key: `SMARTER_RECIPES_GEMINI_API_KEY` or `GEMINI_API_KEY` (or `--api-key`).
+    Categorize {
+        /// Optional recipe id prefix (must be unique among eligible recipes)
+        id: Option<String>,
+        /// Write labels to the database (default: dry-run preview)
+        #[arg(long)]
+        apply: bool,
+        /// Re-label recipes that already have a category
+        #[arg(long)]
+        force: bool,
+        /// Max recipes to process this run
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Recipes per Gemini request
+        #[arg(long, default_value_t = crate::categorize::DEFAULT_BATCH_SIZE)]
+        batch_size: usize,
+        /// Gemini model id
+        #[arg(long, default_value = crate::categorize::DEFAULT_MODEL)]
+        model: String,
+        /// Restrict by source: all | epub | url
+        #[arg(long, default_value = "all")]
+        source: String,
+        /// Dry-run: live-label this many recipes as a sample (0 = count only, no network)
+        #[arg(long, default_value_t = crate::categorize::DEFAULT_SAMPLE)]
+        sample: usize,
+        /// Skip confirmation when applying more than 100 labels
+        #[arg(long)]
+        yes: bool,
+        /// Gemini API key (else `SMARTER_RECIPES_GEMINI_API_KEY` or `GEMINI_API_KEY`)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
     /// Track on-hand ingredients (pantry stock)
     Pantry {
         #[command(subcommand)]
@@ -897,6 +936,108 @@ pub fn run(cli: Cli) -> Result<()> {
                     println!("\n{skipped_non_url} recipe(s) without a source URL will be skipped.");
                 }
                 println!("\nRe-run with --apply to fetch and update in place.");
+            }
+        }
+        Commands::Categorize {
+            id,
+            apply,
+            force,
+            limit,
+            batch_size,
+            model,
+            source,
+            sample,
+            yes,
+            api_key,
+        } => {
+            use crate::categorize::{
+                resolve_api_key, run_categorize, CategorizeOptions, GeminiLabeler, SourceFilter,
+            };
+            let source = SourceFilter::parse(&source)?;
+            let opts = CategorizeOptions {
+                apply,
+                force,
+                limit,
+                batch_size: batch_size.max(1),
+                sample,
+                source,
+                yes,
+                id_prefix: id,
+            };
+
+            // Need a key for apply, or dry-run with sample > 0.
+            let needs_network = apply || opts.sample > 0;
+            let key = if needs_network {
+                Some(resolve_api_key(api_key.as_deref())?)
+            } else {
+                // Still allow resolve if provided; optional for count-only dry-run.
+                resolve_api_key(api_key.as_deref()).ok()
+            };
+
+            let all = store.list_recipes(None)?;
+            if let Some(pfx) = &opts.id_prefix {
+                let matches: Vec<_> = all
+                    .iter()
+                    .filter(|r| r.id.as_str().starts_with(pfx.as_str()))
+                    .collect();
+                match matches.len() {
+                    0 => bail!("no recipe matches id '{pfx}'"),
+                    1 => {}
+                    n => bail!(
+                        "ambiguous recipe id prefix '{pfx}' matches {n} recipes; use a longer prefix"
+                    ),
+                }
+            }
+            let (eligible, skipped_labeled) = crate::categorize::select_eligible(&all, &opts);
+            let batch = opts.batch_size.max(1);
+            let batches = if eligible.is_empty() {
+                0
+            } else {
+                eligible.len().div_ceil(batch)
+            };
+
+            let mode = if apply { "apply" } else { "dry-run" };
+            println!(
+                "Categorize ({mode}): {} eligible, source={}, model={model}",
+                eligible.len(),
+                source.as_str(),
+            );
+            if skipped_labeled > 0 && !force {
+                println!("  Skipping {skipped_labeled} already labeled (use --force to re-label)");
+            }
+            if !eligible.is_empty() {
+                println!("  Plan: ~{batches} API batch(es) of up to {batch} recipe(s)");
+            }
+
+            if eligible.is_empty() {
+                println!("Nothing to categorize.");
+            } else if !needs_network {
+                println!(
+                    "\nCount-only dry-run (no network). Re-run with default --sample to preview \
+                     labels, or with --apply to write. Tip: start with --limit 50 --apply."
+                );
+            } else {
+                let key = key.expect("key required when needs_network");
+                let labeler = GeminiLabeler::new(key, &model)?;
+                let report = run_categorize(&store, &labeler, &opts, eligible, skipped_labeled)?;
+                if apply {
+                    println!(
+                        "Done: labeled {}, left empty {} (low confidence), \
+                         failed batches {}, written {}.",
+                        report.labeled, report.left_empty, report.failed_batches, report.written
+                    );
+                    if report.failed_batches > 0 {
+                        bail!(
+                            "{} batch(es) failed; re-run to retry remaining unlabeled recipes",
+                            report.failed_batches
+                        );
+                    }
+                } else {
+                    println!(
+                        "\nRe-run with --apply to write categories. \
+                         Use --limit 50 for a small first pass."
+                    );
+                }
             }
         }
         Commands::Nutrition { action } => match action {
