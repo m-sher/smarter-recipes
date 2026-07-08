@@ -9,12 +9,12 @@
 //! Ingredient identity uses [`IngredientKey`] (normalized name + unit kind),
 //! matching aggregation and shopping.
 //!
-//! Optional **pantry** stock is applied with **binary shortfall** semantics
-//! shared with [`crate::shopping`]: a key counts as needing to buy iff demand
-//! exceeds on-hand quantity after virtual consumption (exact key, then
-//! mass↔volume density bridge).
-//! Lines with no parsed quantity use a presence-only fallback (any positive
-//! bridged stock covers; otherwise to-buy). Persisted pantry is never mutated.
+//! Optional **pantry** stock is applied with **presence-based, unit-agnostic**
+//! coverage: a recipe ingredient counts as covered (not to-buy) whenever the
+//! pantry holds that ingredient by name at all — any unit, any quantity.
+//! Prioritizing recipes that reuse on-hand ingredients falls out of minimizing
+//! the to-buy union. Persisted pantry is never mutated. (Shopping/restock keeps
+//! its own quantity-aware, unit-bridged math for what to actually purchase.)
 //!
 //! Optional [`NutritionBounds`] steer selection using precomputed whole-recipe
 //! estimated [`Macros`]: prefer schedules that satisfy per-meal, per-day, and
@@ -55,7 +55,7 @@
 //!    Running state is a cloned pantry ledger plus the set of keys already
 //!    marked to-buy. While fewer than `S` recipes are selected, append the
 //!    unused candidate that minimizes the number of **new** to-buy keys
-//!    (quantity shortfall or missing presence). Ties break by:
+//!    (ingredient keys the pantry does not already hold). Ties break by:
 //!    - smaller `|keys(candidate)|`,
 //!    - then lexicographically smaller title,
 //!    - then lexicographically smaller `recipe_id`.
@@ -95,7 +95,6 @@ pub use tod::{
 use crate::domain::{
     normalize_title_key, IngredientKey, Macros, MealPlan, PantryItem, PlannedMeal, Recipe, RecipeId,
 };
-use crate::shopping::{consume_from_stock, pantry_quantity_for};
 use std::collections::{HashMap, HashSet};
 
 /// Quantity comparison tolerance.
@@ -180,24 +179,29 @@ fn recipe_keys(recipe: &Recipe) -> HashSet<IngredientKey> {
     recipe_keys_from_reqs(&recipe_requirements(recipe))
 }
 
-/// Apply one recipe's requirements to a mutable coverage state. Returns how many
-/// keys were newly marked to-buy. Consumes stock for positive needs (including
-/// when the key was already to-buy).
+/// True when the pantry holds this ingredient by name — regardless of unit or
+/// quantity. Pantry coverage is **presence-based and unit-agnostic**: having any
+/// amount of an ingredient, in any unit, covers a recipe's use of it.
+pub(super) fn pantry_covers(pantry: &[PantryItem], name: &str) -> bool {
+    pantry
+        .iter()
+        .any(|p| p.quantity_canonical > EPS && p.key.name == name)
+}
+
+/// Mark this recipe's ingredient keys that the pantry does not hold as to-buy.
+/// Returns how many keys were newly added. Coverage is presence-based (see
+/// [`pantry_covers`]); quantities are not consumed.
 fn apply_recipe_to_coverage(
-    stock: &mut [PantryItem],
+    pantry: &[PantryItem],
     to_buy: &mut HashSet<IngredientKey>,
     reqs: &[(IngredientKey, f64)],
 ) -> usize {
     let mut new_count = 0;
-    for (key, need) in reqs {
-        if *need > EPS {
-            let shortfall = consume_from_stock(stock, key, *need);
-            if shortfall > EPS && to_buy.insert(key.clone()) {
-                new_count += 1;
-            }
-        } else if pantry_quantity_for(key, stock) > EPS {
-            // Presence-only line covered by any positive bridged stock.
-        } else if to_buy.insert(key.clone()) {
+    for (key, _need) in reqs {
+        if pantry_covers(pantry, &key.name) {
+            continue;
+        }
+        if to_buy.insert(key.clone()) {
             new_count += 1;
         }
     }
@@ -312,33 +316,27 @@ fn union_size(keys: &[HashSet<IngredientKey>], indices: &[usize]) -> usize {
 /// Keys in the selected recipes that still need sourcing after quantity-aware
 /// pantry consumption (binary shortfall / missing presence).
 fn net_shortfall_count(reqs: &[RecipeReq], indices: &[usize], pantry: &[PantryItem]) -> usize {
-    let mut stock = pantry.to_vec();
     let mut to_buy = HashSet::new();
     for &i in indices {
-        apply_recipe_to_coverage(&mut stock, &mut to_buy, &reqs[i]);
+        apply_recipe_to_coverage(pantry, &mut to_buy, &reqs[i]);
     }
     to_buy.len()
 }
 
-/// How many on-hand pantry items the selected recipes actually draw down (fully
-/// or partially) — pantry stock the plan puts to *use*, not merely considered.
+/// How many on-hand pantry items the selected recipes use — a pantry item is
+/// used when any selected recipe references its ingredient name (unit-agnostic,
+/// presence-based; quantity is not considered).
 fn pantry_used_count(reqs: &[RecipeReq], indices: &[usize], pantry: &[PantryItem]) -> usize {
     if pantry.is_empty() {
         return 0;
     }
-    let mut stock = pantry.to_vec();
-    let mut to_buy = HashSet::new();
-    for &i in indices {
-        apply_recipe_to_coverage(&mut stock, &mut to_buy, &reqs[i]);
-    }
+    let used: HashSet<&str> = indices
+        .iter()
+        .flat_map(|&i| reqs[i].iter().map(|(k, _)| k.name.as_str()))
+        .collect();
     pantry
         .iter()
-        .filter(|orig| {
-            stock
-                .iter()
-                .find(|s| s.key == orig.key)
-                .is_some_and(|s| orig.quantity_canonical - s.quantity_canonical > EPS)
-        })
+        .filter(|p| used.contains(p.key.name.as_str()))
         .count()
 }
 
@@ -361,16 +359,15 @@ fn candidate_sort_key<'a>(
     pool: &[&'a Recipe],
     reqs: &[RecipeReq],
     keys: &[HashSet<IngredientKey>],
-    stock: &[PantryItem],
+    pantry: &[PantryItem],
     to_buy: &HashSet<IngredientKey>,
     macros: &[Macros],
     bounds: &NutritionBounds,
     day_macros: &Macros,
     i: usize,
 ) -> (usize, usize, u64, &'a str, &'a str) {
-    let mut stock_c = stock.to_vec();
     let mut to_buy_c = to_buy.clone();
-    let new_keys = apply_recipe_to_coverage(&mut stock_c, &mut to_buy_c, &reqs[i]);
+    let new_keys = apply_recipe_to_coverage(pantry, &mut to_buy_c, &reqs[i]);
     let deficit = if bounds.is_empty() {
         0
     } else {
@@ -435,9 +432,8 @@ fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<
     let mpd = (*meals_per_day).max(1);
     let mut selected = Vec::with_capacity(target);
     selected.push(seed);
-    let mut stock = pantry.to_vec();
     let mut to_buy = HashSet::new();
-    apply_recipe_to_coverage(&mut stock, &mut to_buy, &reqs[seed]);
+    apply_recipe_to_coverage(pantry, &mut to_buy, &reqs[seed]);
     let mut used_ids: HashSet<&str> = HashSet::new();
     used_ids.insert(pool[seed].id.as_str());
     let mut day_macros = macros[seed];
@@ -464,7 +460,7 @@ fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<
                 pool,
                 reqs,
                 keys,
-                &stock,
+                pantry,
                 &to_buy,
                 macros,
                 bounds,
@@ -486,7 +482,7 @@ fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<
             break;
         };
         selected.push(choice);
-        apply_recipe_to_coverage(&mut stock, &mut to_buy, &reqs[choice]);
+        apply_recipe_to_coverage(pantry, &mut to_buy, &reqs[choice]);
         used_ids.insert(pool[choice].id.as_str());
         day_macros.add(&macros[choice]);
     }
@@ -852,7 +848,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         let used = pantry_used_count(&reqs, selected, pantry);
         bullets.push(format!(
             "Pantry: {used} of {} on-hand item(s) used; \
-             {net_unique} key(s) not fully covered by pantry stock",
+             {net_unique} key(s) not covered by pantry stock",
             pantry.len()
         ));
     }
@@ -1372,8 +1368,7 @@ mod tests {
         let plan = plan_meals(&pool, &opts);
         // Full union is 4 (flour, milk, eggs, bread); net after pantry is 2.
         assert!(
-            plan.rationale.contains("2")
-                && plan.rationale.to_lowercase().contains("not fully covered"),
+            plan.rationale.contains("2") && plan.rationale.to_lowercase().contains("not covered"),
             "rationale should report net uniques with pantry: {}",
             plan.rationale
         );
@@ -1956,67 +1951,72 @@ mod tests {
         let plan = plan_meals(&pool, &opts);
         assert_eq!(plan.meals[0].recipe_title, "Flour Cake");
         assert!(
-            plan.rationale.contains("0")
-                && plan.rationale.to_lowercase().contains("not fully covered"),
+            plan.rationale.contains("0") && plan.rationale.to_lowercase().contains("not covered"),
             "{}",
             plan.rationale
         );
     }
 
     #[test]
-    fn insufficient_pantry_quantity_is_not_free() {
-        let needs_more_flour = rec("Big Bread", &["20 g flour"]);
-        let needs_rice = rec("Rice Bowl", &["10 g rice"]);
-        let pool = vec![needs_more_flour, needs_rice];
+    fn presence_covers_regardless_of_quantity() {
+        // Presence-based: a recipe needing 20 g flour is covered by just 1 g on
+        // hand — quantity is not consumed.
+        let big_bread = rec("Big Bread", &["20 g flour"]);
+        let rice_bowl = rec("Rice Bowl", &["10 g rice"]);
+        let pool = vec![big_bread, rice_bowl];
         let opts = PlanOptions {
             days: 1,
             meals_per_day: 1,
-            pantry: vec![item("flour", UnitKind::Mass, 10.0)],
+            pantry: vec![item("flour", UnitKind::Mass, 1.0)],
             ..Default::default()
         };
         let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals[0].recipe_title, "Big Bread");
         assert!(
-            plan.rationale.contains("1")
-                && plan.rationale.to_lowercase().contains("not fully covered"),
-            "partial stock must still count as to-buy: {}",
+            plan.rationale.contains("0 key(s) not covered"),
+            "any flour on hand covers the flour line: {}",
             plan.rationale
-        );
-        let opts_enough = PlanOptions {
-            days: 1,
-            meals_per_day: 1,
-            pantry: vec![item("flour", UnitKind::Mass, 20.0)],
-            ..Default::default()
-        };
-        let plan_enough = plan_meals(&pool, &opts_enough);
-        assert_eq!(plan_enough.meals[0].recipe_title, "Big Bread");
-        assert!(
-            plan_enough.rationale.contains("0")
-                && plan_enough
-                    .rationale
-                    .to_lowercase()
-                    .contains("not fully covered"),
-            "{}",
-            plan_enough.rationale
         );
     }
 
     #[test]
-    fn cross_recipe_depletion_marks_shared_ingredient() {
+    fn pantry_coverage_is_unit_agnostic() {
+        // Recipe uses onions by count; pantry holds onions by mass → covered.
+        let soup = rec("Onion Soup", &["2 onions"]);
+        let plain = rec("Plain Rice", &["1 cup rice"]);
+        let pool = vec![soup, plain];
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 1,
+            pantry: vec![item("onions", UnitKind::Mass, 500.0)],
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals[0].recipe_title, "Onion Soup");
+        assert!(
+            plan.rationale.contains("0 key(s) not covered"),
+            "mass onions must cover a count onion line: {}",
+            plan.rationale
+        );
+    }
+
+    #[test]
+    fn one_stocked_ingredient_covers_all_recipes_that_use_it() {
+        // No cross-recipe depletion: a single stocked flour entry covers both.
         let a = rec("A Loaf", &["15 g flour"]);
         let b = rec("B Loaf", &["15 g flour"]);
         let pool = vec![a, b];
         let opts = PlanOptions {
             days: 2,
             meals_per_day: 1,
-            pantry: vec![item("flour", UnitKind::Mass, 20.0)],
+            pantry: vec![item("flour", UnitKind::Mass, 1.0)],
             ..Default::default()
         };
         let plan = plan_meals(&pool, &opts);
         assert_eq!(plan.meals.len(), 2);
         assert!(
-            plan.rationale.contains("1")
-                && plan.rationale.to_lowercase().contains("not fully covered"),
-            "{}",
+            plan.rationale.contains("0 key(s) not covered"),
+            "shared flour is covered for both recipes: {}",
             plan.rationale
         );
     }
@@ -2062,8 +2062,7 @@ mod tests {
         let plan = plan_meals(&pool, &opts);
         assert_eq!(plan.meals[0].recipe_title, "Cupcake");
         assert!(
-            plan.rationale.contains("0")
-                && plan.rationale.to_lowercase().contains("not fully covered"),
+            plan.rationale.contains("0") && plan.rationale.to_lowercase().contains("not covered"),
             "{}",
             plan.rationale
         );
