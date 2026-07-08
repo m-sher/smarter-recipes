@@ -55,10 +55,13 @@
 //!    recipe).
 //!
 //! 3. **Greedy growth from a seed** — start with one recipe as the first meal.
-//!    Running state is a cloned pantry ledger plus the set of keys already
-//!    marked to-buy. While fewer than `S` recipes are selected, append the
-//!    unused candidate that minimizes the number of **new** to-buy keys
-//!    (ingredient keys the pantry does not already hold). Ties break by:
+//!    Running state is the set of keys already marked to-buy (pantry coverage is
+//!    a constant presence set of ingredient names, precomputed once). While
+//!    fewer than `S` recipes are selected, append the unused candidate that
+//!    minimizes the number of **new** to-buy keys (ingredient keys the pantry
+//!    does not already hold). Ties break by:
+//!    - more on-hand pantry ingredient keys used by the candidate (balanced
+//!      pantry priority),
 //!    - smaller `|keys(candidate)|`,
 //!    - then lexicographically smaller title,
 //!    - then lexicographically smaller `recipe_id`.
@@ -67,18 +70,22 @@
 //!    when a feasible alternative exists; deficit to per-day mins is a further
 //!    tie-break.
 //!
-//! 4. **Multi-start** — run the greedy growth once for **every** pool member as
-//!    seed. Keep the schedule with the smallest final **net** to-buy size (or,
-//!    with bounds, feasible first, then least violation magnitude, then net
-//!    to-buy). Ties break by lex `(title, recipe_id)` sequence. Equal schedules
-//!    keep the incumbent. When `S == pool.len()` and bounds are empty,
-//!    multi-start is skipped and a single greedy order is built from the
-//!    lex-smallest seed.
+//! 4. **Multi-start** — run greedy growth from up to `MULTI_START_MAX_SEEDS`
+//!    seeds (every pool member when the pool is small; evenly spaced sample on
+//!    larger catalogs). Keep the schedule with the smallest final **net**
+//!    to-buy size, then most pantry items used, then lex `(title, recipe_id)`.
+//!    With bounds: feasible first, then least violation magnitude, then TOD
+//!    misses, then net to-buy, then pantry used. Equal schedules keep the
+//!    incumbent. When `S == pool.len()` and bounds are empty, multi-start is
+//!    skipped and a single greedy order is built from the lex-smallest seed.
 //!
 //! Construction order is the plan order: ingredients tend to appear when first
 //! needed.
 //!
-//! Complexity: O(P² · S · K) where P = pool size, S = slots, K = avg keys/recipe.
+//! Complexity: O(M · P · S · K) where M = number of multi-start seeds
+//! (≤ `MULTI_START_MAX_SEEDS`), P = pool size, S = slots, K = avg keys/recipe.
+//! Pantry name membership is O(1) via a precomputed set; per-recipe pantry hit
+//! counts are precomputed once per plan.
 
 mod ilp;
 mod nutrition_bounds;
@@ -183,26 +190,46 @@ fn recipe_keys(recipe: &Recipe) -> HashSet<IngredientKey> {
     recipe_keys_from_reqs(&recipe_requirements(recipe))
 }
 
-/// True when the pantry holds this ingredient by name — regardless of unit or
-/// quantity. Pantry coverage is **presence-based and unit-agnostic**: having any
-/// amount of an ingredient, in any unit, covers a recipe's use of it.
-pub(super) fn pantry_covers(pantry: &[PantryItem], name: &str) -> bool {
+/// Positive-quantity pantry ingredient names (presence-based, unit-agnostic).
+/// Built once per plan; membership checks are O(1).
+fn pantry_names_set(pantry: &[PantryItem]) -> HashSet<&str> {
     pantry
         .iter()
-        .any(|p| p.quantity_canonical > EPS && p.key.name == name)
+        .filter(|p| p.quantity_canonical > EPS)
+        .map(|p| p.key.name.as_str())
+        .collect()
+}
+
+/// How many of this recipe's ingredient keys are covered by on-hand pantry
+/// names (unit-agnostic; each name+kind key counts separately).
+fn recipe_pantry_hits(keys: &HashSet<IngredientKey>, pantry_names: &HashSet<&str>) -> usize {
+    keys.iter()
+        .filter(|k| pantry_names.contains(k.name.as_str()))
+        .count()
+}
+
+/// Count keys this recipe would newly mark to-buy, without mutating state.
+fn count_new_to_buy(
+    pantry_names: &HashSet<&str>,
+    to_buy: &HashSet<IngredientKey>,
+    reqs: &[(IngredientKey, f64)],
+) -> usize {
+    reqs.iter()
+        .filter(|(key, _)| !pantry_names.contains(key.name.as_str()) && !to_buy.contains(key))
+        .count()
 }
 
 /// Mark this recipe's ingredient keys that the pantry does not hold as to-buy.
-/// Returns how many keys were newly added. Coverage is presence-based (see
-/// [`pantry_covers`]); quantities are not consumed.
+/// Returns how many keys were newly added. Coverage is presence-based; quantities
+/// are not consumed.
 fn apply_recipe_to_coverage(
-    pantry: &[PantryItem],
+    pantry_names: &HashSet<&str>,
     to_buy: &mut HashSet<IngredientKey>,
     reqs: &[(IngredientKey, f64)],
 ) -> usize {
     let mut new_count = 0;
     for (key, _need) in reqs {
-        if pantry_covers(pantry, &key.name) {
+        if pantry_names.contains(key.name.as_str()) {
             continue;
         }
         if to_buy.insert(key.clone()) {
@@ -317,12 +344,16 @@ fn union_size(keys: &[HashSet<IngredientKey>], indices: &[usize]) -> usize {
     u.len()
 }
 
-/// Keys in the selected recipes that still need sourcing after quantity-aware
-/// pantry consumption (binary shortfall / missing presence).
-fn net_shortfall_count(reqs: &[RecipeReq], indices: &[usize], pantry: &[PantryItem]) -> usize {
+/// Keys in the selected recipes that still need sourcing after presence-based
+/// pantry coverage.
+fn net_shortfall_count(
+    reqs: &[RecipeReq],
+    indices: &[usize],
+    pantry_names: &HashSet<&str>,
+) -> usize {
     let mut to_buy = HashSet::new();
     for &i in indices {
-        apply_recipe_to_coverage(pantry, &mut to_buy, &reqs[i]);
+        apply_recipe_to_coverage(pantry_names, &mut to_buy, &reqs[i]);
     }
     to_buy.len()
 }
@@ -358,38 +389,29 @@ fn deficit_key(bounds: &MacroBounds, day_macros: &Macros, add: &Macros) -> u64 {
     (min_deficit(bounds, &trial) * 1000.0).round() as u64
 }
 
-#[allow(clippy::too_many_arguments)]
 fn candidate_sort_key<'a>(
-    pool: &[&'a Recipe],
-    reqs: &[RecipeReq],
-    keys: &[HashSet<IngredientKey>],
-    pantry: &[PantryItem],
+    input: &'a GreedyInput<'a>,
     to_buy: &HashSet<IngredientKey>,
-    macros: &[Macros],
-    bounds: &NutritionBounds,
     day_macros: &Macros,
     i: usize,
 ) -> (usize, Reverse<usize>, usize, u64, &'a str, &'a str) {
-    let mut to_buy_c = to_buy.clone();
-    let new_keys = apply_recipe_to_coverage(pantry, &mut to_buy_c, &reqs[i]);
+    // Count only — do not clone `to_buy` in this hot path.
+    let new_keys = count_new_to_buy(&input.pantry_names, to_buy, &input.reqs[i]);
     // Balanced pantry priority: after fewest new-to-buy keys, prefer the recipe
     // that uses more on-hand pantry ingredients (Reverse → more sorts first).
-    let pantry_hits = keys[i]
-        .iter()
-        .filter(|k| pantry_covers(pantry, &k.name))
-        .count();
-    let deficit = if bounds.is_empty() {
+    // `pantry_hits` is precomputed once per plan.
+    let deficit = if input.bounds.is_empty() {
         0
     } else {
-        deficit_key(&bounds.per_day, day_macros, &macros[i])
+        deficit_key(&input.bounds.per_day, day_macros, &input.macros[i])
     };
     (
         new_keys,
-        Reverse(pantry_hits),
-        keys[i].len(),
+        Reverse(input.pantry_hits[i]),
+        input.keys[i].len(),
         deficit,
-        pool[i].title.as_str(),
-        pool[i].id.as_str(),
+        input.pool[i].title.as_str(),
+        input.pool[i].id.as_str(),
     )
 }
 
@@ -409,6 +431,10 @@ struct GreedyInput<'a> {
     keys: &'a [HashSet<IngredientKey>],
     macros: &'a [Macros],
     pantry: &'a [PantryItem],
+    /// Positive-qty pantry names for O(1) presence checks.
+    pantry_names: HashSet<&'a str>,
+    /// Per-pool-index count of ingredient keys covered by `pantry_names`.
+    pantry_hits: Vec<usize>,
     bounds: &'a NutritionBounds,
     meals_per_day: u32,
     time_of_day: bool,
@@ -427,27 +453,17 @@ fn slot_allows(input: &GreedyInput<'_>, ri: usize, meal: u32, day_macros: &Macro
 }
 
 /// Greedy growth from `seed`: always add the unused recipe that introduces the
-/// fewest new to-buy keys (relative to remaining pantry stock + already
-/// selected). Returns selected pool indices in plan order.
+/// fewest new to-buy keys (relative to pantry presence + already selected).
+/// Returns selected pool indices in plan order.
 fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<usize> {
-    let GreedyInput {
-        pool,
-        reqs,
-        keys,
-        macros,
-        pantry,
-        bounds,
-        meals_per_day,
-        ..
-    } = input;
-    let mpd = (*meals_per_day).max(1);
+    let mpd = input.meals_per_day.max(1);
     let mut selected = Vec::with_capacity(target);
     selected.push(seed);
     let mut to_buy = HashSet::new();
-    apply_recipe_to_coverage(pantry, &mut to_buy, &reqs[seed]);
+    apply_recipe_to_coverage(&input.pantry_names, &mut to_buy, &input.reqs[seed]);
     let mut used_ids: HashSet<&str> = HashSet::new();
-    used_ids.insert(pool[seed].id.as_str());
-    let mut day_macros = macros[seed];
+    used_ids.insert(input.pool[seed].id.as_str());
+    let mut day_macros = input.macros[seed];
     let mut cur_day = 0u32;
 
     while selected.len() < target {
@@ -463,21 +479,11 @@ fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<
         let mut best_key = None;
         let mut best_relaxed: Option<usize> = None;
         let mut best_relaxed_key = None;
-        for i in 0..pool.len() {
-            if used_ids.contains(pool[i].id.as_str()) {
+        for i in 0..input.pool.len() {
+            if used_ids.contains(input.pool[i].id.as_str()) {
                 continue;
             }
-            let key = candidate_sort_key(
-                pool,
-                reqs,
-                keys,
-                pantry,
-                &to_buy,
-                macros,
-                bounds,
-                &day_macros,
-                i,
-            );
+            let key = candidate_sort_key(input, &to_buy, &day_macros, i);
             let allowed = slot_allows(input, i, meal, &day_macros);
             if allowed {
                 if best_key.as_ref().is_none_or(|bk| key < *bk) {
@@ -493,9 +499,9 @@ fn greedy_from_seed(input: &GreedyInput<'_>, seed: usize, target: usize) -> Vec<
             break;
         };
         selected.push(choice);
-        apply_recipe_to_coverage(pantry, &mut to_buy, &reqs[choice]);
-        used_ids.insert(pool[choice].id.as_str());
-        day_macros.add(&macros[choice]);
+        apply_recipe_to_coverage(&input.pantry_names, &mut to_buy, &input.reqs[choice]);
+        used_ids.insert(input.pool[choice].id.as_str());
+        day_macros.add(&input.macros[choice]);
     }
     selected
 }
@@ -548,7 +554,7 @@ struct ScoredSchedule {
 }
 
 fn score_schedule(input: &GreedyInput<'_>, indices: Vec<usize>) -> ScoredSchedule {
-    let net_union = net_shortfall_count(input.reqs, &indices, input.pantry);
+    let net_union = net_shortfall_count(input.reqs, &indices, &input.pantry_names);
     let pantry_used = pantry_used_count(input.reqs, &indices, input.pantry);
     let violations = if input.bounds.is_empty() {
         Vec::new()
@@ -620,25 +626,28 @@ fn better_scored(pool: &[&Recipe], a: &ScoredSchedule, b: &ScoredSchedule) -> bo
 
 /// Cap multi-start seeds on large pools. Full multi-start is O(P²·S) and can
 /// take minutes on multi-thousand recipe catalogs for little gain over a
-/// well-spaced seed sample once the exact path already produced a plan.
-const GREEDY_CONSTRAINED_MAX_SEEDS: usize = 64;
+/// well-spaced seed sample.
+const MULTI_START_MAX_SEEDS: usize = 64;
+
+/// Seed indices for multi-start greedy: every index when `n` is small, otherwise
+/// an evenly spaced sample of size `max_seeds` over `[0, n)`.
+fn multi_start_seed_indices(n: usize, max_seeds: usize) -> Vec<usize> {
+    if n == 0 || max_seeds == 0 {
+        return Vec::new();
+    }
+    if n <= max_seeds {
+        (0..n).collect()
+    } else {
+        (0..max_seeds).map(|i| i * n / max_seeds).collect()
+    }
+}
 
 /// Greedy fallback for the constrained path: multi-start greedy ranked by
 /// [`better_scored`]. Used when the exact solver declines (too large, error, or
 /// time budget) or still has residual violations.
 fn greedy_constrained_scored(input: &GreedyInput<'_>, target: usize) -> ScoredSchedule {
-    let n = input.pool.len();
-    let seeds: Vec<usize> = if n <= GREEDY_CONSTRAINED_MAX_SEEDS {
-        (0..n).collect()
-    } else {
-        // Evenly spaced seeds over the pool (canonical order not required —
-        // pool order is already normalized upstream).
-        (0..GREEDY_CONSTRAINED_MAX_SEEDS)
-            .map(|i| i * n / GREEDY_CONSTRAINED_MAX_SEEDS)
-            .collect()
-    };
     let mut best: Option<ScoredSchedule> = None;
-    for seed in seeds {
+    for seed in multi_start_seed_indices(input.pool.len(), MULTI_START_MAX_SEEDS) {
         let indices = greedy_from_seed(input, seed, target);
         let candidate = score_schedule(input, indices);
         let take = match &best {
@@ -694,9 +703,9 @@ pub fn plan_bound_violations(
 /// Build a meal plan from a candidate pool (no recipe repeats by id or
 /// normalized title).
 ///
-/// When `opts.pantry` is non-empty, on-hand quantities are consumed virtually
-/// while scoring: keys with any shortfall (or missing presence for unquantified
-/// lines) count toward the net to-buy cost.
+/// When `opts.pantry` is non-empty, presence-based name coverage applies: any
+/// positive stock of an ingredient name covers that name in recipes (any unit).
+/// Keys not covered count toward the net to-buy cost.
 ///
 /// When `opts.nutrition` is non-empty, selection prefers schedules that satisfy
 /// macro min/max bounds (estimated whole-recipe macros in `opts.recipe_macros`).
@@ -764,12 +773,19 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
 
     let target = slots.min(pool.len());
     let mpd = opts.meals_per_day.max(1);
+    let pantry_names = pantry_names_set(pantry);
+    let pantry_hits: Vec<usize> = keys
+        .iter()
+        .map(|k| recipe_pantry_hits(k, &pantry_names))
+        .collect();
     let input = GreedyInput {
         pool: &pool,
         reqs: &reqs,
         keys: &keys,
         macros: &macros,
         pantry,
+        pantry_names,
+        pantry_hits,
         bounds,
         meals_per_day: mpd,
         time_of_day: opts.time_of_day,
@@ -783,9 +799,9 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         score_schedule(&input, indices)
     } else if !constrained {
         let mut best: Option<(Vec<usize>, usize, usize)> = None;
-        for seed in 0..pool.len() {
+        for seed in multi_start_seed_indices(pool.len(), MULTI_START_MAX_SEEDS) {
             let candidate = greedy_from_seed(&input, seed, target);
-            let ua = net_shortfall_count(&reqs, &candidate, pantry);
+            let ua = net_shortfall_count(&reqs, &candidate, &input.pantry_names);
             let pua = pantry_used_count(&reqs, &candidate, pantry);
             let take = match &best {
                 None => true,
@@ -864,21 +880,23 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
                 meal,
                 recipe_id: pool[ri].id.clone(),
                 recipe_title: pool[ri].title.clone(),
+                // Presence-based: any key name that appears in the pantry.
+                uses_pantry: input.pantry_hits[ri] > 0,
             }
         })
         .collect();
 
-    // Summary rendered as a bulleted list (lead line + `• ` items). Substrings
-    // like "N distinct ingredient key(s)", "pantry", "Excluded — …", "Nutrition
-    // constraints satisfied", "slot mismatch", and "partial" are load-bearing for
-    // both the CLI display and the rationale assertions in tests.
-    let mut bullets: Vec<String> = Vec::new();
-    bullets.push(format!("Pool: {} unique recipe(s)", pool.len()));
-    bullets.push(format!("{total_unique} distinct ingredient key(s)"));
+    // Summary as an indented block (same indent as the meal list under each day).
+    // Substrings like "N distinct ingredient key(s)", "pantry", "Excluded — …",
+    // "Nutrition constraints satisfied", "slot mismatch", and "partial" are
+    // load-bearing for the CLI display and rationale assertions in tests.
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("Pool: {} unique recipe(s)", pool.len()));
+    lines.push(format!("{total_unique} distinct ingredient key(s)"));
 
     if !pantry.is_empty() {
         let used = pantry_used_count(&reqs, selected, pantry);
-        bullets.push(format!(
+        lines.push(format!(
             "Pantry: {used} of {} on-hand item(s) used; \
              {net_unique} key(s) not covered by pantry stock",
             pantry.len()
@@ -895,14 +913,14 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     .map(|(label, n)| format!("{label}: {n}"))
     .collect();
     if !excluded_parts.is_empty() {
-        bullets.push(format!("Excluded — {}", excluded_parts.join(", ")));
+        lines.push(format!("Excluded — {}", excluded_parts.join(", ")));
     }
 
     if !bounds.is_empty() {
         if scored.violations.is_empty() {
-            bullets.push("Nutrition constraints satisfied".to_string());
+            lines.push("Nutrition constraints satisfied".to_string());
         } else {
-            bullets.push(format!(
+            lines.push(format!(
                 "Nutrition constraints not fully met (best effort, {} violation(s))",
                 scored.violations.len()
             ));
@@ -911,9 +929,9 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
 
     if opts.time_of_day {
         if scored.tod_misses == 0 {
-            bullets.push("Time-of-day slots matched".to_string());
+            lines.push("Time-of-day slots matched".to_string());
         } else {
-            bullets.push(format!(
+            lines.push(format!(
                 "Time-of-day: {} slot mismatch(es) (best effort)",
                 scored.tod_misses
             ));
@@ -921,7 +939,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
     }
 
     if meals.len() < slots {
-        bullets.push(format!(
+        lines.push(format!(
             "Pool has only {} unique non-empty recipe(s); requested {} slot(s), \
              so the plan is partial (repeats are never used)",
             pool.len(),
@@ -937,10 +955,10 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         "Best-effort planner"
     };
     let rationale = format!(
-        "{lead}: {} meal(s) over {} day(s), no recipe repeats.\n• {}",
+        "{lead}: {} meal(s) over {} day(s), no recipe repeats.\n  {}",
         meals.len(),
         opts.days,
-        bullets.join("\n• ")
+        lines.join("\n  ")
     );
 
     MealPlan {
@@ -1431,6 +1449,57 @@ mod tests {
             "rationale should report pantry items used: {}",
             plan.rationale
         );
+        assert!(
+            plan.meals.iter().all(|m| m.uses_pantry),
+            "both meals use milk/eggs from pantry"
+        );
+    }
+
+    #[test]
+    fn rationale_is_indented_not_bulleted() {
+        let pool = vec![rec("A", &["1 egg"]), rec("B", &["1 milk"])];
+        let plan = plan_meals(
+            &pool,
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !plan.rationale.contains('•'),
+            "rationale should not use bullet markers: {}",
+            plan.rationale
+        );
+        assert!(
+            plan.rationale.contains("\n  Pool:"),
+            "detail lines should be two-space indented: {}",
+            plan.rationale
+        );
+    }
+
+    #[test]
+    fn uses_pantry_flag_only_on_recipes_that_hit_stock() {
+        let stocked_only = rec("Stocked Bowl", &["1 cup rice"]);
+        let mixed = rec("Mixed Bowl", &["1 cup rice", "1 onion"]);
+        let fresh = rec("Fresh Salad", &["1 lettuce", "1 tomato"]);
+        let pool = vec![stocked_only, mixed, fresh];
+        let opts = PlanOptions {
+            days: 3,
+            meals_per_day: 1,
+            pantry: vec![item("rice", UnitKind::Volume, 500.0)],
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 3);
+        let by_title: HashMap<_, _> = plan
+            .meals
+            .iter()
+            .map(|m| (m.recipe_title.as_str(), m.uses_pantry))
+            .collect();
+        assert_eq!(by_title.get("Stocked Bowl"), Some(&true));
+        assert_eq!(by_title.get("Mixed Bowl"), Some(&true));
+        assert_eq!(by_title.get("Fresh Salad"), Some(&false));
     }
 
     #[test]
@@ -2057,6 +2126,124 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(plan_meals(&pool, &empty).meals[0].recipe_title, "Plain");
+    }
+
+    #[test]
+    fn multi_start_seed_indices_full_when_small() {
+        assert_eq!(multi_start_seed_indices(0, 64), Vec::<usize>::new());
+        assert_eq!(multi_start_seed_indices(3, 64), vec![0, 1, 2]);
+        assert_eq!(
+            multi_start_seed_indices(64, 64),
+            (0..64).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multi_start_seed_indices_samples_evenly_when_large() {
+        let seeds = multi_start_seed_indices(200, 64);
+        assert_eq!(seeds.len(), 64);
+        assert_eq!(seeds[0], 0);
+        // Last sample index is floor((63 * 200) / 64) = 196.
+        assert_eq!(*seeds.last().unwrap(), 196);
+        // Strictly non-decreasing and in range.
+        for w in seeds.windows(2) {
+            assert!(w[0] <= w[1]);
+            assert!(w[1] < 200);
+        }
+    }
+
+    #[test]
+    fn count_new_to_buy_matches_apply_recipe_to_coverage() {
+        let pantry = vec![
+            item("flour", UnitKind::Mass, 100.0),
+            item("salt", UnitKind::Mass, 0.0), // zero qty → not covered
+        ];
+        let names = pantry_names_set(&pantry);
+        let cake = rec(
+            "Cake",
+            &["1 cup flour", "1 cup sugar", "1 tsp salt", "2 eggs"],
+        );
+        let reqs = recipe_requirements(&cake);
+        let mut to_buy = HashSet::new();
+        // Pre-mark sugar using the recipe's own key identity.
+        let sugar = reqs
+            .iter()
+            .find(|(k, _)| k.name == "sugar")
+            .expect("sugar key")
+            .0
+            .clone();
+        to_buy.insert(sugar);
+
+        let counted = count_new_to_buy(&names, &to_buy, &reqs);
+        let applied = apply_recipe_to_coverage(&names, &mut to_buy, &reqs);
+        assert_eq!(counted, applied);
+        // flour covered by name; sugar already present; salt (zero stock) + eggs are new.
+        assert_eq!(counted, 2);
+    }
+
+    #[test]
+    fn large_pool_unconstrained_with_pantry_still_prefers_pantry_use() {
+        // Pool larger than MULTI_START_MAX_SEEDS so the seed-sample path runs.
+        // Put the balanced-priority pair at the front so they are always seeds.
+        let plain = rec_with_id("plain", "Plain Loaf", &["1 cup flour", "1 tsp salt"]);
+        let beany = rec_with_id(
+            "beany",
+            "Beany Loaf",
+            &["1 cup flour", "1 tsp salt", "1 can black beans"],
+        );
+        let mut pool = vec![plain, beany];
+        pool.extend((0..80).map(|i| {
+            rec_with_id(
+                &format!("filler-{i}"),
+                &format!("Filler {i:03}"),
+                &[
+                    "1 cup quinoa",
+                    "1 tsp paprika",
+                    &format!("1 pinch spice{i}"),
+                ],
+            )
+        }));
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 1,
+            pantry: vec![item("black beans", UnitKind::Mass, 500.0)],
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 1);
+        // Min buys among 1-meal plans: fillers need 3 keys; Plain/Beany need 2.
+        // Beany wins on balanced pantry priority at equal buy cost.
+        assert_eq!(
+            plan.meals[0].recipe_title, "Beany Loaf",
+            "seed-capped multi-start must still prefer pantry use at equal buys"
+        );
+        assert!(
+            plan.rationale.to_lowercase().contains("pantry"),
+            "{}",
+            plan.rationale
+        );
+    }
+
+    #[test]
+    fn large_pool_unconstrained_fills_all_slots() {
+        let pool: Vec<Recipe> = (0..120)
+            .map(|i| {
+                rec_with_id(
+                    &format!("r{i}"),
+                    &format!("Recipe {i:03}"),
+                    &["1 cup flour", "1 egg", &format!("1 pinch herb{i}")],
+                )
+            })
+            .collect();
+        let opts = PlanOptions {
+            days: 3,
+            meals_per_day: 2,
+            pantry: vec![item("flour", UnitKind::Mass, 500.0)],
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert_eq!(plan.meals.len(), 6);
+        assert_eq!(unique_recipe_ids(&plan), 6);
     }
 
     #[test]

@@ -437,6 +437,7 @@ mod tests {
                 meal: 0,
                 recipe_id: a.id.clone(),
                 recipe_title: a.title.clone(),
+                uses_pantry: false,
             }],
             rationale: "test".into(),
         };
@@ -464,6 +465,7 @@ mod tests {
                 meal: 0,
                 recipe_id: a.id.clone(),
                 recipe_title: a.title.clone(),
+                uses_pantry: false,
             }],
             rationale: "test".into(),
         };
@@ -557,12 +559,14 @@ mod tests {
                     meal: 0,
                     recipe_id: a.id.clone(),
                     recipe_title: a.title.clone(),
+                    uses_pantry: false,
                 },
                 crate::domain::PlannedMeal {
                     day: 1,
                     meal: 0,
                     recipe_id: b.id.clone(),
                     recipe_title: b.title.clone(),
+                    uses_pantry: false,
                 },
             ],
             rationale: "test".into(),

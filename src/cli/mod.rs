@@ -1596,8 +1596,9 @@ fn print_plan(plan: &MealPlan) {
             current_day = Some(m.day);
             println!("Day {}:", m.day + 1);
         }
+        let star = if m.uses_pantry { " ★" } else { "" };
         println!(
-            "  meal {}: {} ({})",
+            "  meal {}: {}{star} ({})",
             m.meal + 1,
             m.recipe_title,
             short_id(m.recipe_id.as_str())
