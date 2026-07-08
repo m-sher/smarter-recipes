@@ -15,8 +15,8 @@ use crate::storage::Store;
 use anyhow::{bail, Result};
 use std::io::{self, IsTerminal, Write};
 
-/// Default Gemini model (cheap Flash). Override with CLI `--model`.
-pub const DEFAULT_MODEL: &str = "gemini-2.0-flash";
+/// Default Gemini model: cheapest current stable Flash-Lite. Override with `--model`.
+pub const DEFAULT_MODEL: &str = "gemini-2.5-flash-lite";
 /// Default recipes per API request.
 pub const DEFAULT_BATCH_SIZE: usize = 25;
 /// Default dry-run live sample size.

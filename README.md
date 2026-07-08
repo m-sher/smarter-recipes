@@ -157,7 +157,7 @@ smarter-recipes reparse --all
 
 # Category labels for planning filters (blacklist/whitelist in nutrition TOML).
 # URL recipes: refresh first to pull schema.org recipeCategory when present.
-# EPUB / gaps: categorize uses Gemini Flash (cheap) to fill missing categories.
+# EPUB / gaps: categorize uses Gemini Flash-Lite (cheap) to fill missing categories.
 # Dry-run by default; --apply writes. API key: SMARTER_RECIPES_GEMINI_API_KEY
 # or GEMINI_API_KEY (https://aistudio.google.com/apikey).
 smarter-recipes refresh --all --apply
