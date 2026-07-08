@@ -13,6 +13,19 @@ import type { NutritionBounds } from "./bridge";
 
 export type Page = "home" | "library" | "pantry" | "plan" | "recipe" | "import";
 
+/** Which control is mid-flight. Independent so plan ≠ import ≠ pantry. */
+export type BusyKey =
+  | "createPlan"
+  | "import"
+  | "deleteRecipe"
+  | "loadNutrition"
+  | "saveNutrition"
+  | "openPlan"
+  | "shop"
+  | "restock"
+  | "pantryAdd"
+  | "pantryRemove";
+
 export type AppState = {
   page: Page;
   status: DbStatus | null;
@@ -46,8 +59,13 @@ export type AppState = {
   error: string | null;
   notice: string | null;
   loading: boolean;
-  busy: boolean;
+  /** Per-action in-progress flags; only the matching control shows busy UI. */
+  busy: Partial<Record<BusyKey, true>>;
 };
+
+export function isBusy(state: AppState, key: BusyKey): boolean {
+  return state.busy[key] === true;
+}
 
 export type Handlers = {
   onNav: (p: Page) => void;
@@ -117,7 +135,7 @@ export function initialState(): AppState {
     error: null,
     notice: null,
     loading: true,
-    busy: false,
+    busy: {},
   };
 }
 
@@ -287,9 +305,12 @@ function renderRecipe(main: HTMLElement, state: AppState, h: Handlers): void {
   }
 
   const actions = el("div", "toolbar");
+  const deleting = isBusy(state, "deleteRecipe");
+  const delBtn = button(deleting ? "Deleting…" : "Delete", () => h.onDeleteRecipe(), "danger");
+  if (deleting) delBtn.disabled = true;
   actions.append(
     button("← Library", () => h.onNav("library"), "ghost"),
-    button("Delete", () => h.onDeleteRecipe(), "danger"),
+    delBtn,
   );
   main.append(actions);
 }
@@ -306,7 +327,10 @@ function renderPantry(main: HTMLElement, state: AppState, h: Handlers): void {
   input.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") h.onPantryAdd();
   });
-  form.append(input, button("Add", () => h.onPantryAdd(), "primary"));
+  const adding = isBusy(state, "pantryAdd");
+  const addBtn = button(adding ? "Adding…" : "Add", () => h.onPantryAdd(), "primary");
+  if (adding) addBtn.disabled = true;
+  form.append(input, addBtn);
   main.append(form);
   if (state.loading && state.pantry.length === 0) {
     main.append(el("div", "empty", "Loading…"));
@@ -380,10 +404,13 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
     ratDetails.append(ratSum, rat);
     card.append(ratDetails);
     const actions = el("div", "toolbar");
-    actions.append(
-      button("Shopping list", () => h.onShop(), "primary"),
-      button("Restock pantry", () => h.onRestock()),
-    );
+    const shopping = isBusy(state, "shop");
+    const restocking = isBusy(state, "restock");
+    const shopBtn = button(shopping ? "Loading…" : "Shopping list", () => h.onShop(), "primary");
+    if (shopping) shopBtn.disabled = true;
+    const restockBtn = button(restocking ? "Restocking…" : "Restock pantry", () => h.onRestock());
+    if (restocking) restockBtn.disabled = true;
+    actions.append(shopBtn, restockBtn);
     card.append(actions);
     main.append(card);
   }
@@ -428,11 +455,13 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
   pathInput.placeholder = "Path to nutrition_bounds.toml";
   pathInput.value = state.nutritionConfig;
   pathInput.addEventListener("input", () => h.onNutritionConfig(pathInput.value));
-  pathRow.append(
-    pathInput,
-    button("Load", () => h.onLoadNutritionConfig()),
-    button("Save", () => h.onSaveNutritionConfig()),
-  );
+  const loadingN = isBusy(state, "loadNutrition");
+  const savingN = isBusy(state, "saveNutrition");
+  const loadBtn = button(loadingN ? "Loading…" : "Load", () => h.onLoadNutritionConfig());
+  if (loadingN) loadBtn.disabled = true;
+  const saveBtn = button(savingN ? "Saving…" : "Save", () => h.onSaveNutritionConfig());
+  if (savingN) saveBtn.disabled = true;
+  pathRow.append(pathInput, loadBtn, saveBtn);
   form.append(pathRow);
 
   const bf = ensurePlanBoundsForm(state.nutritionBounds);
@@ -467,8 +496,9 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
     }),
   );
 
-  const createBtn = button(state.busy ? "Creating…" : "Create plan", () => h.onCreatePlan(), "primary");
-  if (state.busy) createBtn.disabled = true;
+  const planning = isBusy(state, "createPlan");
+  const createBtn = button(planning ? "Creating…" : "Create plan", () => h.onCreatePlan(), "primary");
+  if (planning) createBtn.disabled = true;
   form.append(createBtn);
   main.append(form);
 
@@ -513,8 +543,9 @@ function renderImport(main: HTMLElement, state: AppState, h: Handlers): void {
   card.append(
     labeledText("Path or URL", state.importInput, (v) => h.onImportInput(v), "/path/to/recipe.json"),
   );
-  const importBtn = button(state.busy ? "Importing…" : "Import", () => h.onImport(), "primary");
-  if (state.busy) importBtn.disabled = true;
+  const importing = isBusy(state, "import");
+  const importBtn = button(importing ? "Importing…" : "Import", () => h.onImport(), "primary");
+  if (importing) importBtn.disabled = true;
   card.append(importBtn);
   main.append(card);
 }

@@ -7,6 +7,7 @@ import {
   render,
   setPlanBoundsForm,
   type AppState,
+  type BusyKey,
   type Handlers,
   type Page,
 } from "./app";
@@ -27,6 +28,21 @@ function paint(): void {
 function set(patch: Partial<AppState>, opts: { paint?: boolean } = {}): void {
   state = { ...state, ...patch };
   if (opts.paint !== false) paint();
+}
+
+function begin(key: BusyKey, extra: Partial<AppState> = {}): void {
+  set({
+    ...extra,
+    busy: { ...state.busy, [key]: true },
+    error: null,
+    notice: null,
+  });
+}
+
+function end(key: BusyKey, extra: Partial<AppState> = {}): void {
+  const busy = { ...state.busy };
+  delete busy[key];
+  set({ ...extra, busy });
 }
 
 function numOrNull(s: string): number | null {
@@ -72,21 +88,19 @@ const handlers: Handlers = {
     void (async () => {
       if (!state.recipeDetail) return;
       if (!confirm(`Delete “${state.recipeDetail.title}”?`)) return;
-      set({ busy: true, error: null, notice: null });
+      begin("deleteRecipe");
       try {
         await api.deleteRecipe(state.recipeDetail.id);
         const recipes = await api.listRecipes(state.libraryFilter || null);
         const status = await api.getStatus();
-        // List/nav update is enough feedback — no success toast.
-        set({
+        end("deleteRecipe", {
           recipes,
           status,
           recipeDetail: null,
           page: "library",
-          busy: false,
         });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("deleteRecipe", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
@@ -102,17 +116,16 @@ const handlers: Handlers = {
         set({ error: "Enter a path to a nutrition bounds file first." });
         return;
       }
-      set({ busy: true, error: null, notice: null });
+      begin("loadNutrition");
       try {
         const nutritionBounds = await api.loadNutritionConfig(path);
         setPlanBoundsForm(nutritionBounds);
-        set({
+        end("loadNutrition", {
           nutritionBounds,
-          busy: false,
           notice: "Nutrition bounds loaded.",
         });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("loadNutrition", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
@@ -123,17 +136,16 @@ const handlers: Handlers = {
         set({ error: "Enter a path to save the nutrition bounds file." });
         return;
       }
-      set({ busy: true, error: null, notice: null });
+      begin("saveNutrition");
       try {
         const bounds = ensurePlanBoundsForm(state.nutritionBounds).read();
         await api.saveNutritionConfig(path, bounds);
-        set({
+        end("saveNutrition", {
           nutritionBounds: bounds,
-          busy: false,
           notice: "Nutrition bounds saved.",
         });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("saveNutrition", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
@@ -158,8 +170,7 @@ const handlers: Handlers = {
       );
       if (poolEl) state = { ...state, pool: poolEl.value };
 
-      // In-progress: button only ("Creating…"). No notice, no banner.
-      set({ busy: true, error: null, notice: null });
+      begin("createPlan");
       try {
         const bounds = ensurePlanBoundsForm(state.nutritionBounds).read();
         const poolTokens = state.pool
@@ -185,46 +196,42 @@ const handlers: Handlers = {
         });
         const plans = state.planSave ? await api.listPlans() : state.plans;
         const status = await api.getStatus();
-        // Plan card appears above options — no success toast needed.
-        set({
+        end("createPlan", {
           activePlan,
           plans,
           status,
           nutritionBounds: bounds,
-          busy: false,
           notice: null,
           shop: [],
         });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("createPlan", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
   onOpenPlan: (id) => {
     void (async () => {
-      set({ busy: true, error: null, notice: null, shop: [] });
+      begin("openPlan", { shop: [] });
       try {
         const activePlan = await api.getPlan(id);
-        set({ activePlan, busy: false });
+        end("openPlan", { activePlan });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("openPlan", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
   onShop: () => {
     void (async () => {
       if (!state.activePlan) return;
-      set({ busy: true, error: null, notice: null });
+      begin("shop");
       try {
         const shop = await api.shopPlan(state.activePlan.id);
-        set({
+        end("shop", {
           shop,
-          busy: false,
-          // Empty list is not obvious — only message when there is nothing to show.
           notice: shop.length ? null : "Nothing to buy — pantry covers this plan.",
         });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("shop", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
@@ -234,15 +241,14 @@ const handlers: Handlers = {
       if (!confirm("Update the pantry for this plan (purchases and cooked amounts)?")) {
         return;
       }
-      set({ busy: true, error: null, notice: null });
+      begin("restock");
       try {
         const result = await api.restockPlan(state.activePlan.id);
         const pantry = await api.listPantry();
         const status = await api.getStatus();
-        // Restock result text carries counts users cannot see otherwise.
-        set({ pantry, status, busy: false, notice: result.message });
+        end("restock", { pantry, status, notice: result.message });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("restock", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
@@ -255,30 +261,25 @@ const handlers: Handlers = {
       if (input) state = { ...state, pantryLine: input.value };
       const line = state.pantryLine.trim();
       if (!line) return;
-      set({ busy: true, error: null, notice: null });
+      begin("pantryAdd");
       try {
         const pantry = await api.pantryAdd(line);
         const status = await api.getStatus();
-        set({
-          pantry,
-          status,
-          pantryLine: "",
-          busy: false,
-        });
+        end("pantryAdd", { pantry, status, pantryLine: "" });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("pantryAdd", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
   onPantryRemove: (name, kind) => {
     void (async () => {
-      set({ busy: true, error: null, notice: null });
+      begin("pantryRemove");
       try {
         const pantry = await api.pantryRemove(name, kind);
         const status = await api.getStatus();
-        set({ pantry, status, busy: false });
+        end("pantryRemove", { pantry, status });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("pantryRemove", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
@@ -312,21 +313,19 @@ const handlers: Handlers = {
         set({ error: "Path or URL required." });
         return;
       }
-      set({ busy: true, error: null, notice: null });
+      begin("import");
       try {
         const result = await api.importSource(state.importSource, input);
         const status = await api.getStatus();
         const recipes = await api.listRecipes(null);
-        // Import summary is not visible elsewhere (count + titles).
-        set({
-          busy: false,
+        end("import", {
           status,
           recipes,
           notice: result.message,
           importInput: "",
         });
       } catch (e) {
-        set({ busy: false, error: e instanceof Error ? e.message : String(e) });
+        end("import", { error: e instanceof Error ? e.message : String(e) });
       }
     })();
   },
