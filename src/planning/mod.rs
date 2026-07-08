@@ -12,9 +12,12 @@
 //! Optional **pantry** stock is applied with **presence-based, unit-agnostic**
 //! coverage: a recipe ingredient counts as covered (not to-buy) whenever the
 //! pantry holds that ingredient by name at all — any unit, any quantity.
-//! Prioritizing recipes that reuse on-hand ingredients falls out of minimizing
-//! the to-buy union. Persisted pantry is never mutated. (Shopping/restock keeps
-//! its own quantity-aware, unit-bridged math for what to actually purchase.)
+//! Pantry use is prioritized with **balanced** weight: the primary objective is
+//! still the fewest distinct ingredients to buy, but among options that need the
+//! same number of new purchases the planner prefers the one that uses more
+//! on-hand pantry items — it never buys *more* distinct ingredients just to use
+//! the pantry. Persisted pantry is never mutated. (Shopping/restock keeps its
+//! own quantity-aware, unit-bridged math for what to actually purchase.)
 //!
 //! Optional [`NutritionBounds`] steer selection using precomputed whole-recipe
 //! estimated [`Macros`]: prefer schedules that satisfy per-meal, per-day, and
@@ -95,6 +98,7 @@ pub use tod::{
 use crate::domain::{
     normalize_title_key, IngredientKey, Macros, MealPlan, PantryItem, PlannedMeal, Recipe, RecipeId,
 };
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 /// Quantity comparison tolerance.
@@ -365,9 +369,15 @@ fn candidate_sort_key<'a>(
     bounds: &NutritionBounds,
     day_macros: &Macros,
     i: usize,
-) -> (usize, usize, u64, &'a str, &'a str) {
+) -> (usize, Reverse<usize>, usize, u64, &'a str, &'a str) {
     let mut to_buy_c = to_buy.clone();
     let new_keys = apply_recipe_to_coverage(pantry, &mut to_buy_c, &reqs[i]);
+    // Balanced pantry priority: after fewest new-to-buy keys, prefer the recipe
+    // that uses more on-hand pantry ingredients (Reverse → more sorts first).
+    let pantry_hits = keys[i]
+        .iter()
+        .filter(|k| pantry_covers(pantry, &k.name))
+        .count();
     let deficit = if bounds.is_empty() {
         0
     } else {
@@ -375,6 +385,7 @@ fn candidate_sort_key<'a>(
     };
     (
         new_keys,
+        Reverse(pantry_hits),
         keys[i].len(),
         deficit,
         pool[i].title.as_str(),
@@ -506,11 +517,23 @@ fn lex_better_schedule(pool: &[&Recipe], a: &[usize], b: &[usize]) -> bool {
     false
 }
 
-/// True if `a` beats incumbent `b`: smaller union wins; ties by lex
-/// `(title, id)` sequence. Equal schedules keep the incumbent (`false`).
-fn better_schedule(pool: &[&Recipe], a: &[usize], ua: usize, b: &[usize], ub: usize) -> bool {
+/// True if `a` beats incumbent `b`: smaller to-buy union wins; then (balanced
+/// pantry priority) more pantry items used wins; then lex `(title, id)`.
+/// Equal schedules keep the incumbent (`false`).
+fn better_schedule(
+    pool: &[&Recipe],
+    a: &[usize],
+    ua: usize,
+    pua: usize,
+    b: &[usize],
+    ub: usize,
+    pub_: usize,
+) -> bool {
     if ua != ub {
         return ua < ub;
+    }
+    if pua != pub_ {
+        return pua > pub_;
     }
     lex_better_schedule(pool, a, b)
 }
@@ -518,6 +541,7 @@ fn better_schedule(pool: &[&Recipe], a: &[usize], ua: usize, b: &[usize], ub: us
 struct ScoredSchedule {
     indices: Vec<usize>,
     net_union: usize,
+    pantry_used: usize,
     magnitude: f64,
     tod_misses: usize,
     violations: Vec<BoundViolation>,
@@ -525,6 +549,7 @@ struct ScoredSchedule {
 
 fn score_schedule(input: &GreedyInput<'_>, indices: Vec<usize>) -> ScoredSchedule {
     let net_union = net_shortfall_count(input.reqs, &indices, input.pantry);
+    let pantry_used = pantry_used_count(input.reqs, &indices, input.pantry);
     let violations = if input.bounds.is_empty() {
         Vec::new()
     } else {
@@ -541,6 +566,7 @@ fn score_schedule(input: &GreedyInput<'_>, indices: Vec<usize>) -> ScoredSchedul
     ScoredSchedule {
         indices,
         net_union,
+        pantry_used,
         magnitude,
         tod_misses,
         violations,
@@ -586,6 +612,9 @@ fn better_scored(pool: &[&Recipe], a: &ScoredSchedule, b: &ScoredSchedule) -> bo
     if a.net_union != b.net_union {
         return a.net_union < b.net_union;
     }
+    if a.pantry_used != b.pantry_used {
+        return a.pantry_used > b.pantry_used;
+    }
     lex_better_schedule(pool, &a.indices, &b.indices)
 }
 
@@ -623,6 +652,7 @@ fn greedy_constrained_scored(input: &GreedyInput<'_>, target: usize) -> ScoredSc
     best.unwrap_or_else(|| ScoredSchedule {
         indices: Vec::new(),
         net_union: 0,
+        pantry_used: 0,
         magnitude: 0.0,
         tod_misses: 0,
         violations: Vec::new(),
@@ -752,19 +782,20 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         let indices = order_full_pool(&input);
         score_schedule(&input, indices)
     } else if !constrained {
-        let mut best: Option<(Vec<usize>, usize)> = None;
+        let mut best: Option<(Vec<usize>, usize, usize)> = None;
         for seed in 0..pool.len() {
             let candidate = greedy_from_seed(&input, seed, target);
             let ua = net_shortfall_count(&reqs, &candidate, pantry);
+            let pua = pantry_used_count(&reqs, &candidate, pantry);
             let take = match &best {
                 None => true,
-                Some((b, ub)) => better_schedule(&pool, &candidate, ua, b, *ub),
+                Some((b, ub, pub_)) => better_schedule(&pool, &candidate, ua, pua, b, *ub, *pub_),
             };
             if take {
-                best = Some((candidate, ua));
+                best = Some((candidate, ua, pua));
             }
         }
-        let indices = best.map(|(s, _)| s).unwrap_or_default();
+        let indices = best.map(|(s, _, _)| s).unwrap_or_default();
         score_schedule(&input, indices)
     } else {
         // Compete exact strategies and keep the best-scored plan. A joint
@@ -811,6 +842,7 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         best.unwrap_or_else(|| ScoredSchedule {
             indices: Vec::new(),
             net_union: 0,
+            pantry_used: 0,
             magnitude: 0.0,
             tod_misses: 0,
             violations: Vec::new(),
@@ -1998,6 +2030,33 @@ mod tests {
             "mass onions must cover a count onion line: {}",
             plan.rationale
         );
+    }
+
+    #[test]
+    fn balanced_priority_prefers_pantry_recipe_at_equal_buy_cost() {
+        // Both plans require buying 2 new distinct ingredients (flour, salt), but
+        // "Beany" also uses a pantry item → preferred under balanced priority.
+        let plain = rec("Plain", &["1 cup flour", "1 tsp salt"]);
+        let beany = rec("Beany", &["1 cup flour", "1 tsp salt", "1 can black beans"]);
+        let pool = vec![plain, beany];
+        let opts = PlanOptions {
+            days: 1,
+            meals_per_day: 1,
+            pantry: vec![item("black beans", UnitKind::Mass, 500.0)],
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_meals(&pool, &opts).meals[0].recipe_title,
+            "Beany",
+            "should prefer the recipe that uses pantry stock at equal buy cost"
+        );
+        // Without the pantry item, the smaller recipe (fewer buys) wins.
+        let empty = PlanOptions {
+            days: 1,
+            meals_per_day: 1,
+            ..Default::default()
+        };
+        assert_eq!(plan_meals(&pool, &empty).meals[0].recipe_title, "Plain");
     }
 
     #[test]
