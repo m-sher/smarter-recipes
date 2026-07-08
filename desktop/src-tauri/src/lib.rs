@@ -1,12 +1,18 @@
-//! Tauri backend: thin commands over `smarter_recipes` storage + planning.
+//! Tauri backend: thin commands over `smarter_recipes` (store, plan, shop, ingest).
 
 use serde::{Deserialize, Serialize};
-use smarter_recipes::domain::{IngredientKey, ShoppingList, UnitKind};
+use smarter_recipes::domain::{IngredientKey, Macros, Recipe, RecipeId, ShoppingList, UnitKind};
+use smarter_recipes::ingest::{ingest_from, ingest_many};
 use smarter_recipes::normalize::normalize_line;
-use smarter_recipes::planning::{plan_meals, PlanOptions};
+use smarter_recipes::nutrition::{recipe_nutrition, source_recipe_macros};
+use smarter_recipes::planning::{
+    load_nutrition_bounds, plan_meals, CliPerDayNutrition, PlanOptions, MIN_INGREDIENT_COVERAGE,
+};
 use smarter_recipes::pricing::PackageCatalog;
-use smarter_recipes::shopping::shopping_list_for_plan;
+use smarter_recipes::shopping::{restock_plan_from_shop, shopping_list_for_plan};
 use smarter_recipes::storage::Store;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
 
@@ -81,6 +87,9 @@ pub struct CreatePlanArgs {
     pub meals_per_day: u32,
     pub time_of_day: bool,
     pub save: bool,
+    pub nutrition_config: Option<String>,
+    pub min_protein_g: Option<f64>,
+    pub max_kcal: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +98,20 @@ pub struct ShopItemView {
     pub need: f64,
     pub unit: String,
     pub leftover: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RestockResult {
+    pub additions: usize,
+    pub deductions: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportResult {
+    pub saved: usize,
+    pub titles: Vec<String>,
+    pub message: String,
 }
 
 fn kind_str(k: UnitKind) -> &'static str {
@@ -123,8 +146,18 @@ fn parse_pantry_line(line: &str) -> Result<(IngredientKey, f64), String> {
 }
 
 fn open_default_store() -> Result<Store, String> {
-    let path = Store::default_path();
-    Store::open(path).map_err(|e| format!("open database: {e:#}"))
+    Store::open(Store::default_path()).map_err(|e| format!("open database: {e:#}"))
+}
+
+fn source_label(r: &Recipe) -> String {
+    match &r.source {
+        smarter_recipes::domain::RecipeSource::Url { url } => format!("url:{url}"),
+        smarter_recipes::domain::RecipeSource::Epub { path, .. } => format!("epub:{path}"),
+        smarter_recipes::domain::RecipeSource::File { path } => format!("file:{path}"),
+        smarter_recipes::domain::RecipeSource::Image { path } => format!("image:{path}"),
+        smarter_recipes::domain::RecipeSource::Manual => "manual".into(),
+        smarter_recipes::domain::RecipeSource::Unknown => "unknown".into(),
+    }
 }
 
 fn plan_to_view(plan: &smarter_recipes::domain::MealPlan) -> PlanView {
@@ -145,6 +178,83 @@ fn plan_to_view(plan: &smarter_recipes::domain::MealPlan) -> PlanView {
             .collect(),
         rationale: plan.rationale.clone(),
     }
+}
+
+fn resolve_recipe_prefix(store: &Store, id: &str) -> Result<Recipe, String> {
+    let all = store.list_recipes(None).map_err(|e| e.to_string())?;
+    let matches: Vec<_> = all
+        .into_iter()
+        .filter(|r| r.id.as_str().starts_with(id))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no recipe matching '{id}'")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => Err(format!("ambiguous id '{id}' ({n} matches)")),
+    }
+}
+
+fn resolve_plan_prefix(
+    store: &Store,
+    id: &str,
+) -> Result<smarter_recipes::domain::MealPlan, String> {
+    let plans = store.list_plans().map_err(|e| e.to_string())?;
+    let matches: Vec<_> = plans
+        .into_iter()
+        .filter(|p| p.id.starts_with(id))
+        .collect();
+    match matches.len() {
+        0 => Err(format!("no plan matching '{id}'")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        n => Err(format!("ambiguous plan id '{id}' ({n} matches)")),
+    }
+}
+
+fn nutrition_extra(store: &Store) -> HashMap<String, Macros> {
+    store
+        .nutrition_cache_all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| v.map(|m| (k, m)))
+        .collect()
+}
+
+fn recipe_macros_for_pool(
+    recipes: &[Recipe],
+    extra: &HashMap<String, Macros>,
+) -> (HashMap<RecipeId, Macros>, HashSet<RecipeId>) {
+    let mut macros = HashMap::new();
+    let mut low_coverage = HashSet::new();
+    for r in recipes {
+        let n = recipe_nutrition(r, extra);
+        let estimable = n.covered.len() + n.uncovered.len();
+        let coverage = if estimable > 0 {
+            n.covered.len() as f64 / estimable as f64
+        } else {
+            0.0
+        };
+        if let Some(src) = source_recipe_macros(r) {
+            macros.insert(r.id.clone(), src);
+        } else {
+            if estimable > 0 && coverage < MIN_INGREDIENT_COVERAGE {
+                low_coverage.insert(r.id.clone());
+            }
+            macros.insert(r.id.clone(), n.macros);
+        }
+    }
+    (macros, low_coverage)
+}
+
+fn pantry_views(store: &Store) -> Result<Vec<PantryItemView>, String> {
+    let items = store.list_pantry().map_err(|e| e.to_string())?;
+    Ok(items
+        .into_iter()
+        .map(|p| PantryItemView {
+            name: p.key.name.clone(),
+            kind: kind_str(p.key.kind).to_string(),
+            quantity_canonical: p.quantity_canonical,
+            unit_label: ShoppingList::kind_label(p.key.kind).to_string(),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -184,25 +294,7 @@ fn list_recipes(
 #[tauri::command]
 fn get_recipe(state: State<'_, AppState>, id: String) -> Result<RecipeDetail, String> {
     let store = state.store.lock().map_err(|_| "database lock poisoned")?;
-    // Prefix match like CLI.
-    let all = store.list_recipes(None).map_err(|e| e.to_string())?;
-    let matches: Vec<_> = all
-        .into_iter()
-        .filter(|r| r.id.as_str().starts_with(id.as_str()))
-        .collect();
-    let r = match matches.len() {
-        0 => return Err(format!("no recipe matching '{id}'")),
-        1 => matches.into_iter().next().unwrap(),
-        n => return Err(format!("ambiguous id '{id}' ({n} matches)")),
-    };
-    let source = match &r.source {
-        smarter_recipes::domain::RecipeSource::Url { url } => format!("url:{url}"),
-        smarter_recipes::domain::RecipeSource::Epub { path, .. } => format!("epub:{path}"),
-        smarter_recipes::domain::RecipeSource::File { path } => format!("file:{path}"),
-        smarter_recipes::domain::RecipeSource::Image { path } => format!("image:{path}"),
-        smarter_recipes::domain::RecipeSource::Manual => "manual".into(),
-        smarter_recipes::domain::RecipeSource::Unknown => "unknown".into(),
-    };
+    let r = resolve_recipe_prefix(&store, &id)?;
     Ok(RecipeDetail {
         id: r.id.as_str().to_string(),
         title: r.title,
@@ -210,23 +302,24 @@ fn get_recipe(state: State<'_, AppState>, id: String) -> Result<RecipeDetail, St
         servings: r.servings,
         ingredients: r.ingredients.iter().map(|l| l.original.clone()).collect(),
         steps: r.steps,
-        source,
+        source: source_label(&r),
     })
+}
+
+#[tauri::command]
+fn delete_recipe(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let store = state.store.lock().map_err(|_| "database lock poisoned")?;
+    let r = resolve_recipe_prefix(&store, &id)?;
+    store
+        .delete_recipe(r.id.as_str())
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
 fn list_pantry(state: State<'_, AppState>) -> Result<Vec<PantryItemView>, String> {
     let store = state.store.lock().map_err(|_| "database lock poisoned")?;
-    let items = store.list_pantry().map_err(|e| e.to_string())?;
-    Ok(items
-        .into_iter()
-        .map(|p| PantryItemView {
-            name: p.key.name.clone(),
-            kind: kind_str(p.key.kind).to_string(),
-            quantity_canonical: p.quantity_canonical,
-            unit_label: ShoppingList::kind_label(p.key.kind).to_string(),
-        })
-        .collect())
+    pantry_views(&store)
 }
 
 #[tauri::command]
@@ -234,8 +327,7 @@ fn pantry_add(state: State<'_, AppState>, line: String) -> Result<Vec<PantryItem
     let (key, qty) = parse_pantry_line(&line)?;
     let store = state.store.lock().map_err(|_| "database lock poisoned")?;
     store.pantry_add(&key, qty).map_err(|e| e.to_string())?;
-    drop(store);
-    list_pantry(state)
+    pantry_views(&store)
 }
 
 #[tauri::command]
@@ -270,8 +362,7 @@ fn pantry_remove(
         }
     };
     store.pantry_remove(&key).map_err(|e| e.to_string())?;
-    drop(store);
-    list_pantry(state)
+    pantry_views(&store)
 }
 
 #[tauri::command]
@@ -292,17 +383,7 @@ fn list_plans(state: State<'_, AppState>) -> Result<Vec<PlanSummary>, String> {
 #[tauri::command]
 fn get_plan(state: State<'_, AppState>, id: String) -> Result<PlanView, String> {
     let store = state.store.lock().map_err(|_| "database lock poisoned")?;
-    let plans = store.list_plans().map_err(|e| e.to_string())?;
-    let matches: Vec<_> = plans
-        .into_iter()
-        .filter(|p| p.id.starts_with(id.as_str()))
-        .collect();
-    let plan = match matches.len() {
-        0 => return Err(format!("no plan matching '{id}'")),
-        1 => matches.into_iter().next().unwrap(),
-        n => return Err(format!("ambiguous plan id '{id}' ({n} matches)")),
-    };
-    Ok(plan_to_view(&plan))
+    Ok(plan_to_view(&resolve_plan_prefix(&store, &id)?))
 }
 
 #[tauri::command]
@@ -316,12 +397,37 @@ fn create_plan(state: State<'_, AppState>, args: CreatePlanArgs) -> Result<PlanV
         return Err("recipe pool is empty; import recipes first".into());
     }
     let pantry = store.list_pantry().map_err(|e| e.to_string())?;
+
+    let cli_nutrition = CliPerDayNutrition {
+        min_kcal: None,
+        max_kcal: args.max_kcal,
+        min_protein_g: args.min_protein_g,
+        max_protein_g: None,
+        min_fat_g: None,
+        max_fat_g: None,
+        min_carbs_g: None,
+        max_carbs_g: None,
+    };
+    let nutrition_path = args
+        .nutrition_config
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let nutrition = load_nutrition_bounds(nutrition_path.as_deref(), &cli_nutrition)
+        .map_err(|e| format!("nutrition config: {e:#}"))?;
+
+    let extra = nutrition_extra(&store);
+    let (recipe_macros, recipe_low_coverage) = recipe_macros_for_pool(&recipes, &extra);
+
     let opts = PlanOptions {
         days: args.days,
         meals_per_day: args.meals_per_day,
         pantry,
+        nutrition,
+        recipe_macros,
+        recipe_low_coverage,
         time_of_day: args.time_of_day,
-        ..Default::default()
     };
     let plan = plan_meals(&recipes, &opts);
     if args.save {
@@ -333,16 +439,7 @@ fn create_plan(state: State<'_, AppState>, args: CreatePlanArgs) -> Result<PlanV
 #[tauri::command]
 fn shop_plan(state: State<'_, AppState>, id: String) -> Result<Vec<ShopItemView>, String> {
     let store = state.store.lock().map_err(|_| "database lock poisoned")?;
-    let plans = store.list_plans().map_err(|e| e.to_string())?;
-    let matches: Vec<_> = plans
-        .into_iter()
-        .filter(|p| p.id.starts_with(id.as_str()))
-        .collect();
-    let plan = match matches.len() {
-        0 => return Err(format!("no plan matching '{id}'")),
-        1 => matches.into_iter().next().unwrap(),
-        n => return Err(format!("ambiguous plan id '{id}' ({n} matches)")),
-    };
+    let plan = resolve_plan_prefix(&store, &id)?;
     let cat = PackageCatalog::with_defaults();
     let list = shopping_list_for_plan(&store, &plan, &cat).map_err(|e| e.to_string())?;
     Ok(list
@@ -355,6 +452,80 @@ fn shop_plan(state: State<'_, AppState>, id: String) -> Result<Vec<ShopItemView>
             leftover: i.leftover_canonical,
         })
         .collect())
+}
+
+#[tauri::command]
+fn restock_plan(state: State<'_, AppState>, id: String) -> Result<RestockResult, String> {
+    let store = state.store.lock().map_err(|_| "database lock poisoned")?;
+    let plan = resolve_plan_prefix(&store, &id)?;
+    let cat = PackageCatalog::with_defaults();
+    let delta = restock_plan_from_shop(&store, &plan, &cat).map_err(|e| e.to_string())?;
+    Ok(RestockResult {
+        additions: delta.additions.len(),
+        deductions: delta.deductions.len(),
+        message: format!(
+            "Restocked: {} purchase line(s), {} cooked deduction(s). Leftovers remain in pantry.",
+            delta.additions.len(),
+            delta.deductions.len()
+        ),
+    })
+}
+
+#[tauri::command]
+fn import_source(
+    state: State<'_, AppState>,
+    source: String,
+    input: String,
+) -> Result<ImportResult, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("path or URL required".into());
+    }
+    let source = source.trim().to_lowercase();
+    let batch = if source == "epub" || source == "ebook" || (source == "auto" && input.ends_with(".epub")) {
+        ingest_many(&source, input).map_err(|e| e.to_string())?
+    } else {
+        let r = ingest_from(if source.is_empty() { "auto" } else { &source }, input)
+            .map_err(|e| e.to_string())?;
+        smarter_recipes::ingest::IngestBatch {
+            recipes: vec![r],
+            skipped_ambiguous: Vec::new(),
+        }
+    };
+    if batch.recipes.is_empty() {
+        return Err("no recipes ingested".into());
+    }
+    let store = state.store.lock().map_err(|_| "database lock poisoned")?;
+    let mut titles = Vec::new();
+    let mut saved = 0usize;
+    for r in &batch.recipes {
+        if store
+            .is_duplicate(r.meta.source_url.as_deref())
+            .map_err(|e| e.to_string())?
+        {
+            continue;
+        }
+        store.save_recipe(r).map_err(|e| e.to_string())?;
+        titles.push(r.title.clone());
+        saved += 1;
+    }
+    Ok(ImportResult {
+        saved,
+        titles,
+        message: format!(
+            "Saved {saved} recipe(s){}{}",
+            if batch.skipped_ambiguous.is_empty() {
+                String::new()
+            } else {
+                format!(", skipped {} ambiguous", batch.skipped_ambiguous.len())
+            },
+            if saved == 0 {
+                " (all duplicates?)"
+            } else {
+                ""
+            }
+        ),
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -377,6 +548,7 @@ pub fn run() {
             get_status,
             list_recipes,
             get_recipe,
+            delete_recipe,
             list_pantry,
             pantry_add,
             pantry_remove,
@@ -384,6 +556,8 @@ pub fn run() {
             get_plan,
             create_plan,
             shop_plan,
+            restock_plan,
+            import_source,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

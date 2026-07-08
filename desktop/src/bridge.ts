@@ -1,8 +1,6 @@
 /**
  * Data bridge: Tauri invoke in the app, deterministic mock fixtures for visual tests.
- * Set `window.__SR_MOCK__ = true` (or `?mock=1`) before boot to force mock mode.
  */
-
 export type DbStatus = {
   path: string;
   recipe_count: number;
@@ -62,6 +60,9 @@ export type CreatePlanArgs = {
   meals_per_day: number;
   time_of_day: boolean;
   save: boolean;
+  nutrition_config?: string | null;
+  min_protein_g?: number | null;
+  max_kcal?: number | null;
 };
 
 export type ShopItemView = {
@@ -71,10 +72,23 @@ export type ShopItemView = {
   leftover: number;
 };
 
+export type RestockResult = {
+  additions: number;
+  deductions: number;
+  message: string;
+};
+
+export type ImportResult = {
+  saved: number;
+  titles: string[];
+  message: string;
+};
+
 export type Api = {
   getStatus: () => Promise<DbStatus>;
   listRecipes: (filter?: string | null) => Promise<RecipeSummary[]>;
   getRecipe: (id: string) => Promise<RecipeDetail>;
+  deleteRecipe: (id: string) => Promise<void>;
   listPantry: () => Promise<PantryItemView[]>;
   pantryAdd: (line: string) => Promise<PantryItemView[]>;
   pantryRemove: (name: string, kind?: string | null) => Promise<PantryItemView[]>;
@@ -82,6 +96,8 @@ export type Api = {
   getPlan: (id: string) => Promise<PlanView>;
   createPlan: (args: CreatePlanArgs) => Promise<PlanView>;
   shopPlan: (id: string) => Promise<ShopItemView[]>;
+  restockPlan: (id: string) => Promise<RestockResult>;
+  importSource: (source: string, input: string) => Promise<ImportResult>;
 };
 
 declare global {
@@ -99,24 +115,9 @@ const MOCK_STATUS: DbStatus = {
 };
 
 const MOCK_RECIPES: RecipeSummary[] = [
-  {
-    id: "11111111-aaaa-bbbb-cccc-000000000001",
-    title: "Tomato Pasta",
-    category: "Dinner",
-    ingredient_count: 5,
-  },
-  {
-    id: "22222222-aaaa-bbbb-cccc-000000000002",
-    title: "Watermelon Cooler",
-    category: "Beverage",
-    ingredient_count: 3,
-  },
-  {
-    id: "33333333-aaaa-bbbb-cccc-000000000003",
-    title: "Tahini Sauce",
-    category: "Sauce",
-    ingredient_count: 4,
-  },
+  { id: "11111111-aaaa-bbbb-cccc-000000000001", title: "Tomato Pasta", category: "Dinner", ingredient_count: 5 },
+  { id: "22222222-aaaa-bbbb-cccc-000000000002", title: "Watermelon Cooler", category: "Beverage", ingredient_count: 3 },
+  { id: "33333333-aaaa-bbbb-cccc-000000000003", title: "Tahini Sauce", category: "Sauce", ingredient_count: 4 },
 ];
 
 const MOCK_DETAILS: Record<string, RecipeDetail> = {
@@ -159,26 +160,14 @@ const MOCK_PLAN: PlanView = {
   days: 2,
   meals_per_day: 1,
   meals: [
-    {
-      day: 0,
-      meal: 0,
-      recipe_id: "11111111-aaaa-bbbb-cccc-000000000001",
-      recipe_title: "Tomato Pasta",
-      uses_pantry: true,
-    },
-    {
-      day: 1,
-      meal: 0,
-      recipe_id: "22222222-aaaa-bbbb-cccc-000000000002",
-      recipe_title: "Watermelon Cooler",
-      uses_pantry: false,
-    },
+    { day: 0, meal: 0, recipe_id: "11111111-aaaa-bbbb-cccc-000000000001", recipe_title: "Tomato Pasta", uses_pantry: true },
+    { day: 1, meal: 0, recipe_id: "22222222-aaaa-bbbb-cccc-000000000002", recipe_title: "Watermelon Cooler", uses_pantry: false },
   ],
   rationale:
     "Min-union planner: 2 meal(s) over 2 day(s), no recipe repeats.\n  Pool: 3 unique recipe(s)\n  8 distinct ingredient key(s)\n  Pantry: 1 of 2 on-hand item(s) used; 6 key(s) not covered by pantry stock",
 };
 
-const MOCK_PLANS: PlanSummary[] = [
+let mockPlans: PlanSummary[] = [
   { id: MOCK_PLAN.id, days: 2, meals_per_day: 1, meal_count: 2 },
 ];
 
@@ -190,8 +179,7 @@ const MOCK_SHOP: ShopItemView[] = [
 function useMock(): boolean {
   if (typeof window === "undefined") return true;
   if (window.__SR_MOCK__ === true) return true;
-  const q = new URLSearchParams(window.location.search);
-  return q.get("mock") === "1";
+  return new URLSearchParams(window.location.search).get("mock") === "1";
 }
 
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -204,7 +192,8 @@ function mockApi(): Api {
     getStatus: async () => ({
       ...MOCK_STATUS,
       pantry_count: mockPantry.length,
-      plan_count: MOCK_PLANS.length,
+      plan_count: mockPlans.length,
+      recipe_count: MOCK_RECIPES.length,
     }),
     listRecipes: async (filter) => {
       const f = (filter ?? "").trim().toLowerCase();
@@ -212,15 +201,17 @@ function mockApi(): Api {
       return MOCK_RECIPES.filter((r) => r.title.toLowerCase().includes(f));
     },
     getRecipe: async (id) => {
-      const hit =
-        MOCK_DETAILS[id] ??
-        Object.values(MOCK_DETAILS).find((r) => r.id.startsWith(id));
+      const hit = MOCK_DETAILS[id] ?? Object.values(MOCK_DETAILS).find((r) => r.id.startsWith(id));
       if (!hit) throw new Error(`no recipe matching '${id}'`);
       return structuredClone(hit);
     },
+    deleteRecipe: async (id) => {
+      if (!MOCK_DETAILS[id] && !Object.values(MOCK_DETAILS).some((r) => r.id.startsWith(id))) {
+        throw new Error(`no recipe matching '${id}'`);
+      }
+    },
     listPantry: async () => structuredClone(mockPantry),
     pantryAdd: async (line) => {
-      // Minimal mock: append a fake row from free text.
       const name = line.replace(/^\d+(\.\d+)?\s*\w+\s+/, "").trim() || "item";
       mockPantry = [
         ...mockPantry.filter((p) => p.name !== name),
@@ -232,37 +223,52 @@ function mockApi(): Api {
       mockPantry = mockPantry.filter((p) => p.name !== name);
       return structuredClone(mockPantry);
     },
-    listPlans: async () => structuredClone(MOCK_PLANS),
+    listPlans: async () => structuredClone(mockPlans),
     getPlan: async (id) => {
-      if (!MOCK_PLAN.id.startsWith(id) && id !== MOCK_PLAN.id) {
-        throw new Error(`no plan matching '${id}'`);
-      }
+      if (!MOCK_PLAN.id.startsWith(id) && id !== MOCK_PLAN.id) throw new Error(`no plan matching '${id}'`);
       return structuredClone(MOCK_PLAN);
     },
     createPlan: async (args) => {
       const plan = structuredClone(MOCK_PLAN);
       plan.days = args.days;
       plan.meals_per_day = args.meals_per_day;
+      if (args.nutrition_config) {
+        plan.rationale += "\n  Nutrition constraints satisfied";
+      }
+      if (args.save && !mockPlans.some((p) => p.id === plan.id)) {
+        mockPlans = [{ id: plan.id, days: plan.days, meals_per_day: plan.meals_per_day, meal_count: plan.meals.length }, ...mockPlans];
+      }
       return plan;
     },
     shopPlan: async () => structuredClone(MOCK_SHOP),
+    restockPlan: async () => ({
+      additions: 2,
+      deductions: 3,
+      message: "Restocked: 2 purchase line(s), 3 cooked deduction(s). Leftovers remain in pantry.",
+    }),
+    importSource: async (_source, input) => ({
+      saved: 1,
+      titles: [`Imported ${input.split("/").pop() || input}`],
+      message: "Saved 1 recipe(s)",
+    }),
   };
 }
 
 export function createApi(): Api {
   if (useMock()) return mockApi();
   return {
-    getStatus: () => tauriInvoke<DbStatus>("get_status"),
-    listRecipes: (filter) =>
-      tauriInvoke<RecipeSummary[]>("list_recipes", { filter: filter ?? null }),
-    getRecipe: (id) => tauriInvoke<RecipeDetail>("get_recipe", { id }),
-    listPantry: () => tauriInvoke<PantryItemView[]>("list_pantry"),
-    pantryAdd: (line) => tauriInvoke<PantryItemView[]>("pantry_add", { line }),
-    pantryRemove: (name, kind) =>
-      tauriInvoke<PantryItemView[]>("pantry_remove", { name, kind: kind ?? null }),
-    listPlans: () => tauriInvoke<PlanSummary[]>("list_plans"),
-    getPlan: (id) => tauriInvoke<PlanView>("get_plan", { id }),
-    createPlan: (args) => tauriInvoke<PlanView>("create_plan", { args }),
-    shopPlan: (id) => tauriInvoke<ShopItemView[]>("shop_plan", { id }),
+    getStatus: () => tauriInvoke("get_status"),
+    listRecipes: (filter) => tauriInvoke("list_recipes", { filter: filter ?? null }),
+    getRecipe: (id) => tauriInvoke("get_recipe", { id }),
+    deleteRecipe: (id) => tauriInvoke("delete_recipe", { id }),
+    listPantry: () => tauriInvoke("list_pantry"),
+    pantryAdd: (line) => tauriInvoke("pantry_add", { line }),
+    pantryRemove: (name, kind) => tauriInvoke("pantry_remove", { name, kind: kind ?? null }),
+    listPlans: () => tauriInvoke("list_plans"),
+    getPlan: (id) => tauriInvoke("get_plan", { id }),
+    createPlan: (args) => tauriInvoke("create_plan", { args }),
+    shopPlan: (id) => tauriInvoke("shop_plan", { id }),
+    restockPlan: (id) => tauriInvoke("restock_plan", { id }),
+    importSource: (source, input) => tauriInvoke("import_source", { source, input }),
   };
 }

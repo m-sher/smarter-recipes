@@ -2,11 +2,21 @@
 
 Tauri 2 + Vite desktop shell over the existing `smarter_recipes` library and SQLite database.
 
+## Features (v1)
+
+| Page | Actions |
+|------|---------|
+| **Home** | DB path, recipe / plan / pantry counts |
+| **Library** | Search, open recipe detail, delete |
+| **Pantry** | List, add free-text stock, remove |
+| **Plan** | Days/meals/TOD, optional nutrition TOML + protein/kcal, create & save, open saved, ★ pantry meals, shop list, restock |
+| **Import** | `auto` / `file` / `url` / `epub` ingest (same pipeline as CLI) |
+
 ## Prerequisites
 
 - Rust (same as the CLI crate)
 - Node.js 20+
-- Linux: WebKitGTK for Tauri (`libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, etc. — see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/))
+- Linux: WebKitGTK/GTK for native window — see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
 
 ## Develop
 
@@ -16,41 +26,26 @@ npm install
 npm run tauri dev
 ```
 
-The UI loads from Vite (`localhost:1420`) and calls Tauri commands that open the **same default DB** as the CLI (`SMARTER_RECIPES_DB` / platform data dir).
+Uses the **same default DB** as the CLI (`SMARTER_RECIPES_DB` / platform data dir).
 
 ## Visual regression tests
 
-The UI is testable **without** launching Tauri. Playwright starts Vite, forces mock data (`?mock=1` / `__SR_MOCK__`), captures full-page frames, and compares them to golden PNGs.
+UI is tested **without** launching Tauri. Playwright boots Vite with mock data and compares full-page frames to golden PNGs.
 
 ```bash
 cd desktop
-npm install
 npx playwright install chromium   # once
-npm run test:visual               # compare to baselines
-npm run test:visual:update        # rewrite golden frames after intentional UI changes
+npm run test:visual               # compare
+npm run test:visual:update        # rewrite goldens after intentional UI changes
 ```
 
-Snapshots live under `tests/visual/shell.spec.ts-snapshots/`.
-
-Mock fixtures are deterministic (fixed recipe/pantry rows) so diffs reflect design changes, not live DB contents.
-
-## Commands exposed (v1)
-
-| Command | Purpose |
-|---------|---------|
-| `get_status` | DB path + recipe/plan/pantry counts |
-| `list_recipes` / `get_recipe` | Browse + detail |
-| `list_pantry` / `pantry_add` / `pantry_remove` | Stock management |
-| `create_plan` / `list_plans` / `get_plan` | Meal planning (uses pantry; optional save) |
-| `shop_plan` | Shopping list for a saved plan |
-
-UI pages: **Home**, **Library** (+ recipe detail), **Pantry** (add/remove), **Plan** (generate, ★ pantry, shop).
+Snapshots: `tests/visual/shell.spec.ts-snapshots/`.
 
 ## Layout
 
 ```
 desktop/
-  src/                 # Vite UI (TypeScript)
-  src-tauri/           # Tauri host, invokes smarter_recipes
+  src/                 # Vite UI
+  src-tauri/           # Tauri host → smarter_recipes
   tests/visual/        # Playwright frame comparisons
 ```
