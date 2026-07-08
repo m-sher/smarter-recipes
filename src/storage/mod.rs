@@ -220,6 +220,30 @@ impl Store {
         Ok(())
     }
 
+    /// Persist many recipes in chunked transactions (one commit — hence one fsync —
+    /// per chunk instead of per statement). Prefer this for any bulk write
+    /// (reparse, import, refresh): autocommitting `save_recipe` per row fsyncs on
+    /// every statement and is ~50–100× slower over thousands of rows. `progress` is
+    /// called after each committed chunk with the running total persisted.
+    pub fn save_recipes(&self, recipes: &[Recipe], mut progress: impl FnMut(usize)) -> Result<()> {
+        const CHUNK: usize = 500;
+        let mut done = 0usize;
+        for chunk in recipes.chunks(CHUNK) {
+            self.conn.execute_batch("BEGIN")?;
+            let result = chunk.iter().try_for_each(|r| self.save_recipe(r));
+            match result {
+                Ok(()) => self.conn.execute_batch("COMMIT")?,
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
+            done += chunk.len();
+            progress(done);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn load_recipe_row(
         &self,
@@ -847,6 +871,25 @@ mod tests {
         assert_eq!(loaded.title, "Pasta");
         assert_eq!(loaded.ingredients.len(), 2);
         assert_eq!(loaded.ingredients[0].name, "pasta");
+    }
+
+    #[test]
+    fn save_recipes_batch_persists_all_and_reports_progress() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        let recipes: Vec<Recipe> = (0..1200)
+            .map(|i| sample_recipe(&format!("R{i}"), &["1 cup milk", "2 tsps sugar"]))
+            .collect();
+        let ids: Vec<String> = recipes.iter().map(|r| r.id.as_str().to_string()).collect();
+        let mut ticks = Vec::new();
+        store
+            .save_recipes(&recipes, |done| ticks.push(done))
+            .unwrap();
+        // Chunked at 500 → progress ticks at 500, 1000, 1200 (running totals).
+        assert_eq!(ticks, vec![500, 1000, 1200]);
+        assert_eq!(store.list_recipes(None).unwrap().len(), 1200);
+        let loaded = store.get_recipe(&ids[999]).unwrap().unwrap();
+        assert_eq!(loaded.ingredients.len(), 2);
     }
 
     #[test]

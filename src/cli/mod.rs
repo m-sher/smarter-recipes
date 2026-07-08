@@ -809,11 +809,12 @@ pub fn run(cli: Cli) -> Result<()> {
                 let mut recipes = store.list_recipes(None)?;
                 let total = recipes.len();
                 eprintln!("Reparsing {total} recipe(s) …");
-                for (i, recipe) in recipes.iter_mut().enumerate() {
+                for recipe in recipes.iter_mut() {
                     reparse_recipe(recipe);
-                    store.save_recipe(recipe)?;
-                    eprintln!("  [{}/{}] {}", i + 1, total, recipe.title);
                 }
+                store.save_recipes(&recipes, |done| {
+                    eprintln!("  reparsed {done}/{total}");
+                })?;
                 println!("Reparsed {total} recipe(s).");
             }
             (false, Some(id)) => {
