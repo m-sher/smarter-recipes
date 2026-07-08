@@ -295,6 +295,7 @@ fn list_recipes(
 fn get_recipe(state: State<'_, AppState>, id: String) -> Result<RecipeDetail, String> {
     let store = state.store.lock().map_err(|_| "database lock poisoned")?;
     let r = resolve_recipe_prefix(&store, &id)?;
+    let source = source_label(&r);
     Ok(RecipeDetail {
         id: r.id.as_str().to_string(),
         title: r.title,
@@ -302,7 +303,7 @@ fn get_recipe(state: State<'_, AppState>, id: String) -> Result<RecipeDetail, St
         servings: r.servings,
         ingredients: r.ingredients.iter().map(|l| l.original.clone()).collect(),
         steps: r.steps,
-        source: source_label(&r),
+        source,
     })
 }
 

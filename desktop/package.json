@@ -8,6 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "tauri:dev": "bash -lc 'source ./env-linux.sh 2>/dev/null; tauri dev'",
+    "tauri:build": "bash -lc 'source ./env-linux.sh 2>/dev/null; tauri build'",
     "test:visual": "playwright test",
     "test:visual:update": "playwright test --update-snapshots"
   },

@@ -16,13 +16,35 @@ Tauri 2 + Vite desktop shell over the existing `smarter_recipes` library and SQL
 
 - Rust (same as the CLI crate)
 - Node.js 20+
-- Linux: WebKitGTK/GTK for native window — see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
+- **Linux system libraries** (GTK 3 + WebKitGTK 4.1) — see below
+
+### Linux deps (Ubuntu/Debian)
+
+**Preferred (system-wide):**
+
+```bash
+sudo apt update
+sudo apt install -y \
+  build-essential curl wget file pkg-config \
+  libwebkit2gtk-4.1-dev libgtk-3-dev \
+  libayatana-appindicator3-dev librsvg2-dev patchelf \
+  libssl-dev
+```
+
+**Without sudo:** a user-local sysroot can be used. If present at
+`~/.local/tauri-sysroot`, source the helper before any Tauri build:
+
+```bash
+source desktop/env-linux.sh
+```
 
 ## Develop
 
 ```bash
 cd desktop
 npm install
+# if using user-local GTK/WebKit sysroot:
+# source ./env-linux.sh
 npm run tauri dev
 ```
 
