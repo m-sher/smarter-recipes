@@ -36,10 +36,11 @@ Database default path:
 - Override with `--db PATH` or env `SMARTER_RECIPES_DB`
 
 
-## Desktop GUI (experimental)
+## Desktop GUI
 
-A Tauri 2 desktop shell lives in [`desktop/`](desktop/). It uses the same local
-SQLite database as the CLI.
+A Tauri 2 desktop shell lives in [`desktop/`](desktop/). Same local SQLite DB as
+the CLI. Pages: **Home**, **Library** (detail + delete), **Pantry** (add/remove),
+**Plan** (nutrition options, ★ pantry, shop, restock), **Import** (file/url/epub).
 
 ```bash
 cd desktop
@@ -50,8 +51,8 @@ npm run tauri dev
 
 ### Visual regression tests
 
-The UI is tested **without** launching Tauri. Playwright serves the Vite app with
-deterministic mock data and compares screenshots to golden frames:
+UI is tested **without** launching Tauri. Playwright serves the Vite app with
+deterministic mock data and compares full-page screenshots to golden frames:
 
 ```bash
 cd desktop
@@ -60,7 +61,8 @@ npm run test:visual               # compare
 npm run test:visual:update        # rewrite baselines after intentional UI changes
 ```
 
-Golden images: `desktop/tests/visual/shell.spec.ts-snapshots/`.
+Goldens: `desktop/tests/visual/shell.spec.ts-snapshots/` (home, library, recipe,
+pantry, plan-shop, import).
 
 ## Usage
 
