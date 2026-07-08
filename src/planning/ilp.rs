@@ -46,7 +46,6 @@ use super::{
     MacroBounds, MacroRange, MacroRatio, KCAL_WEIGHT, MACRO_WEIGHT, RATIO_WEIGHT,
 };
 use crate::domain::{Macros, UnitKind};
-use crate::shopping::pantry_quantity_for;
 
 /// Base wall-clock backstop per solve phase on small models.
 const SOLVE_TIME_LIMIT_BASE_SECS: f64 = 5.0;
@@ -767,8 +766,8 @@ fn build_union(
     let mut key_to_cells: HashMap<&crate::domain::IngredientKey, Vec<Variable>> = HashMap::new();
     for (j, &r) in order.iter().enumerate() {
         for k in &input.keys[r] {
-            // Treat a key with any pantry stock as covered.
-            if pantry_quantity_for(k, input.pantry) > super::EPS {
+            // Presence-based, unit-agnostic pantry coverage (see mod::pantry_covers).
+            if super::pantry_covers(input.pantry, &k.name) {
                 continue;
             }
             key_to_cells
