@@ -1117,12 +1117,14 @@ mod tests {
                     meal: 0,
                     recipe_id: RecipeId::from("r0"),
                     recipe_title: "Day0".into(),
+                    uses_pantry: false,
                 },
                 PlannedMeal {
                     day: 2,
                     meal: 0,
                     recipe_id: RecipeId::from("r2"),
                     recipe_title: "Day2".into(),
+                    uses_pantry: false,
                 },
             ],
         };
@@ -1167,6 +1169,7 @@ mod tests {
                 meal: 0,
                 recipe_id: RecipeId::from("pub"),
                 recipe_title: "Published".into(),
+                uses_pantry: false,
             }],
         };
         let pn = plan_nutrition(&store, &plan, &HashMap::new()).unwrap();
@@ -1199,12 +1202,14 @@ mod tests {
                     meal: 0,
                     recipe_id: RecipeId::from("a"),
                     recipe_title: "A".into(),
+                    uses_pantry: false,
                 },
                 PlannedMeal {
                     day: 1,
                     meal: 0,
                     recipe_id: RecipeId::from("b"),
                     recipe_title: "B".into(),
+                    uses_pantry: false,
                 },
             ],
         };

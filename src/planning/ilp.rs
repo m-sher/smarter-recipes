@@ -766,8 +766,8 @@ fn build_union(
     let mut key_to_cells: HashMap<&crate::domain::IngredientKey, Vec<Variable>> = HashMap::new();
     for (j, &r) in order.iter().enumerate() {
         for k in &input.keys[r] {
-            // Presence-based, unit-agnostic pantry coverage (see mod::pantry_covers).
-            if super::pantry_covers(input.pantry, &k.name) {
+            // Presence-based, unit-agnostic pantry coverage (precomputed name set).
+            if input.pantry_names.contains(k.name.as_str()) {
                 continue;
             }
             key_to_cells

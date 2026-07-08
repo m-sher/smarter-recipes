@@ -14,6 +14,10 @@ pub struct PlannedMeal {
     pub meal: u32,
     pub recipe_id: RecipeId,
     pub recipe_title: String,
+    /// True when this recipe uses at least one on-hand pantry ingredient (by
+    /// name). Omitted/false on older saved plans.
+    #[serde(default)]
+    pub uses_pantry: bool,
 }
 
 /// Ordered selection of recipes across days.

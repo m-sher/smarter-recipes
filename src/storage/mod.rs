@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS plan_meals (
     meal INTEGER NOT NULL,
     recipe_id TEXT NOT NULL REFERENCES recipes(id),
     recipe_title TEXT NOT NULL,
+    uses_pantry INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (plan_id, day, meal)
 );
 
@@ -109,8 +110,12 @@ impl Store {
             .with_context(|| format!("opening database at {}", path.display()))?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
-        // Add the nutrition column if missing.
+        // Add columns missing from older databases.
         let _ = conn.execute("ALTER TABLE recipes ADD COLUMN nutrition_json TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE plan_meals ADD COLUMN uses_pantry INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Self { conn, path })
     }
 
@@ -416,14 +421,15 @@ impl Store {
         )?;
         for m in &plan.meals {
             self.conn.execute(
-                "INSERT INTO plan_meals (plan_id, day, meal, recipe_id, recipe_title)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO plan_meals (plan_id, day, meal, recipe_id, recipe_title, uses_pantry)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     plan.id,
                     m.day as i64,
                     m.meal as i64,
                     m.recipe_id.as_str(),
-                    m.recipe_title
+                    m.recipe_title,
+                    m.uses_pantry as i64
                 ],
             )?;
         }
@@ -452,7 +458,7 @@ impl Store {
         };
 
         let mut stmt = self.conn.prepare(
-            "SELECT day, meal, recipe_id, recipe_title FROM plan_meals
+            "SELECT day, meal, recipe_id, recipe_title, uses_pantry FROM plan_meals
              WHERE plan_id = ?1 ORDER BY day, meal",
         )?;
         let meals = stmt
@@ -462,6 +468,7 @@ impl Store {
                     meal: row.get::<_, i64>(1)? as u32,
                     recipe_id: RecipeId(row.get(2)?),
                     recipe_title: row.get(3)?,
+                    uses_pantry: row.get::<_, i64>(4)? != 0,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -844,6 +851,7 @@ mod tests {
                 meal: 0,
                 recipe_id: r.id.clone(),
                 recipe_title: "Junk Roundup".into(),
+                uses_pantry: false,
             }],
         };
         store.save_plan(&plan).unwrap();

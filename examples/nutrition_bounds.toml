@@ -2,20 +2,52 @@
 # Values are whole-recipe estimated macros summed per scope.
 
 [per_day]
-protein_g = { min = 70.0, max = 150.0 }
 kcal = { min = 800, max = 1500.0 }
+protein_g = { min = 80 }
 ratio = { protein = 40, fat = 30, carb = 30 }
 
 [per_meal]
+# kcal = { min = 100 }
 
 [plan]
 
 # Optional category filter for the candidate pool, matched against the
 # publisher's schema.org recipeCategory. Keeps standalone meals and drops
-# components (sauces, dressings, condiments). Matching is case-insensitive.
-# The blacklist wins; a non-empty whitelist is strict, so recipes with no
-# category are excluded. Run `smarter-recipes refresh --all --apply` first to
-# backfill categories across existing recipes.
-# [category]
+# components / building blocks. Matching is case-insensitive on each
+# comma-separated token; blacklist wins if any token matches. A non-empty
+# whitelist is strict (uncategorized recipes are excluded).
+#
+# Blacklist is exhaustive against tokens currently present in the local
+# catalog (~8.8k recipes) that label sauces, dressings, condiments, dips,
+# spice mixes, pantry building blocks, and how-to/component pages — not
+# meal types (Dinner, Lunch, Side Dish, …). "Pantry" is listed; "Pantry Meal"
+# is not. Re-scan after large imports if new component labels appear.
+# Run `smarter-recipes refresh --all --apply` first to backfill categories.
+[category]
 # whitelist = ["Main Course", "Dinner", "Entree"]
-# blacklist = ["Sauce", "Dressing", "Condiment", "Dip"]
+blacklist = [
+  # Sauces / dressings / condiments / dips
+  "Sauce",
+  "Sauces",
+  "Dressing",
+  "Salad Dressing",
+  "Dressings and Sauces",
+  "Condiment",
+  "Condiments",
+  "Condiments and Sauces",
+  "Dip",
+  "Dips and Appetizers",
+  "Salsa",
+  # Components / building blocks / seasoning
+  "Component",
+  "Cooking Component",
+  "Ingredient",
+  "Spice Mix",
+  "Seasonings",
+  "Spices",
+  "Staple",
+  "Pantry",
+  "Cooking Basics",
+  "How-to",
+  "How to",
+]
