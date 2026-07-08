@@ -220,6 +220,12 @@ const handlers: Handlers = {
       }
     })();
   },
+  onDismissPlan: () => {
+    set({ activePlan: null, shop: [], notice: null, error: null });
+  },
+  onDismissShop: () => {
+    set({ shop: [], notice: null });
+  },
   onShop: () => {
     void (async () => {
       if (!state.activePlan) return;

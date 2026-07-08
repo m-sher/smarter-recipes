@@ -90,6 +90,8 @@ export type Handlers = {
   onReadBounds: () => NutritionBounds;
   onCreatePlan: () => void;
   onOpenPlan: (id: string) => void;
+  onDismissPlan: () => void;
+  onDismissShop: () => void;
   onShop: () => void;
   onRestock: () => void;
   onPantryLine: (v: string) => void;
@@ -219,7 +221,7 @@ function renderHome(main: HTMLElement, state: AppState): void {
     statCard("Pantry items", String(state.status.pantry_count)),
   );
   main.append(grid);
-  const card = el("div", "card");
+  const card = el("div", "card stack");
   card.append(el("h3", "", "Database"), el("p", "muted", state.status.path));
   main.append(card);
 }
@@ -270,7 +272,7 @@ function renderRecipe(main: HTMLElement, state: AppState, h: Handlers): void {
     return;
   }
   main.append(pageHeader(d.title, shortId(d.id)));
-  const meta = el("div", "card");
+  const meta = el("div", "card stack");
   const bits = [
     d.category ? `Category: ${d.category}` : "Uncategorized",
     d.servings != null ? `Servings: ${d.servings}` : null,
@@ -279,7 +281,7 @@ function renderRecipe(main: HTMLElement, state: AppState, h: Handlers): void {
   meta.append(el("p", "muted", bits.join(" · ")));
   main.append(meta);
 
-  const ing = el("div", "card");
+  const ing = el("div", "card stack");
   ing.append(el("h3", "", "Ingredients"));
   const ul = el("ul", "plain-list");
   for (const line of d.ingredients) {
@@ -291,7 +293,7 @@ function renderRecipe(main: HTMLElement, state: AppState, h: Handlers): void {
   main.append(ing);
 
   if (d.steps.length) {
-    const st = el("div", "card");
+    const st = el("div", "card stack");
     st.append(el("h3", "", "Steps"));
     const ol = document.createElement("ol");
     ol.className = "plain-list numbered";
@@ -361,8 +363,10 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
   // Results first: active plan and shopping list sit above options.
   if (state.activePlan) {
     const plan = state.activePlan;
-    const card = el("div", "card");
-    card.append(
+    const card = el("div", "card stack");
+    const head = el("div", "card-head");
+    const titles = el("div", "");
+    titles.append(
       el("h3", "", `Plan ${shortId(plan.id)}`),
       el(
         "p",
@@ -370,6 +374,9 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
         `${plan.days} day(s) · ${plan.meals_per_day} meal(s)/day · ${plan.meals.length} scheduled`,
       ),
     );
+    head.append(titles, button("Dismiss", () => h.onDismissPlan(), "ghost small"));
+    card.append(head);
+
     const byDay = new Map<number, typeof plan.meals>();
     for (const m of plan.meals) {
       const arr = byDay.get(m.day) ?? [];
@@ -377,7 +384,8 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
       byDay.set(m.day, arr);
     }
     for (const [day, meals] of [...byDay.entries()].sort((a, b) => a[0] - b[0])) {
-      card.append(el("div", "day-label", `Day ${day + 1}`));
+      const dayBlock = el("div", "day-block");
+      dayBlock.append(el("div", "day-label", `Day ${day + 1}`));
       const ul = el("ul", "list compact");
       for (const m of meals) {
         const li = document.createElement("li");
@@ -393,7 +401,8 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
         li.addEventListener("click", () => h.onOpenRecipe(m.recipe_id));
         ul.append(li);
       }
-      card.append(ul);
+      dayBlock.append(ul);
+      card.append(dayBlock);
     }
     const ratDetails = el("details", "bounds-scope") as HTMLDetailsElement;
     ratDetails.open = false;
@@ -416,8 +425,10 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
   }
 
   if (state.shop.length) {
-    const shop = el("div", "card");
-    shop.append(el("h3", "", "Shopping list"));
+    const shop = el("div", "card stack");
+    const head = el("div", "card-head");
+    head.append(el("h3", "", "Shopping list"), button("Dismiss", () => h.onDismissShop(), "ghost small"));
+    shop.append(head);
     const ul = el("ul", "list");
     for (const item of state.shop) {
       const li = document.createElement("li");
@@ -437,7 +448,7 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
   }
 
   // Options / generate form below results.
-  const form = el("div", "card form-grid");
+  const form = el("div", "card form-grid stack");
   form.append(el("h3", "", "Generate meal plan"));
   form.append(
     labeledNumber("Days", state.planDays, (n) => h.onPlanDays(n)),
@@ -503,7 +514,7 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
   main.append(form);
 
   if (state.plans.length) {
-    const saved = el("div", "card");
+    const saved = el("div", "card stack");
     saved.append(el("h3", "", "Saved plans"));
     const list = el("ul", "list");
     for (const p of state.plans) {
@@ -525,7 +536,7 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
 
 function renderImport(main: HTMLElement, state: AppState, h: Handlers): void {
   main.append(pageHeader("Import", ""));
-  const card = el("div", "card form-grid");
+  const card = el("div", "card form-grid stack");
   card.append(el("h3", "", "Import recipes"));
   const sel = document.createElement("select");
   sel.className = "input";

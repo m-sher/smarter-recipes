@@ -74,6 +74,10 @@ test.describe("shell frames (mock data)", () => {
     await page.getByRole("button", { name: "Shopping list" }).click();
     await expect(page.getByText("pasta", { exact: true })).toBeVisible();
     await expect(page).toHaveScreenshot("plan-shop.png", { fullPage: true });
+    // Results are dismissable (plan dismiss also clears shop).
+    await page.getByRole("button", { name: "Dismiss" }).first().click();
+    await expect(page.getByText("Tomato Pasta ★")).toHaveCount(0);
+    await expect(page.getByText("pasta", { exact: true })).toHaveCount(0);
   });
 
   test("import page", async ({ page }) => {
