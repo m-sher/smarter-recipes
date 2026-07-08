@@ -39,8 +39,12 @@ Mock fixtures are deterministic (fixed recipe/pantry rows) so diffs reflect desi
 | Command | Purpose |
 |---------|---------|
 | `get_status` | DB path + recipe/plan/pantry counts |
-| `list_recipes` | Optional title filter |
-| `list_pantry` | On-hand stock |
+| `list_recipes` / `get_recipe` | Browse + detail |
+| `list_pantry` / `pantry_add` / `pantry_remove` | Stock management |
+| `create_plan` / `list_plans` / `get_plan` | Meal planning (uses pantry; optional save) |
+| `shop_plan` | Shopping list for a saved plan |
+
+UI pages: **Home**, **Library** (+ recipe detail), **Pantry** (add/remove), **Plan** (generate, ★ pantry, shop).
 
 ## Layout
 

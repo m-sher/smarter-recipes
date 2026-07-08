@@ -44,3 +44,25 @@ body { min-height: 100vh; }
 .badge { align-self: center; font-size: 0.75rem; padding: 3px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
 .empty { padding: 28px; text-align: center; color: var(--ink-muted); }
 .error { color: var(--danger); background: #fef2f2; border: 1px solid #fecaca; border-radius: 10px; padding: 12px 14px; }
+
+.toolbar { display: flex; gap: 8px; align-items: center; }
+.input { font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: #fff; color: var(--ink); min-width: 0; }
+.input.grow, .toolbar .input { flex: 1; }
+.btn { font: inherit; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: #fff; cursor: pointer; color: var(--ink); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.btn.danger { color: var(--danger); border-color: #fecaca; background: #fef2f2; }
+.btn.ghost { background: transparent; }
+.btn.small { padding: 6px 10px; font-size: 0.85rem; }
+.btn:hover { filter: brightness(0.98); }
+.list.clickable li, .list li.clickable, li.clickable { cursor: pointer; }
+.list li.clickable:hover { border-color: rgb(15 118 110 / 35%); }
+.list.compact li { padding: 8px 10px; }
+.row-actions { display: flex; align-items: center; gap: 8px; }
+.form-grid { display: flex; flex-direction: column; gap: 12px; }
+.field { display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem; }
+.field.check { flex-direction: row; align-items: center; gap: 8px; }
+.day-label { margin: 14px 0 6px; font-weight: 700; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-muted); }
+.rationale { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; background: #faf7f2; border: 1px solid var(--line); border-radius: 10px; padding: 12px; overflow: auto; max-height: 220px; }
+.plain-list { margin: 0; padding-left: 1.2rem; }
+.plain-list.numbered { list-style: decimal; }
+.notice { background: var(--accent-soft); color: var(--accent); border: 1px solid #99f6e4; border-radius: 10px; padding: 12px 14px; }

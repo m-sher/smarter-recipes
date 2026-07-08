@@ -6,7 +6,6 @@ import { test, expect } from "@playwright/test";
  */
 test.describe("shell frames (mock data)", () => {
   test.beforeEach(async ({ page }) => {
-    // Force mock bridge before any app code runs.
     await page.addInitScript(() => {
       (window as unknown as { __SR_MOCK__: boolean }).__SR_MOCK__ = true;
     });
@@ -29,6 +28,16 @@ test.describe("shell frames (mock data)", () => {
     await expect(page).toHaveScreenshot("library.png", { fullPage: true });
   });
 
+  test("recipe detail", async ({ page }) => {
+    await page.goto("/?mock=1");
+    await page.getByRole("button", { name: "Library" }).click();
+    await page.getByText("Tomato Pasta").click();
+    await expect(page.getByRole("heading", { name: "Tomato Pasta" })).toBeVisible();
+    await expect(page.getByText("400 g pasta")).toBeVisible();
+    await expect(page.getByText("Boil pasta.")).toBeVisible();
+    await expect(page).toHaveScreenshot("recipe.png", { fullPage: true });
+  });
+
   test("pantry list", async ({ page }) => {
     await page.goto("/?mock=1");
     await page.getByRole("button", { name: "Pantry" }).click();
@@ -36,5 +45,16 @@ test.describe("shell frames (mock data)", () => {
     await expect(page.getByText("flour")).toBeVisible();
     await expect(page.getByText("500 g")).toBeVisible();
     await expect(page).toHaveScreenshot("pantry.png", { fullPage: true });
+  });
+
+  test("plan page with generated schedule", async ({ page }) => {
+    await page.goto("/?mock=1");
+    await page.getByRole("button", { name: "Plan" }).click();
+    await expect(page.getByRole("heading", { name: "Plan", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Create plan" }).click();
+    await expect(page.getByText("Tomato Pasta ★")).toBeVisible();
+    await expect(page.getByText("Watermelon Cooler")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Rationale" })).toBeVisible();
+    await expect(page).toHaveScreenshot("plan.png", { fullPage: true });
   });
 });
