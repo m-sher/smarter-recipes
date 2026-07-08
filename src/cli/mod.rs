@@ -268,8 +268,8 @@ pub enum Commands {
         /// Skip confirmation when applying more than 100 labels
         #[arg(long)]
         yes: bool,
-        /// Gemini API key (otherwise env)
-        #[arg(long, env = "SMARTER_RECIPES_GEMINI_API_KEY")]
+        /// Gemini API key (else `SMARTER_RECIPES_GEMINI_API_KEY` or `GEMINI_API_KEY`)
+        #[arg(long)]
         api_key: Option<String>,
     },
     /// Track on-hand ingredients (pantry stock)
@@ -1019,7 +1019,7 @@ pub fn run(cli: Cli) -> Result<()> {
             } else {
                 let key = key.expect("key required when needs_network");
                 let labeler = GeminiLabeler::new(key, &model)?;
-                let report = run_categorize(&store, &labeler, &opts)?;
+                let report = run_categorize(&store, &labeler, &opts, eligible, skipped_labeled)?;
                 if apply {
                     println!(
                         "Done: labeled {}, left empty {} (low confidence), \

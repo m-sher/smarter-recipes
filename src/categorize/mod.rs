@@ -2,6 +2,10 @@
 //!
 //! Labels missing `meta.category` values so the plan-time category filter can
 //! keep meals and drop components/drinks. Dry-run by default; `--apply` writes.
+//!
+//! When the model is unsure it returns an empty `categories` list — we leave
+//! `meta.category` unset. With any category filter configured, uncategorized
+//! recipes are excluded from the plan pool (same as blacklisted components).
 
 mod gemini;
 mod prompt;
@@ -208,15 +212,16 @@ fn confirm_apply(n: usize, yes: bool) -> Result<bool> {
 
 /// Run categorize against `store` using `labeler`.
 ///
-/// Progress and diagnostics go to stderr; caller prints the final summary.
+/// `eligible` should come from a single [`select_eligible`] call (caller owns
+/// the preview counts). Progress and diagnostics go to stderr; caller prints
+/// the final summary.
 pub fn run_categorize(
     store: &Store,
     labeler: &dyn CategoryLabeler,
     opts: &CategorizeOptions,
+    mut eligible: Vec<Recipe>,
+    skipped_labeled: usize,
 ) -> Result<CategorizeReport> {
-    let all = store.list_recipes(None)?;
-    let (mut eligible, skipped_labeled) = select_eligible(&all, opts);
-
     let mut report = CategorizeReport {
         eligible: eligible.len(),
         skipped_labeled,
@@ -328,13 +333,7 @@ fn short_id(id: &str) -> String {
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
-    let t: String = s.chars().take(max).collect();
-    if s.chars().count() > max {
-        // pad-ish: just return truncated
-        t
-    } else {
-        t
-    }
+    s.chars().take(max).collect()
 }
 
 #[cfg(test)]
@@ -431,16 +430,14 @@ mod tests {
             map: HashMap::from([("cool-1".into(), vec!["Beverage".into()])]),
             calls: Mutex::new(0),
         };
-        let report = run_categorize(
-            &store,
-            &labeler,
-            &CategorizeOptions {
-                apply: false,
-                sample: 1,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let opts = CategorizeOptions {
+            apply: false,
+            sample: 1,
+            ..Default::default()
+        };
+        let all = store.list_recipes(None).unwrap();
+        let (eligible, skipped) = select_eligible(&all, &opts);
+        let report = run_categorize(&store, &labeler, &opts, eligible, skipped).unwrap();
         assert!(report.dry_run);
         assert_eq!(report.written, 0);
         assert_eq!(*labeler.calls.lock().unwrap(), 1);
@@ -460,17 +457,15 @@ mod tests {
             map: HashMap::from([("cool-1".into(), vec!["Beverage".into()])]),
             calls: Mutex::new(0),
         };
-        let report = run_categorize(
-            &store,
-            &labeler,
-            &CategorizeOptions {
-                apply: true,
-                sample: 0,
-                yes: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let opts = CategorizeOptions {
+            apply: true,
+            sample: 0,
+            yes: true,
+            ..Default::default()
+        };
+        let all = store.list_recipes(None).unwrap();
+        let (eligible, skipped) = select_eligible(&all, &opts);
+        let report = run_categorize(&store, &labeler, &opts, eligible, skipped).unwrap();
         assert_eq!(report.written, 1);
         assert_eq!(report.labeled, 1);
         let loaded = store.get_recipe("cool-1").unwrap().unwrap();
@@ -489,17 +484,15 @@ mod tests {
             map: HashMap::new(),
             calls: Mutex::new(0),
         };
-        let report = run_categorize(
-            &store,
-            &labeler,
-            &CategorizeOptions {
-                apply: true,
-                yes: true,
-                sample: 0,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let opts = CategorizeOptions {
+            apply: true,
+            yes: true,
+            sample: 0,
+            ..Default::default()
+        };
+        let all = store.list_recipes(None).unwrap();
+        let (eligible, skipped) = select_eligible(&all, &opts);
+        let report = run_categorize(&store, &labeler, &opts, eligible, skipped).unwrap();
         assert_eq!(report.left_empty, 1);
         assert_eq!(report.written, 0);
         assert!(store

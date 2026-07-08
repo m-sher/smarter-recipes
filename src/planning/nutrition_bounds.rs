@@ -124,6 +124,15 @@ pub struct CategoryFilter {
     pub blacklist: Vec<String>,
 }
 
+/// Why a recipe was excluded by a non-empty category filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CategoryDrop {
+    /// No category tokens (missing / blank). Suggest re-running `categorize`.
+    NoCategory,
+    /// Has tokens but failed blacklist and/or whitelist.
+    Filtered,
+}
+
 impl CategoryFilter {
     pub fn is_empty(&self) -> bool {
         self.whitelist.is_empty() && self.blacklist.is_empty()
@@ -161,8 +170,13 @@ impl CategoryFilter {
     /// - Blacklist wins: any black token drops the recipe.
     /// - Non-empty whitelist then requires at least one white token.
     pub fn allows(&self, category: Option<&str>) -> bool {
+        self.drop_reason(category).is_none()
+    }
+
+    /// `None` if allowed; otherwise why it was excluded.
+    pub fn drop_reason(&self, category: Option<&str>) -> Option<CategoryDrop> {
         if self.is_empty() {
-            return true;
+            return None;
         }
         let tokens: Vec<String> = category
             .into_iter()
@@ -172,17 +186,19 @@ impl CategoryFilter {
             .collect();
         // Configured filter is strict: no category means we can't classify it.
         if tokens.is_empty() {
-            return false;
+            return Some(CategoryDrop::NoCategory);
         }
         let black = expand_tokens(&self.blacklist);
         if tokens.iter().any(|t| black.contains(t)) {
-            return false;
+            return Some(CategoryDrop::Filtered);
         }
         if !self.whitelist.is_empty() {
             let white = expand_tokens(&self.whitelist);
-            return tokens.iter().any(|t| white.contains(t));
+            if !tokens.iter().any(|t| white.contains(t)) {
+                return Some(CategoryDrop::Filtered);
+            }
         }
-        true
+        None
     }
 }
 
