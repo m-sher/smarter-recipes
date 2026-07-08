@@ -320,6 +320,28 @@ fn net_shortfall_count(reqs: &[RecipeReq], indices: &[usize], pantry: &[PantryIt
     to_buy.len()
 }
 
+/// How many on-hand pantry items the selected recipes actually draw down (fully
+/// or partially) — pantry stock the plan puts to *use*, not merely considered.
+fn pantry_used_count(reqs: &[RecipeReq], indices: &[usize], pantry: &[PantryItem]) -> usize {
+    if pantry.is_empty() {
+        return 0;
+    }
+    let mut stock = pantry.to_vec();
+    let mut to_buy = HashSet::new();
+    for &i in indices {
+        apply_recipe_to_coverage(&mut stock, &mut to_buy, &reqs[i]);
+    }
+    pantry
+        .iter()
+        .filter(|orig| {
+            stock
+                .iter()
+                .find(|s| s.key == orig.key)
+                .is_some_and(|s| orig.quantity_canonical - s.quantity_canonical > EPS)
+        })
+        .count()
+}
+
 fn macros_for(opts: &PlanOptions, id: &RecipeId) -> Macros {
     opts.recipe_macros.get(id).copied().unwrap_or_default()
 }
@@ -818,87 +840,80 @@ pub fn plan_meals(pool: &[Recipe], opts: &PlanOptions) -> MealPlan {
         })
         .collect();
 
-    let excluded_note = {
-        let parts: Vec<String> = [
-            ("category", dropped_by_category),
-            ("no macros", dropped_non_meal),
-            ("low coverage", dropped_low_coverage),
-        ]
-        .into_iter()
-        .filter(|(_, n)| *n > 0)
-        .map(|(label, n)| format!("{label}: {n}"))
-        .collect();
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" Excluded — {}.", parts.join(", "))
-        }
-    };
+    // Summary rendered as a bulleted list (lead line + `• ` items). Substrings
+    // like "N distinct ingredient key(s)", "pantry", "Excluded — …", "Nutrition
+    // constraints satisfied", "slot mismatch", and "partial" are load-bearing for
+    // both the CLI display and the rationale assertions in tests.
+    let mut bullets: Vec<String> = Vec::new();
+    bullets.push(format!("Pool: {} unique recipe(s)", pool.len()));
+    bullets.push(format!("{total_unique} distinct ingredient key(s)"));
 
-    let partial_note = if meals.len() < slots {
-        format!(
-            " Pool has only {} unique non-empty recipe(s); requested {} slot(s), so the plan is partial (repeats are never used).",
+    if !pantry.is_empty() {
+        let used = pantry_used_count(&reqs, selected, pantry);
+        bullets.push(format!(
+            "Pantry: {used} of {} on-hand item(s) used; \
+             {net_unique} key(s) not fully covered by pantry stock",
+            pantry.len()
+        ));
+    }
+
+    let excluded_parts: Vec<String> = [
+        ("category", dropped_by_category),
+        ("no macros", dropped_non_meal),
+        ("low coverage", dropped_low_coverage),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 0)
+    .map(|(label, n)| format!("{label}: {n}"))
+    .collect();
+    if !excluded_parts.is_empty() {
+        bullets.push(format!("Excluded — {}", excluded_parts.join(", ")));
+    }
+
+    if !bounds.is_empty() {
+        if scored.violations.is_empty() {
+            bullets.push("Nutrition constraints satisfied".to_string());
+        } else {
+            bullets.push(format!(
+                "Nutrition constraints not fully met (best effort, {} violation(s))",
+                scored.violations.len()
+            ));
+        }
+    }
+
+    if opts.time_of_day {
+        if scored.tod_misses == 0 {
+            bullets.push("Time-of-day slots matched".to_string());
+        } else {
+            bullets.push(format!(
+                "Time-of-day: {} slot mismatch(es) (best effort)",
+                scored.tod_misses
+            ));
+        }
+    }
+
+    if meals.len() < slots {
+        bullets.push(format!(
+            "Pool has only {} unique non-empty recipe(s); requested {} slot(s), \
+             so the plan is partial (repeats are never used)",
             pool.len(),
             slots
-        )
-    } else {
-        String::new()
-    };
+        ));
+    }
 
-    let pantry_note = if pantry.is_empty() {
-        format!("Plan uses {total_unique} distinct ingredient key(s).")
+    let lead = if !constrained {
+        "Min-union planner"
+    } else if planner_ilp {
+        "Exact ILP planner"
     } else {
-        format!(
-            "Plan uses {total_unique} distinct ingredient key(s) \
-             ({net_unique} not fully covered by pantry stock; {} pantry item(s) considered).",
-            pantry.len()
-        )
+        "Best-effort planner"
     };
-
-    let nutrition_note = if bounds.is_empty() {
-        String::new()
-    } else if scored.violations.is_empty() {
-        " Nutrition constraints satisfied.".to_string()
-    } else {
-        format!(
-            " Nutrition constraints not fully met (best effort, {} violation(s)).",
-            scored.violations.len()
-        )
-    };
-
-    let tod_note = if !opts.time_of_day {
-        String::new()
-    } else if scored.tod_misses == 0 {
-        " Time-of-day slots matched.".to_string()
-    } else {
-        format!(
-            " Time-of-day: {} slot mismatch(es) (best effort).",
-            scored.tod_misses
-        )
-    };
-
-    let rationale = if !constrained {
-        format!(
-            "Min-union planner: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
-             no recipe repeats. {pantry_note}{excluded_note}{nutrition_note}{tod_note}{partial_note}",
-            meals.len(),
-            opts.days,
-            pool.len(),
-        )
-    } else {
-        let lead = if planner_ilp {
-            "Exact ILP planner"
-        } else {
-            "Best-effort planner"
-        };
-        format!(
-            "{lead}: {} meal(s) over {} day(s) from a pool of {} unique recipe(s), \
-             no recipe repeats. {pantry_note}{excluded_note}{nutrition_note}{tod_note}{partial_note}",
-            meals.len(),
-            opts.days,
-            pool.len(),
-        )
-    };
+    let rationale = format!(
+        "{lead}: {} meal(s) over {} day(s), no recipe repeats.\n• {}",
+        meals.len(),
+        opts.days,
+        bullets.join("\n• ")
+    );
 
     MealPlan {
         id: plan_id,
@@ -1363,6 +1378,32 @@ mod tests {
             plan.rationale
         );
         assert_eq!(plan_union_size(&pool, &plan), 4);
+    }
+
+    #[test]
+    fn rationale_reports_pantry_items_used() {
+        // Both stocked items (milk, eggs) are required by the chosen recipes → used;
+        // the stocked saffron is used by neither → not counted as used.
+        let a = rec("Pancakes", &["2 cups flour", "1 cup milk", "2 eggs"]);
+        let b = rec("French Toast", &["4 slices bread", "1 cup milk", "2 eggs"]);
+        let pool = vec![a, b];
+        let pantry = vec![
+            stocked("milk", UnitKind::Volume),
+            stocked("eggs", UnitKind::Count),
+            stocked("saffron", UnitKind::Volume),
+        ];
+        let opts = PlanOptions {
+            days: 2,
+            meals_per_day: 1,
+            pantry,
+            ..Default::default()
+        };
+        let plan = plan_meals(&pool, &opts);
+        assert!(
+            plan.rationale.contains("2 of 3 on-hand item(s) used"),
+            "rationale should report pantry items used: {}",
+            plan.rationale
+        );
     }
 
     #[test]
