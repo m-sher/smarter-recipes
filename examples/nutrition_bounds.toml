@@ -7,7 +7,7 @@ protein_g = { min = 80 }
 ratio = { protein = 40, fat = 30, carb = 30 }
 
 [per_meal]
-# kcal = { min = 100 }
+kcal = { min = 100 }
 
 [plan]
 
@@ -32,6 +32,7 @@ ratio = { protein = 40, fat = 30, carb = 30 }
 [category]
 # whitelist = ["Main Course", "Dinner", "Entree"]
 blacklist = [
+  "Dessert",
   # Sauces / dressings / condiments / dips
   "Sauce",
   "Sauces",

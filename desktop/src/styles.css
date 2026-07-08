@@ -66,3 +66,39 @@ body { min-height: 100vh; }
 .plain-list { margin: 0; padding-left: 1.2rem; }
 .plain-list.numbered { list-style: decimal; }
 .notice { background: var(--accent-soft); color: var(--accent); border: 1px solid #99f6e4; border-radius: 10px; padding: 12px 14px; }
+
+/* Nutrition bounds editor (mirrors nutrition_bounds.toml) */
+.bounds-form { display: flex; flex-direction: column; gap: 10px; }
+.bounds-scope {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  padding: 8px 12px 12px;
+}
+.bounds-scope > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  padding: 4px 0 8px;
+  list-style-position: outside;
+}
+.bounds-grid { display: flex; flex-direction: column; gap: 8px; }
+.bounds-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.2fr) 1fr 1fr;
+  gap: 8px;
+  align-items: center;
+}
+.bounds-row.ratio { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.bounds-label { font-size: 0.82rem; color: var(--ink-muted); margin-bottom: 2px; }
+.bounds-ratio { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.input.textarea {
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+  margin: 4px 0 10px;
+}
+.bounds-grid > .field { min-width: 0; }
+.btn:disabled { opacity: 0.6; cursor: not-allowed; }

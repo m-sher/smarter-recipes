@@ -6,7 +6,8 @@ use smarter_recipes::ingest::{ingest_from, ingest_many};
 use smarter_recipes::normalize::normalize_line;
 use smarter_recipes::nutrition::{recipe_nutrition, source_recipe_macros};
 use smarter_recipes::planning::{
-    load_nutrition_bounds, plan_meals, CliPerDayNutrition, PlanOptions, MIN_INGREDIENT_COVERAGE,
+    load_nutrition_bounds, plan_meals, CliPerDayNutrition, NutritionBounds, PlanOptions,
+    MIN_INGREDIENT_COVERAGE,
 };
 use smarter_recipes::pricing::PackageCatalog;
 use smarter_recipes::shopping::{restock_plan_from_shop, shopping_list_for_plan};
@@ -87,9 +88,20 @@ pub struct CreatePlanArgs {
     pub meals_per_day: u32,
     pub time_of_day: bool,
     pub save: bool,
+    /// Full bounds from the GUI form (preferred base when present).
+    pub bounds: Option<NutritionBounds>,
+    /// Optional TOML path used when `bounds` is None.
     pub nutrition_config: Option<String>,
-    pub min_protein_g: Option<f64>,
+    pub min_kcal: Option<f64>,
     pub max_kcal: Option<f64>,
+    pub min_protein_g: Option<f64>,
+    pub max_protein_g: Option<f64>,
+    pub min_fat_g: Option<f64>,
+    pub max_fat_g: Option<f64>,
+    pub min_carbs_g: Option<f64>,
+    pub max_carbs_g: Option<f64>,
+    /// Restrict pool to recipe ids (full or prefix); empty/None = all.
+    pub pool: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -207,6 +219,11 @@ fn resolve_plan_prefix(
         1 => Ok(matches.into_iter().next().unwrap()),
         n => Err(format!("ambiguous plan id '{id}' ({n} matches)")),
     }
+}
+
+/// True when form bounds carry neither macro constraints nor category filter.
+fn bounds_effectively_empty(b: &NutritionBounds) -> bool {
+    b.is_empty() && b.category.is_empty()
 }
 
 fn nutrition_extra(store: &Store) -> HashMap<String, Macros> {
@@ -388,53 +405,145 @@ fn get_plan(state: State<'_, AppState>, id: String) -> Result<PlanView, String> 
 }
 
 #[tauri::command]
-fn create_plan(state: State<'_, AppState>, args: CreatePlanArgs) -> Result<PlanView, String> {
+async fn create_plan(state: State<'_, AppState>, args: CreatePlanArgs) -> Result<PlanView, String> {
     if args.days == 0 || args.meals_per_day == 0 {
         return Err("days and meals_per_day must be >= 1".into());
     }
-    let store = state.store.lock().map_err(|_| "database lock poisoned")?;
-    let recipes = store.list_recipes(None).map_err(|e| e.to_string())?;
+
+    // Snapshot under a short lock — never run the planner while holding the
+    // store mutex (ILP/multi-start can take minutes on multi-thousand catalogs).
+    let (mut recipes, pantry, extra) = {
+        let store = state.store.lock().map_err(|_| "database lock poisoned")?;
+        let recipes = store.list_recipes(None).map_err(|e| e.to_string())?;
+        let pantry = store.list_pantry().map_err(|e| e.to_string())?;
+        let extra = nutrition_extra(&store);
+        (recipes, pantry, extra)
+    };
+
     if recipes.is_empty() {
         return Err("recipe pool is empty; import recipes first".into());
     }
-    let pantry = store.list_pantry().map_err(|e| e.to_string())?;
+
+    if let Some(pool) = &args.pool {
+        if !pool.is_empty() {
+            recipes.retain(|r| {
+                pool.iter()
+                    .any(|p| r.id.as_str() == p || r.id.as_str().starts_with(p.as_str()))
+            });
+            if recipes.is_empty() {
+                return Err("no recipes match the selected pool".into());
+            }
+        }
+    }
+
+    // Prefer non-empty form bounds (macros or category). If the form is empty
+    // but a TOML path is set, load that — same as CLI `--nutrition-config`.
+    let mut nutrition = {
+        let path = args
+            .nutrition_config
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let form = args.bounds.clone();
+        let form_empty = form.as_ref().map(bounds_effectively_empty).unwrap_or(true);
+        if let Some(b) = form.filter(|_| !form_empty) {
+            b
+        } else if path.is_some() {
+            load_nutrition_bounds(path.as_deref(), &CliPerDayNutrition::default())
+                .map_err(|e| format!("nutrition config: {e:#}"))?
+        } else {
+            NutritionBounds::default()
+        }
+    };
 
     let cli_nutrition = CliPerDayNutrition {
-        min_kcal: None,
+        min_kcal: args.min_kcal,
         max_kcal: args.max_kcal,
         min_protein_g: args.min_protein_g,
-        max_protein_g: None,
-        min_fat_g: None,
-        max_fat_g: None,
-        min_carbs_g: None,
-        max_carbs_g: None,
+        max_protein_g: args.max_protein_g,
+        min_fat_g: args.min_fat_g,
+        max_fat_g: args.max_fat_g,
+        min_carbs_g: args.min_carbs_g,
+        max_carbs_g: args.max_carbs_g,
     };
-    let nutrition_path = args
-        .nutrition_config
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-    let nutrition = load_nutrition_bounds(nutrition_path.as_deref(), &cli_nutrition)
-        .map_err(|e| format!("nutrition config: {e:#}"))?;
+    nutrition.merge_cli_per_day(&cli_nutrition);
+    nutrition
+        .validate()
+        .map_err(|e| format!("nutrition bounds invalid: {e:#}"))?;
 
-    let extra = nutrition_extra(&store);
-    let (recipe_macros, recipe_low_coverage) = recipe_macros_for_pool(&recipes, &extra);
+    let days = args.days;
+    let meals_per_day = args.meals_per_day;
+    let time_of_day = args.time_of_day;
+    let save = args.save;
 
-    let opts = PlanOptions {
-        days: args.days,
-        meals_per_day: args.meals_per_day,
-        pantry,
-        nutrition,
-        recipe_macros,
-        recipe_low_coverage,
-        time_of_day: args.time_of_day,
-    };
-    let plan = plan_meals(&recipes, &opts);
-    if args.save {
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        let (recipe_macros, recipe_low_coverage) = recipe_macros_for_pool(&recipes, &extra);
+        let opts = PlanOptions {
+            days,
+            meals_per_day,
+            pantry,
+            nutrition,
+            recipe_macros,
+            recipe_low_coverage,
+            time_of_day,
+        };
+        plan_meals(&recipes, &opts)
+    })
+    .await
+    .map_err(|e| format!("plan task failed: {e}"))?;
+
+    if save {
+        let store = state.store.lock().map_err(|_| "database lock poisoned")?;
         store.save_plan(&plan).map_err(|e| e.to_string())?;
     }
     Ok(plan_to_view(&plan))
+}
+
+#[tauri::command]
+fn load_nutrition_config(path: String) -> Result<NutritionBounds, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("path required".into());
+    }
+    NutritionBounds::from_toml_path(PathBuf::from(path).as_path())
+        .map_err(|e| format!("load nutrition config: {e:#}"))
+}
+
+#[tauri::command]
+fn parse_nutrition_toml(text: String) -> Result<NutritionBounds, String> {
+    NutritionBounds::from_toml_str(&text).map_err(|e| format!("parse nutrition TOML: {e:#}"))
+}
+
+#[tauri::command]
+fn default_nutrition_bounds() -> NutritionBounds {
+    NutritionBounds::default()
+}
+
+#[tauri::command]
+fn nutrition_bounds_to_toml(bounds: NutritionBounds) -> Result<String, String> {
+    bounds
+        .validate()
+        .map_err(|e| format!("invalid bounds: {e:#}"))?;
+    bounds
+        .to_toml_string()
+        .map_err(|e| format!("serialize TOML: {e:#}"))
+}
+
+#[tauri::command]
+fn save_nutrition_config(path: String, bounds: NutritionBounds) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("path required".into());
+    }
+    bounds
+        .validate()
+        .map_err(|e| format!("invalid bounds: {e:#}"))?;
+    let text = bounds
+        .to_toml_string()
+        .map_err(|e| format!("serialize TOML: {e:#}"))?;
+    std::fs::write(path, text).map_err(|e| format!("write {path}: {e}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -473,26 +582,42 @@ fn restock_plan(state: State<'_, AppState>, id: String) -> Result<RestockResult,
 }
 
 #[tauri::command]
-fn import_source(
+async fn import_source(
     state: State<'_, AppState>,
     source: String,
     input: String,
 ) -> Result<ImportResult, String> {
-    let input = input.trim();
+    let input = input.trim().to_string();
     if input.is_empty() {
         return Err("path or URL required".into());
     }
     let source = source.trim().to_lowercase();
-    let batch = if source == "epub" || source == "ebook" || (source == "auto" && input.ends_with(".epub")) {
-        ingest_many(&source, input).map_err(|e| e.to_string())?
-    } else {
-        let r = ingest_from(if source.is_empty() { "auto" } else { &source }, input)
-            .map_err(|e| e.to_string())?;
-        smarter_recipes::ingest::IngestBatch {
-            recipes: vec![r],
-            skipped_ambiguous: Vec::new(),
+    let source_owned = source.clone();
+    let input_owned = input.clone();
+
+    // Ingest off the async runtime (EPUB/network can be slow).
+    let batch = tauri::async_runtime::spawn_blocking(move || {
+        if source_owned == "epub"
+            || source_owned == "ebook"
+            || (source_owned == "auto" && input_owned.ends_with(".epub"))
+        {
+            ingest_many(&source_owned, &input_owned).map_err(|e| e.to_string())
+        } else {
+            let kind = if source_owned.is_empty() {
+                "auto"
+            } else {
+                source_owned.as_str()
+            };
+            let r = ingest_from(kind, &input_owned).map_err(|e| e.to_string())?;
+            Ok(smarter_recipes::ingest::IngestBatch {
+                recipes: vec![r],
+                skipped_ambiguous: Vec::new(),
+            })
         }
-    };
+    })
+    .await
+    .map_err(|e| format!("import task failed: {e}"))??;
+
     if batch.recipes.is_empty() {
         return Err("no recipes ingested".into());
     }
@@ -556,6 +681,11 @@ pub fn run() {
             list_plans,
             get_plan,
             create_plan,
+            load_nutrition_config,
+            parse_nutrition_toml,
+            default_nutrition_bounds,
+            nutrition_bounds_to_toml,
+            save_nutrition_config,
             shop_plan,
             restock_plan,
             import_source,

@@ -2,11 +2,11 @@
 
 use crate::domain::Macros;
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// One optional min/max pair for a single macro nutrient.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct MacroRange {
     pub min: Option<f64>,
     pub max: Option<f64>,
@@ -45,7 +45,7 @@ pub const DEFAULT_RATIO_TOLERANCE: f64 = 5.0;
 /// (`protein_g + fat_g + carbs_g`). Each share is optional and independent; a
 /// share is satisfied when the actual share is within `tolerance` percentage
 /// points of the target.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct MacroRatio {
     pub protein: Option<f64>,
     pub fat: Option<f64>,
@@ -110,7 +110,7 @@ fn expand_tokens(list: &[String]) -> Vec<String> {
 /// normalized key). Whenever either list is non-empty, recipes with **no**
 /// category tokens are excluded (same strictness as a non-empty whitelist).
 /// Not counted by [`NutritionBounds::is_empty`].
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CategoryFilter {
     /// When non-empty, ONLY recipes whose category matches one of these are
     /// eligible. Uncategorized recipes are excluded whenever any filter list
@@ -203,7 +203,7 @@ impl CategoryFilter {
 }
 
 /// Min/max ranges for all tracked macros, plus an optional target macro split.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MacroBounds {
     #[serde(default)]
     pub kcal: MacroRange,
@@ -238,7 +238,7 @@ impl MacroBounds {
 
 /// Full constraint set: per-day, per-meal, and whole-plan scopes, plus an
 /// optional category-based pool filter.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NutritionBounds {
     #[serde(default)]
     pub per_day: MacroBounds,
@@ -278,6 +278,11 @@ impl NutritionBounds {
             .with_context(|| format!("reading nutrition config {}", path.display()))?;
         Self::from_toml_str(&text)
             .with_context(|| format!("invalid nutrition config {}", path.display()))
+    }
+
+    /// Serialize to TOML for GUI save / round-trip.
+    pub fn to_toml_string(&self) -> Result<String> {
+        toml::to_string_pretty(self).context("serializing nutrition bounds to TOML")
     }
 
     /// Overlay CLI per-day flags. Only `Some` fields replace file values.

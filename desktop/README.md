@@ -9,7 +9,7 @@ Tauri 2 + Vite desktop shell over the existing `smarter_recipes` library and SQL
 | **Home** | DB path, recipe / plan / pantry counts |
 | **Library** | Search, open recipe detail, delete |
 | **Pantry** | List, add free-text stock, remove |
-| **Plan** | Days/meals/TOD, optional nutrition TOML + protein/kcal, create & save, open saved, ★ pantry meals, shop list, restock |
+| **Plan** | Days/meals/TOD/save; full `nutrition_bounds.toml` editor (per_day / per_meal / plan min-max + ratio, category whitelist/blacklist); Load/Save TOML path; CLI per-day overlays (`min/max` kcal·protein·fat·carbs); optional recipe pool; async plan (UI stays responsive); open saved; ★ pantry meals; shop; restock |
 | **Import** | `auto` / `file` / `url` / `epub` ingest (same pipeline as CLI) |
 
 ## Prerequisites

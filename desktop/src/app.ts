@@ -8,6 +8,8 @@ import type {
   RecipeSummary,
   ShopItemView,
 } from "./bridge";
+import { boundsForm, emptyBounds, type BoundsForm } from "./nutrition-form";
+import type { NutritionBounds } from "./bridge";
 
 export type Page = "home" | "library" | "pantry" | "plan" | "recipe" | "import";
 
@@ -25,8 +27,18 @@ export type AppState = {
   planTod: boolean;
   planSave: boolean;
   nutritionConfig: string;
+  nutritionBounds: NutritionBounds;
+  showBoundsEditor: boolean;
   minProtein: string;
   maxKcal: string;
+  minKcal: string;
+  maxProtein: string;
+  minFat: string;
+  maxFat: string;
+  minCarbs: string;
+  maxCarbs: string;
+  /** Comma-separated recipe id prefixes (CLI --pool). Empty = all. */
+  pool: string;
   pantryLine: string;
   libraryFilter: string;
   importSource: string;
@@ -46,8 +58,18 @@ export type Handlers = {
   onPlanTod: (v: boolean) => void;
   onPlanSave: (v: boolean) => void;
   onNutritionConfig: (v: string) => void;
-  onMinProtein: (v: string) => void;
+  onLoadNutritionConfig: () => void;
+  onSaveNutritionConfig: () => void;
+  onMinKcal: (v: string) => void;
   onMaxKcal: (v: string) => void;
+  onMinProtein: (v: string) => void;
+  onMaxProtein: (v: string) => void;
+  onMinFat: (v: string) => void;
+  onMaxFat: (v: string) => void;
+  onMinCarbs: (v: string) => void;
+  onMaxCarbs: (v: string) => void;
+  onPool: (v: string) => void;
+  onReadBounds: () => NutritionBounds;
   onCreatePlan: () => void;
   onOpenPlan: (id: string) => void;
   onShop: () => void;
@@ -77,8 +99,17 @@ export function initialState(): AppState {
     planTod: false,
     planSave: true,
     nutritionConfig: "",
+    nutritionBounds: emptyBounds(),
+    showBoundsEditor: true,
     minProtein: "",
     maxKcal: "",
+    minKcal: "",
+    maxProtein: "",
+    minFat: "",
+    maxFat: "",
+    minCarbs: "",
+    maxCarbs: "",
+    pool: "",
     pantryLine: "",
     libraryFilter: "",
     importSource: "auto",
@@ -92,6 +123,24 @@ export function initialState(): AppState {
 
 function shortId(id: string): string {
   return id.slice(0, 8);
+}
+
+/** Survives re-renders so focus is not lost while editing bounds. */
+let planBoundsForm: BoundsForm | null = null;
+
+export function clearPlanBoundsForm(): void {
+  planBoundsForm = null;
+}
+
+export function ensurePlanBoundsForm(initial: NutritionBounds): BoundsForm {
+  if (!planBoundsForm) {
+    planBoundsForm = boundsForm(initial, () => {});
+  }
+  return planBoundsForm;
+}
+
+export function setPlanBoundsForm(b: NutritionBounds): void {
+  ensurePlanBoundsForm(b).set(b);
 }
 
 export function render(root: HTMLElement, state: AppState, h: Handlers): void {
@@ -301,12 +350,62 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
     labeledCheck("Time-of-day steering", state.planTod, (v) => h.onPlanTod(v)),
     labeledCheck("Save plan to database", state.planSave, (v) => h.onPlanSave(v)),
   );
-  form.append(
-    labeledText("Nutrition TOML path (optional)", state.nutritionConfig, (v) => h.onNutritionConfig(v), "examples/nutrition_bounds.toml"),
-    labeledText("Min protein g/day (optional)", state.minProtein, (v) => h.onMinProtein(v), "80"),
-    labeledText("Max kcal/day (optional)", state.maxKcal, (v) => h.onMaxKcal(v), "2500"),
+  // TOML path + load/save
+  const pathRow = el("div", "toolbar");
+  const pathInput = document.createElement("input");
+  pathInput.type = "text";
+  pathInput.className = "input grow";
+  pathInput.placeholder = "Path to nutrition_bounds.toml";
+  pathInput.value = state.nutritionConfig;
+  pathInput.addEventListener("input", () => h.onNutritionConfig(pathInput.value));
+  pathRow.append(
+    pathInput,
+    button("Load TOML", () => h.onLoadNutritionConfig()),
+    button("Save TOML", () => h.onSaveNutritionConfig()),
   );
-  form.append(button(state.busy ? "Planning…" : "Create plan", () => h.onCreatePlan(), "primary"));
+  form.append(pathRow);
+
+  // Full bounds editor (all scopes + category) — same as CLI/TOML
+  const bf = ensurePlanBoundsForm(state.nutritionBounds);
+  form.append(el("h3", "", "Nutrition bounds (full)"));
+  form.append(
+    el(
+      "p",
+      "muted",
+      "Matches nutrition_bounds.toml: per_day / per_meal / plan min-max + ratio, and category whitelist/blacklist. Empty fields = unconstrained.",
+    ),
+  );
+  form.append(bf.root);
+
+  // CLI-style per-day overlays (applied on top of the form/TOML)
+  form.append(el("h3", "", "Per-day CLI overlays (optional)"));
+  form.append(
+    el("p", "muted", "Same as CLI --min-kcal / --max-protein-g etc. Override the form for per_day only."),
+  );
+  const overlay = el("div", "bounds-grid");
+  overlay.append(
+    overlayField("min kcal", state.minKcal, h.onMinKcal),
+    overlayField("max kcal", state.maxKcal, h.onMaxKcal),
+    overlayField("min protein g", state.minProtein, h.onMinProtein),
+    overlayField("max protein g", state.maxProtein, h.onMaxProtein),
+    overlayField("min fat g", state.minFat, h.onMinFat),
+    overlayField("max fat g", state.maxFat, h.onMaxFat),
+    overlayField("min carbs g", state.minCarbs, h.onMinCarbs),
+    overlayField("max carbs g", state.maxCarbs, h.onMaxCarbs),
+  );
+  form.append(overlay);
+
+  form.append(el("h3", "", "Recipe pool (optional)"));
+  form.append(
+    el("p", "muted", "Same as CLI --pool: comma-separated recipe id prefixes. Empty = entire library."),
+  );
+  form.append(
+    labeledText("Pool", state.pool, (v) => h.onPool(v), "id1,id2,…"),
+  );
+
+  const createBtn = button(state.busy ? "Planning… (UI stays responsive)" : "Create plan", () => h.onCreatePlan(), "primary");
+  if (state.busy) createBtn.disabled = true;
+  form.append(createBtn);
   main.append(form);
 
   if (state.plans.length) {
@@ -494,6 +593,19 @@ function labeledNumber(label: string, value: number, onChange: (n: number) => vo
   input.value = String(value);
   input.className = "input";
   input.addEventListener("change", () => onChange(Math.max(1, Number(input.value) || 1)));
+  wrap.append(input);
+  return wrap;
+}
+
+function overlayField(label: string, value: string, onChange: (v: string) => void): HTMLElement {
+  const wrap = el("label", "field");
+  wrap.append(el("span", "", label));
+  const input = document.createElement("input");
+  input.type = "number";
+  input.step = "any";
+  input.value = value;
+  input.className = "input";
+  input.addEventListener("input", () => onChange(input.value));
   wrap.append(input);
   return wrap;
 }

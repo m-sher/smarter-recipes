@@ -55,14 +55,48 @@ export type PlanSummary = {
   meal_count: number;
 };
 
+
+export type MacroRange = { min?: number | null; max?: number | null };
+export type MacroRatio = {
+  protein?: number | null;
+  fat?: number | null;
+  carb?: number | null;
+  tolerance?: number | null;
+};
+export type MacroBounds = {
+  kcal?: MacroRange;
+  protein_g?: MacroRange;
+  fat_g?: MacroRange;
+  carbs_g?: MacroRange;
+  ratio?: MacroRatio;
+};
+export type CategoryFilter = {
+  whitelist?: string[];
+  blacklist?: string[];
+};
+export type NutritionBounds = {
+  per_day?: MacroBounds;
+  per_meal?: MacroBounds;
+  plan?: MacroBounds;
+  category?: CategoryFilter;
+};
+
 export type CreatePlanArgs = {
   days: number;
   meals_per_day: number;
   time_of_day: boolean;
   save: boolean;
+  bounds?: NutritionBounds | null;
   nutrition_config?: string | null;
-  min_protein_g?: number | null;
+  min_kcal?: number | null;
   max_kcal?: number | null;
+  min_protein_g?: number | null;
+  max_protein_g?: number | null;
+  min_fat_g?: number | null;
+  max_fat_g?: number | null;
+  min_carbs_g?: number | null;
+  max_carbs_g?: number | null;
+  pool?: string[] | null;
 };
 
 export type ShopItemView = {
@@ -95,6 +129,11 @@ export type Api = {
   listPlans: () => Promise<PlanSummary[]>;
   getPlan: (id: string) => Promise<PlanView>;
   createPlan: (args: CreatePlanArgs) => Promise<PlanView>;
+  loadNutritionConfig: (path: string) => Promise<NutritionBounds>;
+  parseNutritionToml: (text: string) => Promise<NutritionBounds>;
+  defaultNutritionBounds: () => Promise<NutritionBounds>;
+  nutritionBoundsToToml: (bounds: NutritionBounds) => Promise<string>;
+  saveNutritionConfig: (path: string, bounds: NutritionBounds) => Promise<void>;
   shopPlan: (id: string) => Promise<ShopItemView[]>;
   restockPlan: (id: string) => Promise<RestockResult>;
   importSource: (source: string, input: string) => Promise<ImportResult>;
@@ -240,6 +279,20 @@ function mockApi(): Api {
       }
       return plan;
     },
+    loadNutritionConfig: async () => ({
+      per_day: {
+        kcal: { min: 800, max: 1500 },
+        protein_g: { min: 80 },
+        ratio: { protein: 40, fat: 30, carb: 30, tolerance: 5 },
+      },
+      per_meal: { kcal: { min: 100 } },
+      plan: {},
+      category: { blacklist: ["Sauce", "Dressing", "Dessert"], whitelist: [] },
+    }),
+    parseNutritionToml: async () => ({ per_day: {}, per_meal: {}, plan: {}, category: { whitelist: [], blacklist: [] } }),
+    defaultNutritionBounds: async () => ({ per_day: {}, per_meal: {}, plan: {}, category: { whitelist: [], blacklist: [] } }),
+    nutritionBoundsToToml: async () => "# empty bounds\n",
+    saveNutritionConfig: async () => {},
     shopPlan: async () => structuredClone(MOCK_SHOP),
     restockPlan: async () => ({
       additions: 2,
@@ -267,6 +320,12 @@ export function createApi(): Api {
     listPlans: () => tauriInvoke("list_plans"),
     getPlan: (id) => tauriInvoke("get_plan", { id }),
     createPlan: (args) => tauriInvoke("create_plan", { args }),
+    loadNutritionConfig: (path) => tauriInvoke("load_nutrition_config", { path }),
+    parseNutritionToml: (text) => tauriInvoke("parse_nutrition_toml", { text }),
+    defaultNutritionBounds: () => tauriInvoke("default_nutrition_bounds"),
+    nutritionBoundsToToml: (bounds) => tauriInvoke("nutrition_bounds_to_toml", { bounds }),
+    saveNutritionConfig: (path, bounds) =>
+      tauriInvoke("save_nutrition_config", { path, bounds }),
     shopPlan: (id) => tauriInvoke("shop_plan", { id }),
     restockPlan: (id) => tauriInvoke("restock_plan", { id }),
     importSource: (source, input) => tauriInvoke("import_source", { source, input }),

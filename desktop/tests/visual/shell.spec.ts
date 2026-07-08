@@ -44,6 +44,15 @@ test.describe("shell frames (mock data)", () => {
     await page.goto("/?mock=1");
     await page.getByRole("button", { name: "Plan" }).click();
     await expect(page.getByRole("heading", { name: "Plan", exact: true })).toBeVisible();
+    // Full CLI/TOML nutrition surface
+    await expect(page.getByText("Nutrition bounds (full)")).toBeVisible();
+    await expect(page.getByText("Per day")).toBeVisible();
+    await expect(page.getByText("Per meal")).toBeVisible();
+    await expect(page.getByText("Whole plan")).toBeVisible();
+    await expect(page.getByText("Category filter")).toBeVisible();
+    await expect(page.getByText("Per-day CLI overlays (optional)")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Load TOML" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save TOML" })).toBeVisible();
     await page.getByRole("button", { name: "Create plan" }).click();
     await expect(page.getByText("Tomato Pasta ★")).toBeVisible();
     await page.getByRole("button", { name: "Shopping list" }).click();
