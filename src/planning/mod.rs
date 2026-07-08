@@ -1814,7 +1814,8 @@ mod tests {
     fn category_blacklist_excludes_component_from_plan() {
         let mut sauce = rec("Tahini Sauce", &["1/2 cup tahini", "2 tbsp lemon juice"]);
         sauce.meta.category = Some("Sauce".into());
-        let meal = rec("Grilled Chicken", &["2 chicken breasts", "1 tbsp oil"]);
+        let mut meal = rec("Grilled Chicken", &["2 chicken breasts", "1 tbsp oil"]);
+        meal.meta.category = Some("Main Course".into());
         let bounds = NutritionBounds {
             category: CategoryFilter {
                 blacklist: vec!["Sauce".into()],
@@ -1824,6 +1825,35 @@ mod tests {
         };
         let plan = plan_meals(
             &[sauce, meal],
+            &PlanOptions {
+                days: 2,
+                meals_per_day: 1,
+                nutrition: bounds,
+                ..Default::default()
+            },
+        );
+        assert_eq!(titles(&plan), vec!["Grilled Chicken"]);
+        assert!(
+            plan.rationale.to_lowercase().contains("category"),
+            "rationale should note the category exclusion: {}",
+            plan.rationale
+        );
+    }
+
+    #[test]
+    fn category_blacklist_excludes_uncategorized_from_plan() {
+        let drink = rec("Watermelon Cooler", &["1 cup watermelon", "1 cup lemonade"]);
+        let mut meal = rec("Grilled Chicken", &["2 chicken breasts", "1 tbsp oil"]);
+        meal.meta.category = Some("Dinner".into());
+        let bounds = NutritionBounds {
+            category: CategoryFilter {
+                blacklist: vec!["Sauce".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = plan_meals(
+            &[drink, meal],
             &PlanOptions {
                 days: 2,
                 meals_per_day: 1,
