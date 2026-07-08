@@ -44,12 +44,22 @@ test.describe("shell frames (mock data)", () => {
     await page.goto("/?mock=1");
     await page.getByRole("button", { name: "Plan" }).click();
     await expect(page.getByRole("heading", { name: "Plan", exact: true })).toBeVisible();
+    // Outer sections default closed; nested scopes stay closed until expanded.
     await expect(page.getByText("Nutrition bounds")).toBeVisible();
+    await expect(page.getByText("Per-day overrides")).toBeVisible();
+    await expect(page.getByText("Recipe pool")).toBeVisible();
+    // Bodies exist in the DOM but must not be visible while collapsed.
+    await expect(page.getByText("Calories (kcal)").first()).toBeHidden();
+    await page.getByText("Nutrition bounds").click();
     await expect(page.getByText("Per day")).toBeVisible();
     await expect(page.getByText("Per meal")).toBeVisible();
     await expect(page.getByText("Whole plan")).toBeVisible();
     await expect(page.getByText("Category filter")).toBeVisible();
-    await expect(page.getByText("Per-day overrides")).toBeVisible();
+    await expect(page.getByText("Calories (kcal)").first()).toBeHidden();
+    await page.getByText("Per day").click();
+    await expect(page.getByText("Calories (kcal)").first()).toBeVisible();
+    await page.getByText("Per day").click(); // re-collapse
+    await expect(page.getByText("Calories (kcal)").first()).toBeHidden();
     await expect(page.getByRole("button", { name: "Load" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Save", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Create plan" }).click();

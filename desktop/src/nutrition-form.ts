@@ -50,7 +50,8 @@ export function scopeEditor(
 ): { root: HTMLElement; read: () => MacroBounds } {
   const root = document.createElement("details");
   root.className = "bounds-scope";
-  root.open = true;
+  // Default collapsed — open only when the user expands.
+  root.open = false;
   const sum = document.createElement("summary");
   sum.textContent = title;
   root.append(sum);
@@ -152,10 +153,12 @@ export function boundsForm(
 
   const cat = document.createElement("details");
   cat.className = "bounds-scope";
-  cat.open = true;
+  cat.open = false;
   const catSum = document.createElement("summary");
   catSum.textContent = "Category filter";
   cat.append(catSum);
+  const catBody = document.createElement("div");
+  catBody.className = "bounds-scope-body";
   const white = document.createElement("textarea");
   white.className = "input textarea";
   white.placeholder = "One per line or comma-separated";
@@ -166,7 +169,8 @@ export function boundsForm(
   black.placeholder = "One per line or comma-separated";
   black.value = (initial.category?.blacklist ?? []).join("\n");
   black.addEventListener("input", onChange);
-  cat.append(labelEl("Whitelist"), white, labelEl("Blacklist"), black);
+  catBody.append(labelEl("Whitelist"), white, labelEl("Blacklist"), black);
+  cat.append(catBody);
 
   function rebuild(b: NutritionBounds): void {
     root.innerHTML = "";
@@ -175,6 +179,7 @@ export function boundsForm(
     plan = scopeEditor("Whole plan", b.plan, onChange);
     white.value = (b.category?.whitelist ?? []).join("\n");
     black.value = (b.category?.blacklist ?? []).join("\n");
+    // Keep category closed on reload unless the user had it open.
     root.append(day.root, meal.root, plan.root, cat);
   }
 

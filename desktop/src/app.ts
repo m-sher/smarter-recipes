@@ -371,9 +371,14 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
       }
       card.append(ul);
     }
+    const ratDetails = el("details", "bounds-scope") as HTMLDetailsElement;
+    ratDetails.open = false;
+    const ratSum = document.createElement("summary");
+    ratSum.textContent = "Rationale";
     const rat = el("pre", "rationale");
     rat.textContent = plan.rationale;
-    card.append(el("h3", "", "Rationale"), rat);
+    ratDetails.append(ratSum, rat);
+    card.append(ratDetails);
     const actions = el("div", "toolbar");
     actions.append(
       button("Shopping list", () => h.onShop(), "primary"),
@@ -431,26 +436,35 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
   form.append(pathRow);
 
   const bf = ensurePlanBoundsForm(state.nutritionBounds);
-  form.append(el("h3", "", "Nutrition bounds"));
-  form.append(bf.root);
-
-  form.append(el("h3", "", "Per-day overrides"));
-  const overlay = el("div", "bounds-grid");
-  overlay.append(
-    overlayField("min kcal", state.minKcal, h.onMinKcal),
-    overlayField("max kcal", state.maxKcal, h.onMaxKcal),
-    overlayField("min protein g", state.minProtein, h.onMinProtein),
-    overlayField("max protein g", state.maxProtein, h.onMaxProtein),
-    overlayField("min fat g", state.minFat, h.onMinFat),
-    overlayField("max fat g", state.maxFat, h.onMaxFat),
-    overlayField("min carbs g", state.minCarbs, h.onMinCarbs),
-    overlayField("max carbs g", state.maxCarbs, h.onMaxCarbs),
-  );
-  form.append(overlay);
-
-  form.append(el("h3", "", "Recipe pool"));
   form.append(
-    labeledText("Recipe ids", state.pool, (v) => h.onPool(v), "Leave empty for all"),
+    collapsible("Nutrition bounds", false, (body) => {
+      body.append(bf.root);
+    }),
+  );
+
+  form.append(
+    collapsible("Per-day overrides", false, (body) => {
+      const overlay = el("div", "bounds-grid");
+      overlay.append(
+        overlayField("min kcal", state.minKcal, h.onMinKcal),
+        overlayField("max kcal", state.maxKcal, h.onMaxKcal),
+        overlayField("min protein g", state.minProtein, h.onMinProtein),
+        overlayField("max protein g", state.maxProtein, h.onMaxProtein),
+        overlayField("min fat g", state.minFat, h.onMinFat),
+        overlayField("max fat g", state.maxFat, h.onMaxFat),
+        overlayField("min carbs g", state.minCarbs, h.onMinCarbs),
+        overlayField("max carbs g", state.maxCarbs, h.onMaxCarbs),
+      );
+      body.append(overlay);
+    }),
+  );
+
+  form.append(
+    collapsible("Recipe pool", false, (body) => {
+      body.append(
+        labeledText("Recipe ids", state.pool, (v) => h.onPool(v), "Leave empty for all"),
+      );
+    }),
   );
 
   const createBtn = button(state.busy ? "Creating…" : "Create plan", () => h.onCreatePlan(), "primary");
@@ -619,4 +633,21 @@ function labeledCheck(label: string, value: boolean, onChange: (v: boolean) => v
   input.addEventListener("change", () => onChange(input.checked));
   wrap.append(input, el("span", "", label));
   return wrap;
+}
+
+/** Collapsible block; defaults closed unless `open` is true. */
+function collapsible(
+  title: string,
+  open: boolean,
+  build: (body: HTMLElement) => void,
+): HTMLDetailsElement {
+  const d = document.createElement("details");
+  d.className = "bounds-scope";
+  d.open = open;
+  const sum = document.createElement("summary");
+  sum.textContent = title;
+  const body = el("div", "bounds-scope-body");
+  build(body);
+  d.append(sum, body);
+  return d;
 }

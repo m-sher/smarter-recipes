@@ -62,26 +62,64 @@ body { min-height: 100vh; }
 .field { display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem; }
 .field.check { flex-direction: row; align-items: center; gap: 8px; }
 .day-label { margin: 14px 0 6px; font-weight: 700; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-muted); }
-.rationale { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; background: #faf7f2; border: 1px solid var(--line); border-radius: 10px; padding: 12px; overflow: auto; max-height: 220px; }
+.rationale {
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+  background: #faf7f2;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  overflow: auto;
+  max-height: 220px;
+  margin: 0;
+}
 .plain-list { margin: 0; padding-left: 1.2rem; }
 .plain-list.numbered { list-style: decimal; }
 .notice { background: var(--accent-soft); color: var(--accent); border: 1px solid #99f6e4; border-radius: 10px; padding: 12px 14px; }
 
-/* Nutrition bounds editor (mirrors nutrition_bounds.toml) */
-.bounds-form { display: flex; flex-direction: column; gap: 10px; }
+/* Nutrition bounds editor */
+.bounds-form { display: flex; flex-direction: column; gap: 8px; }
 .bounds-scope {
   border: 1px solid var(--line);
   border-radius: 10px;
   background: #fff;
-  padding: 8px 12px 12px;
+  /* No padding on the details shell — padding lives on summary/body so
+     collapsed state cannot leak a sliver of body content. */
+  padding: 0;
+  overflow: hidden;
 }
 .bounds-scope > summary {
   cursor: pointer;
   font-weight: 600;
   font-size: 0.9rem;
-  padding: 4px 0 8px;
-  list-style-position: outside;
+  padding: 10px 12px;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  user-select: none;
+  /* Reset browser marker so we own the chevron layout. */
 }
+.bounds-scope > summary::-webkit-details-marker { display: none; }
+.bounds-scope > summary::marker { content: ""; }
+.bounds-scope > summary::before {
+  content: "▸";
+  flex: 0 0 auto;
+  width: 1em;
+  color: var(--ink-muted);
+  font-size: 0.85em;
+  line-height: 1;
+}
+.bounds-scope[open] > summary::before { content: "▾"; }
+/* Body of a details block (everything except the summary). */
+.bounds-scope > :not(summary) {
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--line);
+  margin: 0;
+  box-sizing: border-box;
+}
+.bounds-scope-body { display: flex; flex-direction: column; gap: 4px; }
 .bounds-grid { display: flex; flex-direction: column; gap: 8px; }
 .bounds-row {
   display: grid;
