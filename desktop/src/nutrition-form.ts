@@ -158,12 +158,12 @@ export function boundsForm(
   cat.append(catSum);
   const white = document.createElement("textarea");
   white.className = "input textarea";
-  white.placeholder = "Whitelist (one per line or comma-separated). Empty = no whitelist.";
+  white.placeholder = "One per line or comma-separated";
   white.value = (initial.category?.whitelist ?? []).join("\n");
   white.addEventListener("input", onChange);
   const black = document.createElement("textarea");
   black.className = "input textarea";
-  black.placeholder = "Blacklist (one per line or comma-separated)";
+  black.placeholder = "One per line or comma-separated";
   black.value = (initial.category?.blacklist ?? []).join("\n");
   black.addEventListener("input", onChange);
   cat.append(labelEl("Whitelist"), white, labelEl("Blacklist"), black);

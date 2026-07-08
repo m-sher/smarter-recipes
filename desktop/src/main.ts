@@ -55,7 +55,7 @@ const handlers: Handlers = {
   },
   onOpenRecipe: (id) => {
     void (async () => {
-      set({ page: "recipe", loading: true, error: null, recipeDetail: null });
+      set({ page: "recipe", loading: true, error: null, recipeDetail: null, notice: null });
       try {
         const recipeDetail = await api.getRecipe(id);
         set({ recipeDetail, loading: false });
@@ -72,18 +72,18 @@ const handlers: Handlers = {
     void (async () => {
       if (!state.recipeDetail) return;
       if (!confirm(`Delete “${state.recipeDetail.title}”?`)) return;
-      set({ busy: true, error: null });
+      set({ busy: true, error: null, notice: null });
       try {
         await api.deleteRecipe(state.recipeDetail.id);
         const recipes = await api.listRecipes(state.libraryFilter || null);
         const status = await api.getStatus();
+        // List/nav update is enough feedback — no success toast.
         set({
           recipes,
           status,
           recipeDetail: null,
           page: "library",
           busy: false,
-          notice: "Recipe deleted.",
         });
       } catch (e) {
         set({ busy: false, error: e instanceof Error ? e.message : String(e) });
@@ -99,7 +99,7 @@ const handlers: Handlers = {
     void (async () => {
       const path = state.nutritionConfig.trim();
       if (!path) {
-        set({ error: "Enter a path to nutrition_bounds.toml first." });
+        set({ error: "Enter a path to a nutrition bounds file first." });
         return;
       }
       set({ busy: true, error: null, notice: null });
@@ -109,7 +109,7 @@ const handlers: Handlers = {
         set({
           nutritionBounds,
           busy: false,
-          notice: `Loaded nutrition bounds from ${path}`,
+          notice: "Nutrition bounds loaded.",
         });
       } catch (e) {
         set({ busy: false, error: e instanceof Error ? e.message : String(e) });
@@ -120,7 +120,7 @@ const handlers: Handlers = {
     void (async () => {
       const path = state.nutritionConfig.trim();
       if (!path) {
-        set({ error: "Enter a path to write nutrition_bounds.toml." });
+        set({ error: "Enter a path to save the nutrition bounds file." });
         return;
       }
       set({ busy: true, error: null, notice: null });
@@ -130,7 +130,7 @@ const handlers: Handlers = {
         set({
           nutritionBounds: bounds,
           busy: false,
-          notice: `Saved nutrition bounds to ${path}`,
+          notice: "Nutrition bounds saved.",
         });
       } catch (e) {
         set({ busy: false, error: e instanceof Error ? e.message : String(e) });
@@ -149,17 +149,17 @@ const handlers: Handlers = {
   onReadBounds: () => ensurePlanBoundsForm(state.nutritionBounds).read(),
   onCreatePlan: () => {
     void (async () => {
-      // Sync path/overlays from live DOM in case paint:false left state behind
       const pathEl = root!.querySelector<HTMLInputElement>(
         'input[placeholder*="nutrition_bounds"]',
       );
       if (pathEl) state = { ...state, nutritionConfig: pathEl.value };
       const poolEl = root!.querySelector<HTMLInputElement>(
-        'input[placeholder*="id1"]',
+        'input[placeholder*="Leave empty"]',
       );
       if (poolEl) state = { ...state, pool: poolEl.value };
 
-      set({ busy: true, error: null, notice: "Planning… UI stays responsive." });
+      // In-progress: button only ("Creating…"). No notice, no banner.
+      set({ busy: true, error: null, notice: null });
       try {
         const bounds = ensurePlanBoundsForm(state.nutritionBounds).read();
         const poolTokens = state.pool
@@ -185,13 +185,15 @@ const handlers: Handlers = {
         });
         const plans = state.planSave ? await api.listPlans() : state.plans;
         const status = await api.getStatus();
+        // Plan card appears above options — no success toast needed.
         set({
           activePlan,
           plans,
           status,
           nutritionBounds: bounds,
           busy: false,
-          notice: state.planSave ? "Plan saved." : "Plan generated (not saved).",
+          notice: null,
+          shop: [],
         });
       } catch (e) {
         set({ busy: false, error: e instanceof Error ? e.message : String(e) });
@@ -200,7 +202,7 @@ const handlers: Handlers = {
   },
   onOpenPlan: (id) => {
     void (async () => {
-      set({ busy: true, error: null, shop: [] });
+      set({ busy: true, error: null, notice: null, shop: [] });
       try {
         const activePlan = await api.getPlan(id);
         set({ activePlan, busy: false });
@@ -212,13 +214,14 @@ const handlers: Handlers = {
   onShop: () => {
     void (async () => {
       if (!state.activePlan) return;
-      set({ busy: true, error: null });
+      set({ busy: true, error: null, notice: null });
       try {
         const shop = await api.shopPlan(state.activePlan.id);
         set({
           shop,
           busy: false,
-          notice: shop.length ? null : "Nothing to buy (fully covered).",
+          // Empty list is not obvious — only message when there is nothing to show.
+          notice: shop.length ? null : "Nothing to buy — pantry covers this plan.",
         });
       } catch (e) {
         set({ busy: false, error: e instanceof Error ? e.message : String(e) });
@@ -228,11 +231,7 @@ const handlers: Handlers = {
   onRestock: () => {
     void (async () => {
       if (!state.activePlan) return;
-      if (
-        !confirm(
-          "Restock applies buy+cook to the pantry once per plan. Continue?",
-        )
-      ) {
+      if (!confirm("Update the pantry for this plan (purchases and cooked amounts)?")) {
         return;
       }
       set({ busy: true, error: null, notice: null });
@@ -240,6 +239,7 @@ const handlers: Handlers = {
         const result = await api.restockPlan(state.activePlan.id);
         const pantry = await api.listPantry();
         const status = await api.getStatus();
+        // Restock result text carries counts users cannot see otherwise.
         set({ pantry, status, busy: false, notice: result.message });
       } catch (e) {
         set({ busy: false, error: e instanceof Error ? e.message : String(e) });
@@ -249,7 +249,6 @@ const handlers: Handlers = {
   onPantryLine: (v) => set({ pantryLine: v }, { paint: false }),
   onPantryAdd: () => {
     void (async () => {
-      // Re-read from live input if paint was skipped
       const input = root!.querySelector<HTMLInputElement>(
         'input[placeholder*="cups milk"]',
       );
@@ -265,7 +264,6 @@ const handlers: Handlers = {
           status,
           pantryLine: "",
           busy: false,
-          notice: "Added to pantry.",
         });
       } catch (e) {
         set({ busy: false, error: e instanceof Error ? e.message : String(e) });
@@ -278,7 +276,7 @@ const handlers: Handlers = {
       try {
         const pantry = await api.pantryRemove(name, kind);
         const status = await api.getStatus();
-        set({ pantry, status, busy: false, notice: `Removed ${name}.` });
+        set({ pantry, status, busy: false });
       } catch (e) {
         set({ busy: false, error: e instanceof Error ? e.message : String(e) });
       }
@@ -289,7 +287,7 @@ const handlers: Handlers = {
     void (async () => {
       const input = root!.querySelector<HTMLInputElement>('input[type="search"]');
       if (input) state = { ...state, libraryFilter: input.value };
-      set({ loading: true, error: null });
+      set({ loading: true, error: null, notice: null });
       try {
         const recipes = await api.listRecipes(state.libraryFilter || null);
         set({ recipes, loading: false });
@@ -319,6 +317,7 @@ const handlers: Handlers = {
         const result = await api.importSource(state.importSource, input);
         const status = await api.getStatus();
         const recipes = await api.listRecipes(null);
+        // Import summary is not visible elsewhere (count + titles).
         set({
           busy: false,
           status,

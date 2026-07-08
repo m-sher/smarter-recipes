@@ -37,7 +37,7 @@ export type AppState = {
   maxFat: string;
   minCarbs: string;
   maxCarbs: string;
-  /** Comma-separated recipe id prefixes (CLI --pool). Empty = all. */
+  /** Comma-separated recipe id prefixes. Empty = all. */
   pool: string;
   pantryLine: string;
   libraryFilter: string;
@@ -171,9 +171,10 @@ export function render(root: HTMLElement, state: AppState, h: Handlers): void {
   shell.append(sidebar);
 
   const main = el("main", "main");
+  // Only show errors and outcome notices — never a global "Working…" banner.
+  // In-progress is indicated solely on the control that started the action.
   if (state.error) main.append(el("div", "error", state.error));
   if (state.notice) main.append(el("div", "notice", state.notice));
-  if (state.busy) main.append(el("div", "empty", "Working…"));
 
   if (state.page === "home") renderHome(main, state);
   else if (state.page === "library") renderLibrary(main, state, h);
@@ -202,13 +203,6 @@ function renderHome(main: HTMLElement, state: AppState): void {
   main.append(grid);
   const card = el("div", "card");
   card.append(el("h3", "", "Database"), el("p", "muted", state.status.path));
-  card.append(
-    el(
-      "p",
-      "muted",
-      "Import recipes, stock the pantry, then generate a plan. Same SQLite DB as the CLI.",
-    ),
-  );
   main.append(card);
 }
 
@@ -294,8 +288,8 @@ function renderRecipe(main: HTMLElement, state: AppState, h: Handlers): void {
 
   const actions = el("div", "toolbar");
   actions.append(
-    button("← Back to library", () => h.onNav("library"), "ghost"),
-    button("Delete recipe", () => h.onDeleteRecipe(), "danger"),
+    button("← Library", () => h.onNav("library"), "ghost"),
+    button("Delete", () => h.onDeleteRecipe(), "danger"),
   );
   main.append(actions);
 }
@@ -305,7 +299,7 @@ function renderPantry(main: HTMLElement, state: AppState, h: Handlers): void {
   const form = el("div", "toolbar");
   const input = document.createElement("input");
   input.type = "text";
-  input.placeholder = 'Add stock, e.g. "2 cups milk"';
+  input.placeholder = 'e.g. "2 cups milk"';
   input.value = state.pantryLine;
   input.className = "input grow";
   input.addEventListener("input", () => h.onPantryLine(input.value));
@@ -340,100 +334,17 @@ function renderPantry(main: HTMLElement, state: AppState, h: Handlers): void {
 function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
   main.append(pageHeader("Plan", state.activePlan ? shortId(state.activePlan.id) : "new"));
 
-  const form = el("div", "card form-grid");
-  form.append(el("h3", "", "Generate meal plan"));
-  form.append(
-    labeledNumber("Days", state.planDays, (n) => h.onPlanDays(n)),
-    labeledNumber("Meals / day", state.planMealsPerDay, (n) => h.onPlanMeals(n)),
-  );
-  form.append(
-    labeledCheck("Time-of-day steering", state.planTod, (v) => h.onPlanTod(v)),
-    labeledCheck("Save plan to database", state.planSave, (v) => h.onPlanSave(v)),
-  );
-  // TOML path + load/save
-  const pathRow = el("div", "toolbar");
-  const pathInput = document.createElement("input");
-  pathInput.type = "text";
-  pathInput.className = "input grow";
-  pathInput.placeholder = "Path to nutrition_bounds.toml";
-  pathInput.value = state.nutritionConfig;
-  pathInput.addEventListener("input", () => h.onNutritionConfig(pathInput.value));
-  pathRow.append(
-    pathInput,
-    button("Load TOML", () => h.onLoadNutritionConfig()),
-    button("Save TOML", () => h.onSaveNutritionConfig()),
-  );
-  form.append(pathRow);
-
-  // Full bounds editor (all scopes + category) — same as CLI/TOML
-  const bf = ensurePlanBoundsForm(state.nutritionBounds);
-  form.append(el("h3", "", "Nutrition bounds (full)"));
-  form.append(
-    el(
-      "p",
-      "muted",
-      "Matches nutrition_bounds.toml: per_day / per_meal / plan min-max + ratio, and category whitelist/blacklist. Empty fields = unconstrained.",
-    ),
-  );
-  form.append(bf.root);
-
-  // CLI-style per-day overlays (applied on top of the form/TOML)
-  form.append(el("h3", "", "Per-day CLI overlays (optional)"));
-  form.append(
-    el("p", "muted", "Same as CLI --min-kcal / --max-protein-g etc. Override the form for per_day only."),
-  );
-  const overlay = el("div", "bounds-grid");
-  overlay.append(
-    overlayField("min kcal", state.minKcal, h.onMinKcal),
-    overlayField("max kcal", state.maxKcal, h.onMaxKcal),
-    overlayField("min protein g", state.minProtein, h.onMinProtein),
-    overlayField("max protein g", state.maxProtein, h.onMaxProtein),
-    overlayField("min fat g", state.minFat, h.onMinFat),
-    overlayField("max fat g", state.maxFat, h.onMaxFat),
-    overlayField("min carbs g", state.minCarbs, h.onMinCarbs),
-    overlayField("max carbs g", state.maxCarbs, h.onMaxCarbs),
-  );
-  form.append(overlay);
-
-  form.append(el("h3", "", "Recipe pool (optional)"));
-  form.append(
-    el("p", "muted", "Same as CLI --pool: comma-separated recipe id prefixes. Empty = entire library."),
-  );
-  form.append(
-    labeledText("Pool", state.pool, (v) => h.onPool(v), "id1,id2,…"),
-  );
-
-  const createBtn = button(state.busy ? "Planning… (UI stays responsive)" : "Create plan", () => h.onCreatePlan(), "primary");
-  if (state.busy) createBtn.disabled = true;
-  form.append(createBtn);
-  main.append(form);
-
-  if (state.plans.length) {
-    const saved = el("div", "card");
-    saved.append(el("h3", "", "Saved plans"));
-    const list = el("ul", "list");
-    for (const p of state.plans) {
-      const li = document.createElement("li");
-      li.classList.add("clickable");
-      const left = document.createElement("div");
-      left.append(
-        el("div", "title", shortId(p.id)),
-        el("div", "sub", `${p.days}d × ${p.meals_per_day} · ${p.meal_count} meals`),
-      );
-      li.append(left);
-      li.addEventListener("click", () => h.onOpenPlan(p.id));
-      list.append(li);
-    }
-    saved.append(list);
-    main.append(saved);
-  }
-
+  // Results first: active plan and shopping list sit above options.
   if (state.activePlan) {
     const plan = state.activePlan;
     const card = el("div", "card");
     card.append(
       el("h3", "", `Plan ${shortId(plan.id)}`),
-      el("p", "muted", `${plan.days} day(s) · ${plan.meals_per_day} meal(s)/day · ${plan.meals.length} scheduled`),
+      el(
+        "p",
+        "muted",
+        `${plan.days} day(s) · ${plan.meals_per_day} meal(s)/day · ${plan.meals.length} scheduled`,
+      ),
     );
     const byDay = new Map<number, typeof plan.meals>();
     for (const m of plan.meals) {
@@ -466,7 +377,7 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
     const actions = el("div", "toolbar");
     actions.append(
       button("Shopping list", () => h.onShop(), "primary"),
-      button("Restock (buy + cook)", () => h.onRestock()),
+      button("Restock pantry", () => h.onRestock()),
     );
     card.append(actions);
     main.append(card);
@@ -484,18 +395,94 @@ function renderPlan(main: HTMLElement, state: AppState, h: Handlers): void {
         el("div", "sub", `need ${formatQty(item.need)} ${item.unit}`),
       );
       li.append(left);
-      if (item.leftover > 0) li.append(el("span", "badge", `leftover ${formatQty(item.leftover)}`));
+      if (item.leftover > 0) {
+        li.append(el("span", "badge", `leftover ${formatQty(item.leftover)}`));
+      }
       ul.append(li);
     }
     shop.append(ul);
     main.append(shop);
   }
+
+  // Options / generate form below results.
+  const form = el("div", "card form-grid");
+  form.append(el("h3", "", "Generate meal plan"));
+  form.append(
+    labeledNumber("Days", state.planDays, (n) => h.onPlanDays(n)),
+    labeledNumber("Meals / day", state.planMealsPerDay, (n) => h.onPlanMeals(n)),
+  );
+  form.append(
+    labeledCheck("Match time of day", state.planTod, (v) => h.onPlanTod(v)),
+    labeledCheck("Save plan", state.planSave, (v) => h.onPlanSave(v)),
+  );
+
+  const pathRow = el("div", "toolbar");
+  const pathInput = document.createElement("input");
+  pathInput.type = "text";
+  pathInput.className = "input grow";
+  pathInput.placeholder = "Path to nutrition_bounds.toml";
+  pathInput.value = state.nutritionConfig;
+  pathInput.addEventListener("input", () => h.onNutritionConfig(pathInput.value));
+  pathRow.append(
+    pathInput,
+    button("Load", () => h.onLoadNutritionConfig()),
+    button("Save", () => h.onSaveNutritionConfig()),
+  );
+  form.append(pathRow);
+
+  const bf = ensurePlanBoundsForm(state.nutritionBounds);
+  form.append(el("h3", "", "Nutrition bounds"));
+  form.append(bf.root);
+
+  form.append(el("h3", "", "Per-day overrides"));
+  const overlay = el("div", "bounds-grid");
+  overlay.append(
+    overlayField("min kcal", state.minKcal, h.onMinKcal),
+    overlayField("max kcal", state.maxKcal, h.onMaxKcal),
+    overlayField("min protein g", state.minProtein, h.onMinProtein),
+    overlayField("max protein g", state.maxProtein, h.onMaxProtein),
+    overlayField("min fat g", state.minFat, h.onMinFat),
+    overlayField("max fat g", state.maxFat, h.onMaxFat),
+    overlayField("min carbs g", state.minCarbs, h.onMinCarbs),
+    overlayField("max carbs g", state.maxCarbs, h.onMaxCarbs),
+  );
+  form.append(overlay);
+
+  form.append(el("h3", "", "Recipe pool"));
+  form.append(
+    labeledText("Recipe ids", state.pool, (v) => h.onPool(v), "Leave empty for all"),
+  );
+
+  const createBtn = button(state.busy ? "Creating…" : "Create plan", () => h.onCreatePlan(), "primary");
+  if (state.busy) createBtn.disabled = true;
+  form.append(createBtn);
+  main.append(form);
+
+  if (state.plans.length) {
+    const saved = el("div", "card");
+    saved.append(el("h3", "", "Saved plans"));
+    const list = el("ul", "list");
+    for (const p of state.plans) {
+      const li = document.createElement("li");
+      li.classList.add("clickable");
+      const left = document.createElement("div");
+      left.append(
+        el("div", "title", shortId(p.id)),
+        el("div", "sub", `${p.days}d × ${p.meals_per_day} · ${p.meal_count} meals`),
+      );
+      li.append(left);
+      li.addEventListener("click", () => h.onOpenPlan(p.id));
+      list.append(li);
+    }
+    saved.append(list);
+    main.append(saved);
+  }
 }
 
 function renderImport(main: HTMLElement, state: AppState, h: Handlers): void {
-  main.append(pageHeader("Import", "file · url · epub · auto"));
+  main.append(pageHeader("Import", ""));
   const card = el("div", "card form-grid");
-  card.append(el("h3", "", "Ingest a recipe source"));
+  card.append(el("h3", "", "Import recipes"));
   const sel = document.createElement("select");
   sel.className = "input";
   for (const s of ["auto", "file", "url", "epub"]) {
@@ -507,19 +494,14 @@ function renderImport(main: HTMLElement, state: AppState, h: Handlers): void {
   }
   sel.addEventListener("change", () => h.onImportSource(sel.value));
   const lab = el("label", "field");
-  lab.append(el("span", "", "Source kind"), sel);
+  lab.append(el("span", "", "Source"), sel);
   card.append(lab);
   card.append(
     labeledText("Path or URL", state.importInput, (v) => h.onImportInput(v), "/path/to/recipe.json"),
   );
-  card.append(button(state.busy ? "Importing…" : "Import", () => h.onImport(), "primary"));
-  card.append(
-    el(
-      "p",
-      "muted",
-      "Uses the same ingest pipeline as the CLI. EPUB may save multiple recipes. Duplicates by source URL are skipped.",
-    ),
-  );
+  const importBtn = button(state.busy ? "Importing…" : "Import", () => h.onImport(), "primary");
+  if (state.busy) importBtn.disabled = true;
+  card.append(importBtn);
   main.append(card);
 }
 
@@ -550,7 +532,8 @@ export async function loadPageData(api: Api, page: Page, state: AppState): Promi
 
 function pageHeader(title: string, meta: string): HTMLElement {
   const h = el("div", "page-header");
-  h.append(el("h2", "", title), el("div", "meta", meta));
+  h.append(el("h2", "", title));
+  if (meta) h.append(el("div", "meta", meta));
   return h;
 }
 

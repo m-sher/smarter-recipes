@@ -297,7 +297,7 @@ function mockApi(): Api {
     restockPlan: async () => ({
       additions: 2,
       deductions: 3,
-      message: "Restocked: 2 purchase line(s), 3 cooked deduction(s). Leftovers remain in pantry.",
+      message: "Pantry updated: 2 purchased, 3 used from cooking.",
     }),
     importSource: async (_source, input) => ({
       saved: 1,

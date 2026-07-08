@@ -574,7 +574,7 @@ fn restock_plan(state: State<'_, AppState>, id: String) -> Result<RestockResult,
         additions: delta.additions.len(),
         deductions: delta.deductions.len(),
         message: format!(
-            "Restocked: {} purchase line(s), {} cooked deduction(s). Leftovers remain in pantry.",
+            "Pantry updated: {} purchased, {} used from cooking.",
             delta.additions.len(),
             delta.deductions.len()
         ),
