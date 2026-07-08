@@ -212,6 +212,14 @@ const PER_EACH_G: &[(&str, f64)] = &[
     ("carrots", 61.0),
     ("celery", 40.0),
     ("bell pepper", 119.0),
+    ("bell peppers", 119.0),
+    ("red bell pepper", 119.0),
+    ("red bell peppers", 119.0),
+    ("green bell pepper", 119.0),
+    ("green bell peppers", 119.0),
+    ("yellow bell pepper", 119.0),
+    ("yellow bell peppers", 119.0),
+    ("orange bell pepper", 119.0),
     ("scallion", 15.0),
     ("scallions", 15.0),
     ("green onion", 15.0),
@@ -239,6 +247,10 @@ const PER_EACH_G: &[(&str, f64)] = &[
     ("chile de arbol", 2.0),
     ("red chile pepper", 15.0),
     ("red chile peppers", 15.0),
+    ("red chili", 15.0),
+    ("red chilli", 15.0),
+    ("red chilies", 15.0),
+    ("red chillies", 15.0),
     // Whole spices / aromatics (counts).
     ("black cardamom pod", 1.0),
     ("black cardamom pods", 1.0),
@@ -251,9 +263,12 @@ const PER_EACH_G: &[(&str, f64)] = &[
     ("bay leaves", 0.4),
     ("curry leaf", 0.15),
     ("curry leaves", 0.15),
-    // Whole spice cloves only (not bare "cloves" — that is common garlic shorthand
-    // and would under-weigh badly if mapped to ~0.1 g spice cloves).
+    // Whole spice cloves. Bare "cloves" resolves here too: garlic always keeps the
+    // word "garlic" after name normalization ("6 cloves garlic" → name "garlic";
+    // "garlic cloves" is tried before "cloves"), so a bare "cloves" count is the
+    // whole spice, not garlic.
     ("whole cloves", 0.1),
+    ("cloves", 0.1),
     ("stick cinnamon", 3.0),
     ("sticks cinnamon", 3.0),
     ("cinnamon stick", 3.0),
@@ -350,12 +365,16 @@ mod tests {
         assert_eq!(grams_per_each("bay leaves"), Some(0.4));
         assert_eq!(grams_per_each("green cardamom pods"), Some(0.3));
         assert_eq!(grams_per_each("black cardamom pods"), Some(1.0));
-        // Garlic must not pick up a spice-clove weight; bare "cloves" stays unknown
-        // (ambiguous garlic shorthand vs whole spice).
+        // Garlic must not pick up a spice-clove weight; bare "cloves" is the spice
+        // (garlic keeps the word "garlic" after normalization, so it never collapses
+        // to a bare "cloves" count).
         assert_eq!(grams_per_each("garlic cloves"), Some(3.0));
         assert_eq!(grams_per_each("whole cloves"), Some(0.1));
-        assert!(grams_per_each("cloves").is_none());
+        assert_eq!(grams_per_each("cloves"), Some(0.1));
         assert_eq!(grams_per_each("stick cinnamon"), Some(3.0));
+        // Bell peppers by count, including color variants.
+        assert_eq!(grams_per_each("red bell pepper"), Some(119.0));
+        assert_eq!(grams_per_each("green bell peppers"), Some(119.0));
     }
 
     #[test]

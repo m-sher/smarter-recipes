@@ -75,13 +75,13 @@ fn builtin_units() -> HashMap<String, Unit> {
     );
     add(
         &mut m,
-        &["tsp", "teaspoon", "teaspoons"],
+        &["tsp", "tsps", "teaspoon", "teaspoons"],
         UnitKind::Volume,
         4.92892159375,
     );
     add(
         &mut m,
-        &["tbsp", "tablespoon", "tablespoons", "tbl", "tbs"],
+        &["tbsp", "tbsps", "tablespoon", "tablespoons", "tbl", "tbs"],
         UnitKind::Volume,
         14.78676478125,
     );
@@ -196,5 +196,25 @@ mod tests {
         assert!((tsp.to_base - 4.92892159375).abs() < 1e-9);
         assert!((tbsp.to_base - 14.78676478125).abs() < 1e-9);
         assert!(tsp.to_base < tbsp.to_base);
+    }
+
+    #[test]
+    fn plural_and_dotted_spoon_abbreviations_are_volume() {
+        // "2 tsps lemon juice" / "2 tbsps. olive oil" must parse as volume, not a
+        // bare count. Periods are stripped, so "tbsps." also resolves.
+        for a in ["tsps", "tsps."] {
+            assert_eq!(
+                lookup_unit(a).map(|u| u.kind),
+                Some(UnitKind::Volume),
+                "{a}"
+            );
+        }
+        for a in ["tbsps", "tbsps."] {
+            assert_eq!(
+                lookup_unit(a).map(|u| u.kind),
+                Some(UnitKind::Volume),
+                "{a}"
+            );
+        }
     }
 }
