@@ -35,6 +35,35 @@ Database default path:
 - Linux/macOS: `$XDG_DATA_HOME/smarter-recipes/recipes.db` or `~/.local/share/smarter-recipes/recipes.db`
 - Override with `--db PATH` or env `SMARTER_RECIPES_DB`
 
+
+## Desktop GUI
+
+A Tauri 2 desktop shell lives in [`desktop/`](desktop/). Same local SQLite DB as
+the CLI. Pages: **Home**, **Library** (detail + delete), **Pantry** (add/remove),
+**Plan** (nutrition options, ★ pantry, shop, restock), **Import** (file/url/epub).
+
+```bash
+cd desktop
+npm install
+# Linux: install WebKitGTK/GTK deps first (see desktop/README.md)
+npm run tauri dev
+```
+
+### Visual regression tests
+
+UI is tested **without** launching Tauri. Playwright serves the Vite app with
+deterministic mock data and compares full-page screenshots to golden frames:
+
+```bash
+cd desktop
+npx playwright install chromium   # once
+npm run test:visual               # compare
+npm run test:visual:update        # rewrite baselines after intentional UI changes
+```
+
+Goldens: `desktop/tests/visual/shell.spec.ts-snapshots/` (home, library, recipe,
+pantry, plan-shop, import).
+
 ## Usage
 
 ```bash

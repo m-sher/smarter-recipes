@@ -1,5 +1,11 @@
 # smarter-recipes — project conventions
 
+## GitHub: use MCP tools, not the `gh` CLI
+
+For issues, PRs, reviews, comments, checks, merges, and any other GitHub
+operations, use the **GitHub MCP** (`search_tool` → `use_tool` with
+`github__…`). Do not use `gh` unless MCP is unavailable or the user asks for it.
+
 ## Bulk database writes: batch in a transaction, never per-row autocommit
 
 `rusqlite` runs each `conn.execute` as its own autocommitted transaction, and
