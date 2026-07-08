@@ -52,7 +52,11 @@ function numOrNull(s: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/** Bump on each nav so stale loadPageData results are dropped. */
+let navSeq = 0;
+
 async function navigate(page: Page): Promise<void> {
+  const seq = ++navSeq;
   set({
     page,
     loading: true,
@@ -62,6 +66,7 @@ async function navigate(page: Page): Promise<void> {
     recipeDetail: page === "recipe" ? state.recipeDetail : null,
   });
   const patch = await loadPageData(api, page, state);
+  if (seq !== navSeq) return; // a newer navigation won
   set({ ...patch, page });
 }
 
@@ -158,7 +163,6 @@ const handlers: Handlers = {
   onMinCarbs: (v) => set({ minCarbs: v }, { paint: false }),
   onMaxCarbs: (v) => set({ maxCarbs: v }, { paint: false }),
   onPool: (v) => set({ pool: v }, { paint: false }),
-  onReadBounds: () => ensurePlanBoundsForm(state.nutritionBounds).read(),
   onCreatePlan: () => {
     void (async () => {
       const pathEl = root!.querySelector<HTMLInputElement>(

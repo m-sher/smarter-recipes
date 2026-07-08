@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use smarter_recipes::domain::{IngredientKey, Macros, Recipe, RecipeId, ShoppingList, UnitKind};
-use smarter_recipes::ingest::{ingest_from, ingest_many};
+use smarter_recipes::ingest::{ingest_from, ingest_many, normalize_url, recipe_source_url};
 use smarter_recipes::normalize::normalize_line;
 use smarter_recipes::nutrition::{recipe_nutrition, source_recipe_macros};
 use smarter_recipes::planning::{
@@ -597,9 +597,14 @@ async fn import_source(
 
     // Ingest off the async runtime (EPUB/network can be slow).
     let batch = tauri::async_runtime::spawn_blocking(move || {
+        // Match auto_detect: extension compare is case-insensitive.
+        let looks_like_epub = PathBuf::from(&input_owned)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("epub"));
         if source_owned == "epub"
             || source_owned == "ebook"
-            || (source_owned == "auto" && input_owned.ends_with(".epub"))
+            || (source_owned == "auto" && looks_like_epub)
         {
             ingest_many(&source_owned, &input_owned).map_err(|e| e.to_string())
         } else {
@@ -621,20 +626,37 @@ async fn import_source(
     if batch.recipes.is_empty() {
         return Err("no recipes ingested".into());
     }
+
     let store = state.store.lock().map_err(|_| "database lock poisoned")?;
-    let mut titles = Vec::new();
-    let mut saved = 0usize;
-    for r in &batch.recipes {
-        if store
-            .is_duplicate(r.meta.source_url.as_deref())
-            .map_err(|e| e.to_string())?
-        {
-            continue;
+
+    // One full-table scan for existing source URLs, then O(1) lookups per import
+    // row (never call is_duplicate / list_recipes per recipe).
+    let mut seen: HashSet<String> = HashSet::new();
+    for existing in store.list_recipes(None).map_err(|e| e.to_string())? {
+        if let Some(src) = recipe_source_url(&existing) {
+            seen.insert(normalize_url(&src));
         }
-        store.save_recipe(r).map_err(|e| e.to_string())?;
-        titles.push(r.title.clone());
-        saved += 1;
     }
+
+    let mut keep = Vec::new();
+    let mut titles = Vec::new();
+    for r in batch.recipes {
+        if let Some(src) = recipe_source_url(&r) {
+            let key = normalize_url(&src);
+            if !seen.insert(key) {
+                continue; // already in DB or earlier in this batch
+            }
+        }
+        titles.push(r.title.clone());
+        keep.push(r);
+    }
+
+    let saved = keep.len();
+    // Batched transaction writes — never per-row autocommit (CLAUDE.md).
+    store
+        .save_recipes(&keep, |_| {})
+        .map_err(|e| e.to_string())?;
+
     Ok(ImportResult {
         saved,
         titles,
@@ -666,7 +688,6 @@ pub fn run() {
     });
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             store: Mutex::new(store),
         })

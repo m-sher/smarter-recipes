@@ -87,7 +87,6 @@ export type Handlers = {
   onMinCarbs: (v: string) => void;
   onMaxCarbs: (v: string) => void;
   onPool: (v: string) => void;
-  onReadBounds: () => NutritionBounds;
   onCreatePlan: () => void;
   onOpenPlan: (id: string) => void;
   onDismissPlan: () => void;
@@ -147,10 +146,6 @@ function shortId(id: string): string {
 
 /** Survives re-renders so focus is not lost while editing bounds. */
 let planBoundsForm: BoundsForm | null = null;
-
-export function clearPlanBoundsForm(): void {
-  planBoundsForm = null;
-}
 
 export function ensurePlanBoundsForm(initial: NutritionBounds): BoundsForm {
   if (!planBoundsForm) {
@@ -350,7 +345,10 @@ function renderPantry(main: HTMLElement, state: AppState, h: Handlers): void {
     li.append(left);
     const right = el("div", "row-actions");
     right.append(el("span", "badge", `${formatQty(p.quantity_canonical)} ${p.unit_label}`));
-    right.append(button("Remove", () => h.onPantryRemove(p.name, p.kind), "danger small"));
+    const removing = isBusy(state, "pantryRemove");
+    const rm = button(removing ? "…" : "Remove", () => h.onPantryRemove(p.name, p.kind), "danger small");
+    if (removing) rm.disabled = true;
+    right.append(rm);
     li.append(right);
     list.append(li);
   }
